@@ -1,4 +1,6 @@
-Pinned license for Three.js r184.
+License note for the Three.js 0.184.0 CDN smoke test.
+Source: https://cdn.jsdelivr.net/npm/three@0.184.0/build/three.cjs
+SHA-256: 0fe243aabd03faa48e4156b51bf5b4c943fea15748aa623047aab539ab3b9624
 
 The MIT License
 

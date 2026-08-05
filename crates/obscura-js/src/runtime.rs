@@ -1312,6 +1312,72 @@ impl Default for ObscuraJsRuntime {
 mod tests {
     use super::*;
     use obscura_dom::parse_html;
+    use sha2::{Digest, Sha256};
+    use std::path::PathBuf;
+
+    const THREE_CDN_URL: &str =
+        "https://cdn.jsdelivr.net/npm/three@0.184.0/build/three.cjs";
+    const THREE_CDN_SHA256: &str =
+        "0fe243aabd03faa48e4156b51bf5b4c943fea15748aa623047aab539ab3b9624";
+    const PIXI_CDN_URL: &str =
+        "https://cdn.jsdelivr.net/npm/pixi.js@8.18.1/dist/pixi.min.js";
+    const PIXI_CDN_SHA256: &str =
+        "abeeec74acab20e84c74d05d89e13965b9f3152ca958864cf49e5de5de6dd516";
+
+    fn cdn_fixture_cache_path(name: &str) -> PathBuf {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let target_dir = option_env!("CARGO_TARGET_DIR")
+            .map(PathBuf::from)
+            .map(|path| if path.is_absolute() { path } else { manifest_dir.join("../..").join(path) })
+            .unwrap_or_else(|| manifest_dir.join("../../target"));
+        target_dir.join("test-fixtures/graphics").join(name)
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        let digest = Sha256::digest(bytes);
+        digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    async fn load_cdn_fixture(name: &str, url: &str, expected_sha256: &str) -> Result<String, String> {
+        let cache_path = cdn_fixture_cache_path(name);
+        if let Ok(bytes) = tokio::fs::read(&cache_path).await {
+            if sha256_hex(&bytes) == expected_sha256 {
+                return String::from_utf8(bytes).map_err(|error| format!("{name} is not UTF-8: {error}"));
+            }
+        }
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|error| format!("cannot build the CDN client: {error}"))?;
+        let response = client
+            .get(url)
+            .send()
+            .await
+            .map_err(|error| format!("cannot download {name} from {url}: {error}"))?
+            .error_for_status()
+            .map_err(|error| format!("CDN error for {name} at {url}: {error}"))?;
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|error| format!("cannot read {name} from {url}: {error}"))?;
+        let actual_sha256 = sha256_hex(&bytes);
+        if actual_sha256 != expected_sha256 {
+            return Err(format!(
+                "wrong SHA-256 for {name}: expected {expected_sha256}, got {actual_sha256}"
+            ));
+        }
+
+        if let Some(parent) = cache_path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(|error| format!("cannot make CDN cache directory: {error}"))?;
+        }
+        tokio::fs::write(&cache_path, &bytes)
+            .await
+            .map_err(|error| format!("cannot cache {name}: {error}"))?;
+        String::from_utf8(bytes.to_vec()).map_err(|error| format!("{name} is not UTF-8: {error}"))
+    }
 
     fn setup_runtime(html: &str) -> ObscuraJsRuntime {
         let dom = parse_html(html);
@@ -1466,13 +1532,16 @@ mod tests {
         assert_eq!(value.as_str(), Some("[true,8,0,\"function\",0]"));
     }
 
-    #[test]
-    fn three_r184_webgl_renderer_smoke() {
+    #[tokio::test(flavor = "current_thread")]
+    async fn three_r184_webgl_renderer_smoke() {
+        let source = load_cdn_fixture("three-0.184.0.cjs", THREE_CDN_URL, THREE_CDN_SHA256)
+            .await
+            .unwrap();
+        let source = format!(
+            "(function(){{const module={{exports:{{}}}};const exports=module.exports;\n{source}\nglobalThis.THREE=module.exports;}})();"
+        );
         let mut rt = setup_catalog_graphics_runtime("https://example.com/");
-        rt.execute_script(
-            "three-r184.iife.js",
-            include_str!("../tests/fixtures/graphics/three-r184.iife.js"),
-        ).unwrap();
+        rt.execute_script("three-0.184.0.cjs", &source).unwrap();
         let value = rt.evaluate(r#"(function(){
           const canvas=document.getElementById('c');
           const renderer=new THREE.WebGLRenderer({canvas,antialias:true});renderer.setSize(8,8,false);
@@ -1489,12 +1558,12 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn pixi_8_18_1_webgl_renderer_smoke() {
+        let source = load_cdn_fixture("pixi-8.18.1.min.js", PIXI_CDN_URL, PIXI_CDN_SHA256)
+            .await
+            .unwrap();
         let mut rt = setup_catalog_graphics_runtime("https://example.com/");
         rt.execute_script("stop-pixi-ticker", "globalThis.requestAnimationFrame=function(){return 1};globalThis.cancelAnimationFrame=function(){};").unwrap();
-        rt.execute_script(
-            "pixi-8.18.1.min.js",
-            include_str!("../tests/fixtures/graphics/pixi-8.18.1.min.js"),
-        ).unwrap();
+        rt.execute_script("pixi-8.18.1.min.js", &source).unwrap();
         let value = rt.evaluate_for_cdp(r#"(async function(){
           const canvas=document.getElementById('c'),app=new PIXI.Application();
           await app.init({canvas,width:8,height:8,preference:'webgl',antialias:false,autoStart:false,sharedTicker:false});

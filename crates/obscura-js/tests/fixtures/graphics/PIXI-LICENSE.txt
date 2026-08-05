@@ -1,4 +1,6 @@
-Pinned license for PixiJS 8.18.1.
+License note for the PixiJS 8.18.1 CDN smoke test.
+Source: https://cdn.jsdelivr.net/npm/pixi.js@8.18.1/dist/pixi.min.js
+SHA-256: abeeec74acab20e84c74d05d89e13965b9f3152ca958864cf49e5de5de6dd516
 
 The MIT License
 
