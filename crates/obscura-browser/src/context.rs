@@ -1,11 +1,13 @@
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
 
+use obscura_js::ops::OriginStorage;
 use obscura_net::{CookieJar, ObscuraHttpClient, RobotsCache};
 
 pub struct BrowserContext {
     pub id: String,
     pub cookie_jar: Arc<CookieJar>,
+    pub local_storage: Arc<OriginStorage>,
     pub http_client: Arc<ObscuraHttpClient>,
     pub user_agent: String,
     pub platform: String,
@@ -134,6 +136,7 @@ impl BrowserContext {
         BrowserContext {
             id,
             cookie_jar,
+            local_storage: Arc::new(OriginStorage::default()),
             http_client,
             user_agent: resolved_ua,
             platform,
@@ -198,7 +201,13 @@ impl BrowserContext {
             cookie_jar.set_cookies_from_cdp(self.cookie_jar.get_all_cookies());
         }
         let storage_dir = persistent.then(|| self.storage_dir.clone()).flatten();
-        self.copy_with_profile(id, cookie_jar, storage_dir, profile)
+        self.copy_with_profile(
+            id,
+            cookie_jar,
+            Arc::new(OriginStorage::default()),
+            storage_dir,
+            profile,
+        )
     }
 
     /// Replace only the identity of one connection context. Mutable cookie
@@ -212,6 +221,7 @@ impl BrowserContext {
         Ok(self.copy_with_profile(
             self.id.clone(),
             self.cookie_jar.clone(),
+            self.local_storage.clone(),
             self.storage_dir.clone(),
             profile,
         ))
@@ -221,6 +231,7 @@ impl BrowserContext {
         &self,
         id: String,
         cookie_jar: Arc<CookieJar>,
+        local_storage: Arc<OriginStorage>,
         storage_dir: Option<PathBuf>,
         profile: Arc<crate::profiles::ResolvedFingerprintProfile>,
     ) -> Self {
@@ -245,6 +256,7 @@ impl BrowserContext {
         BrowserContext {
             id,
             cookie_jar,
+            local_storage,
             http_client: Arc::new(client),
             user_agent,
             platform: profile.navigator.platform.clone(),
@@ -363,6 +375,8 @@ mod tests {
         assert_eq!(source.http_client.user_agent.read().await.as_str(), "Template-UA/1.0");
         assert_eq!(source.profile_id(), persistent.profile_id());
         assert_eq!(source.profile_id(), incognito.profile_id());
+        assert!(!Arc::ptr_eq(&source.local_storage, &persistent.local_storage));
+        assert!(!Arc::ptr_eq(&source.local_storage, &incognito.local_storage));
         assert!(Arc::ptr_eq(
             &source.fingerprint_profile,
             &persistent.fingerprint_profile
@@ -410,6 +424,7 @@ mod tests {
         let selected = source.copy_with_profile_id(&profile_id).unwrap();
         assert_eq!(selected.profile_id(), profile_id);
         assert!(Arc::ptr_eq(&source.cookie_jar, &selected.cookie_jar));
+        assert!(Arc::ptr_eq(&source.local_storage, &selected.local_storage));
 
         selected.cookie_jar.set_cookie(
             "sid=selected",

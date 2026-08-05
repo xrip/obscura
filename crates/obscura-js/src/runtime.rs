@@ -10,7 +10,7 @@ use obscura_dom::DomTree;
 pub use deno_core::v8::IsolateHandle;
 
 use crate::module_loader::ObscuraModuleLoader;
-use crate::ops::{build_extension, ObscuraState, StoredNetworkResponseBody};
+use crate::ops::{build_extension, ObscuraState, OriginStorage, StoredNetworkResponseBody};
 
 static SNAPSHOT: &[u8] = include_bytes!(env!("OBSCURA_SNAPSHOT_PATH"));
 
@@ -168,6 +168,10 @@ impl ObscuraJsRuntime {
 
     pub fn set_cookie_jar(&self, jar: std::sync::Arc<obscura_net::CookieJar>) {
         self.state.borrow_mut().cookie_jar = Some(jar);
+    }
+
+    pub fn set_local_storage(&self, storage: std::sync::Arc<OriginStorage>) {
+        self.state.borrow_mut().local_storage = Some(storage);
     }
 
     pub fn set_http_client(&self, client: std::sync::Arc<obscura_net::ObscuraHttpClient>) {
@@ -1387,6 +1391,58 @@ mod tests {
         rt.set_title("Test Page");
         rt.run_page_init();
         rt
+    }
+
+    fn setup_runtime_with_storage(
+        url: &str,
+        storage: std::sync::Arc<OriginStorage>,
+    ) -> ObscuraJsRuntime {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        rt.set_url(url);
+        rt.set_local_storage(storage);
+        rt.run_page_init();
+        rt
+    }
+
+    #[test]
+    fn local_storage_is_shared_by_origin_but_session_storage_is_not() {
+        let storage = std::sync::Arc::new(OriginStorage::default());
+        let mut first = setup_runtime_with_storage(
+            "https://example.com/login",
+            storage.clone(),
+        );
+        first
+            .evaluate(
+                "(function(){ localStorage.setItem('token','one'); localStorage.second='two'; sessionStorage.setItem('temporary','yes'); return true; })()",
+            )
+            .unwrap();
+        assert_eq!(
+            first.evaluate("Object.keys(localStorage).join(',')").unwrap(),
+            serde_json::json!("token,second")
+        );
+        drop(first);
+
+        let mut second = setup_runtime_with_storage(
+            "https://example.com/account",
+            storage.clone(),
+        );
+        assert_eq!(
+            second
+                .evaluate(
+                    "[localStorage.getItem('token'), localStorage.second, localStorage.length, sessionStorage.getItem('temporary')]",
+                )
+                .unwrap(),
+            serde_json::json!(["one", "two", 2, null])
+        );
+        second.evaluate("delete localStorage.second").unwrap();
+        drop(second);
+
+        let mut third = setup_runtime_with_storage("https://other.example/", storage);
+        assert_eq!(
+            third.evaluate("localStorage.getItem('token')").unwrap(),
+            serde_json::Value::Null
+        );
     }
 
     fn setup_graphics_runtime(url: &str) -> ObscuraJsRuntime {

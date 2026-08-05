@@ -310,6 +310,71 @@ save cookies, `localStorage`, or other account state. Stock Playwright does not
 send a custom `profileId` option from `browser.newContext()` in this release,
 so use `Obscura.setProfile` before the first context or page.
 
+### Use a profile with a saved Playwright login
+
+The fingerprint profile and account state are separate. Select the profile on
+the root CDP connection. Then use Playwright's normal `storageState` option and
+methods for each browser context:
+
+```javascript
+import { existsSync } from 'node:fs';
+import { chromium } from 'playwright';
+
+const statePath = './account-state.json';
+const profileId = 'c145w1:d2e85f68f4092704b75e2a9fe7145fd7:f9b781363030180eb52d391c03167488:012a7166bca451ee154cd22665977ee4';
+
+const browser = await chromium.connectOverCDP(
+  'http://127.0.0.1:9222',
+);
+const root = await browser.newBrowserCDPSession();
+await root.send('Obscura.setProfile', { profileId });
+
+const context = await browser.newContext(
+  existsSync(statePath) ? { storageState: statePath } : {},
+);
+const page = await context.newPage();
+await page.goto('https://example.com/account');
+
+// Log in or do other work here. Save the new account state on the client.
+await context.storageState({ path: statePath });
+
+await context.close();
+await browser.close();
+```
+
+The JSON file is read and written by Playwright, not by the Obscura server.
+This keeps local and remote CDP use the same: the file path is always a path on
+the Playwright machine.
+
+Obscura supports the standard Playwright calls used by this flow:
+
+- `browser.newContext({ storageState })`, with a file path or state object.
+- `context.storageState()` and `context.storageState({ path })`.
+- `context.setStorageState()`, with a file path or state object.
+- `context.cookies()` and `context.cookies(urls)`.
+- `context.addCookies()`.
+- `context.clearCookies()`, including name, domain, and path filters.
+
+Cookies and `localStorage` belong to one Playwright `BrowserContext`. Pages in
+that context share them. Another context has separate data, even when both
+contexts use the same fingerprint profile. Changing the connection profile
+does not clear or copy account state.
+
+`localStorage` is kept by origin. `sessionStorage` stays page-local and is not
+part of Playwright storage state. IndexedDB and Cache Storage are not included
+in this release.
+
+To run the real Playwright test, first build the release binary, then run:
+
+```powershell
+cargo build --release -p obscura-cli
+node crates/obscura-cdp/tests/playwright_storage_state.mjs
+```
+
+The test gets pinned `playwright-core` 1.62.1 with npm only when it is missing.
+It puts the package under ignored `target/test-fixtures/`; Playwright is not
+kept in the repository.
+
 ## Find and inspect profile IDs
 
 The tracked runtime catalog is:
