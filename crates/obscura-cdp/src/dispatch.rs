@@ -200,6 +200,22 @@ impl CdpContext {
         id
     }
 
+    pub fn set_profile(&mut self, profile_id: &str) -> Result<String, String> {
+        if self.page_counter != 0 || self.browser_context_counter != 0 {
+            return Err(
+                "Obscura.setProfile must run before the first page or browser context is created"
+                    .to_string(),
+            );
+        }
+        let context = self
+            .default_context
+            .copy_with_profile_id(profile_id)
+            .map_err(|error| error.to_string())?;
+        let selected = context.profile_id().to_string();
+        self.default_context = Arc::new(context);
+        Ok(selected)
+    }
+
     pub fn dispose_browser_context(&mut self, id: &str) -> Result<Vec<String>, String> {
         if id == self.default_context.id {
             return Err("The default browser context cannot be disposed".to_string());
@@ -273,7 +289,8 @@ impl CdpContext {
 /// must stay behind the lock.
 fn is_v8_free_method(method: &str) -> bool {
     matches!(method,
-        "Target.getTargets" | "Target.setDiscoverTargets"
+        "Obscura.setProfile"
+        | "Target.getTargets" | "Target.setDiscoverTargets"
         | "Target.attachToTarget" | "Target.attachToBrowserTarget"
         | "Target.setAutoAttach"
         | "Target.getBrowserContexts" | "Target.createBrowserContext"
@@ -377,8 +394,9 @@ pub async fn dispatch(req: &CdpRequest, ctx: &mut CdpContext) -> CdpResponse {
     };
 
     let result = match domain {
+        "Obscura" => domains::obscura::handle(method, &req.params, ctx, &req.session_id).await,
         "Target" => domains::target::handle(method, &req.params, ctx).await,
-        "Browser" => domains::browser::handle(method, &req.params).await,
+        "Browser" => domains::browser::handle(method, &req.params, ctx).await,
         "Page" => domains::page::handle(method, &req.params, ctx, &req.session_id).await,
         "DOM" => domains::dom::handle(method, &req.params, ctx, &req.session_id).await,
         "DOMSnapshot" => domains::domsnapshot::handle(method, &req.params, ctx, &req.session_id).await,

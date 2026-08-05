@@ -172,10 +172,63 @@ impl BrowserContext {
     /// current cookies; incognito copies start empty and never write to the
     /// template's storage directory.
     pub fn isolated_copy(&self, id: String, persistent: bool) -> Self {
+        self.isolated_copy_with_profile(id, persistent, self.fingerprint_profile.clone())
+    }
+
+    /// Create an isolated copy with one exact catalog profile. This is used by
+    /// a root CDP connection before it creates any pages or browser contexts.
+    pub fn isolated_copy_with_profile_id(
+        &self,
+        id: String,
+        persistent: bool,
+        profile_id: &str,
+    ) -> Result<Self, crate::profiles::ProfileError> {
+        let profile = crate::profiles::resolve_profile_id(profile_id)?;
+        Ok(self.isolated_copy_with_profile(id, persistent, profile))
+    }
+
+    fn isolated_copy_with_profile(
+        &self,
+        id: String,
+        persistent: bool,
+        profile: Arc<crate::profiles::ResolvedFingerprintProfile>,
+    ) -> Self {
         let cookie_jar = Arc::new(CookieJar::new());
         if persistent {
             cookie_jar.set_cookies_from_cdp(self.cookie_jar.get_all_cookies());
         }
+        let storage_dir = persistent.then(|| self.storage_dir.clone()).flatten();
+        self.copy_with_profile(id, cookie_jar, storage_dir, profile)
+    }
+
+    /// Replace only the identity of one connection context. Mutable cookie
+    /// state stays attached to the connection so its normal persistence merge
+    /// still sees later changes.
+    pub fn copy_with_profile_id(
+        &self,
+        profile_id: &str,
+    ) -> Result<Self, crate::profiles::ProfileError> {
+        let profile = crate::profiles::resolve_profile_id(profile_id)?;
+        Ok(self.copy_with_profile(
+            self.id.clone(),
+            self.cookie_jar.clone(),
+            self.storage_dir.clone(),
+            profile,
+        ))
+    }
+
+    fn copy_with_profile(
+        &self,
+        id: String,
+        cookie_jar: Arc<CookieJar>,
+        storage_dir: Option<PathBuf>,
+        profile: Arc<crate::profiles::ResolvedFingerprintProfile>,
+    ) -> Self {
+        let user_agent = if self.user_agent == self.fingerprint_profile.browser.user_agent {
+            profile.browser.user_agent.clone()
+        } else {
+            self.user_agent.clone()
+        };
 
         let mut client = ObscuraHttpClient::with_full_options(
             cookie_jar.clone(),
@@ -186,30 +239,38 @@ impl BrowserContext {
             client.block_trackers = true;
         }
         if let Ok(mut guard) = client.user_agent.try_write() {
-            *guard = self.user_agent.clone();
+            *guard = user_agent.clone();
         }
 
         BrowserContext {
             id,
             cookie_jar,
             http_client: Arc::new(client),
-            user_agent: self.user_agent.clone(),
-            platform: self.platform.clone(),
-            ua_platform: self.ua_platform.clone(),
-            ua_platform_version: self.ua_platform_version.clone(),
-            fingerprint_profile: self.fingerprint_profile.clone(),
+            user_agent,
+            platform: profile.navigator.platform.clone(),
+            ua_platform: profile.navigator.ua_platform.clone(),
+            ua_platform_version: profile.navigator.ua_platform_version.clone(),
+            fingerprint_profile: profile,
             proxy_url: self.proxy_url.clone(),
             robots_cache: Arc::new(RobotsCache::new()),
             obey_robots: self.obey_robots,
             stealth: self.stealth,
             allow_file_access: self.allow_file_access,
-            storage_dir: persistent.then(|| self.storage_dir.clone()).flatten(),
+            storage_dir,
             allow_private_network: self.allow_private_network,
         }
     }
 
     pub fn profile_id(&self) -> &str {
         &self.fingerprint_profile.id
+    }
+
+    pub fn browser_version(&self) -> &str {
+        &self.fingerprint_profile.browser.version
+    }
+
+    pub fn screen_profile(&self) -> &crate::profiles::ScreenWindowProfile {
+        &self.fingerprint_profile.screen
     }
 
     /// Persist cookies to disk if storage_dir is configured.
@@ -230,6 +291,22 @@ impl BrowserContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn alternate_profile_id() -> String {
+        let index: serde_json::Value = serde_json::from_str(
+            &crate::profiles::catalog().unwrap().index_json().unwrap(),
+        )
+        .unwrap();
+        let default_id = index["defaultProfileId"].as_str().unwrap();
+        let parts: Vec<&str> = default_id.split(':').collect();
+        let graphics_id = index["graphicsProfiles"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find_map(|row| row["id"].as_str().filter(|id| *id != parts[2]))
+            .unwrap();
+        format!("c145w1:{}:{}:{}", parts[1], graphics_id, parts[3])
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn with_full_options_propagates_user_agent_to_http_client() {
@@ -290,6 +367,55 @@ mod tests {
             &source.fingerprint_profile,
             &persistent.fingerprint_profile
         ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn isolated_copy_can_select_an_exact_profile_and_keep_a_custom_ua() {
+        let profile_id = alternate_profile_id();
+        let source = BrowserContext::new("source".to_string());
+        let selected = source
+            .isolated_copy_with_profile_id("selected".to_string(), true, &profile_id)
+            .unwrap();
+        assert_eq!(selected.profile_id(), profile_id);
+        assert_eq!(
+            selected.user_agent,
+            selected.http_client.user_agent.read().await.as_str()
+        );
+        assert_eq!(
+            selected.ua_platform_version,
+            selected.fingerprint_profile.navigator.ua_platform_version
+        );
+
+        let custom = BrowserContext::with_full_options(
+            "custom".to_string(),
+            None,
+            false,
+            Some("Custom-UA/1.0".to_string()),
+        );
+        let custom_selected = custom
+            .isolated_copy_with_profile_id("custom-selected".to_string(), true, &profile_id)
+            .unwrap();
+        assert_eq!(custom_selected.profile_id(), profile_id);
+        assert_eq!(custom_selected.user_agent, "Custom-UA/1.0");
+        assert_eq!(
+            custom_selected.http_client.user_agent.read().await.as_str(),
+            "Custom-UA/1.0"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn connection_profile_copy_keeps_cookie_state() {
+        let profile_id = alternate_profile_id();
+        let source = BrowserContext::new("source".to_string());
+        let selected = source.copy_with_profile_id(&profile_id).unwrap();
+        assert_eq!(selected.profile_id(), profile_id);
+        assert!(Arc::ptr_eq(&source.cookie_jar, &selected.cookie_jar));
+
+        selected.cookie_jar.set_cookie(
+            "sid=selected",
+            &url::Url::parse("https://example.com").unwrap(),
+        );
+        assert_eq!(source.cookie_jar.get_all_cookies().len(), 1);
     }
 
     #[tokio::test(flavor = "current_thread")]

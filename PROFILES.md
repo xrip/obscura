@@ -216,8 +216,99 @@ The selector works with `fetch`, `serve`, `scrape`, and `mcp`, because all of
 them make browser contexts through the same profile code.
 
 For a CDP server, use a fixed ID or seed when all new contexts must be
-repeatable. With rotation, separate contexts in one server process may have
-different profiles.
+repeatable. The process selector is the first profile for every new root CDP
+connection. A connection may replace it with the exact-ID command below.
+
+### Select a profile before CDP work
+
+Start one server. It may have many root CDP connections running in parallel:
+
+```powershell
+.\target\release\obscura.exe serve --port 9222
+```
+
+Keep that terminal open. In another terminal, connect a CDP client to Obscura.
+This Puppeteer example uses `connect`; it does not start Chrome. It sends the
+non-standard `Obscura.setProfile` command on the browser session before it
+makes a page or browser context:
+
+```javascript
+import puppeteer from 'puppeteer-core';
+
+const browser = await puppeteer.connect({
+  browserWSEndpoint: 'ws://127.0.0.1:9222/devtools/browser',
+});
+
+const profileId = 'c145w1:d2e85f68f4092704b75e2a9fe7145fd7:f9b781363030180eb52d391c03167488:012a7166bca451ee154cd22665977ee4';
+const root = await browser.target().createCDPSession();
+const selected = await root.send('Obscura.setProfile', { profileId });
+console.log(selected.profileId);
+
+const context = await browser.createBrowserContext();
+const page = await context.newPage();
+
+const identity = await page.evaluate(async () => {
+  const high = await navigator.userAgentData.getHighEntropyValues([
+    'platformVersion',
+  ]);
+  const canvas = document.createElement('canvas');
+  const gl = canvas.getContext('webgl2');
+  const debug = gl.getExtension('WEBGL_debug_renderer_info');
+  return {
+    userAgent: navigator.userAgent,
+    platform: navigator.userAgentData.platform,
+    platformVersion: high.platformVersion,
+    renderer: debug
+      ? gl.getParameter(debug.UNMASKED_RENDERER_WEBGL)
+      : null,
+  };
+});
+
+console.log(identity);
+await context.close();
+await root.detach();
+await browser.disconnect();
+```
+
+`profileId` must be one exact `c145w1:...` ID from the embedded catalog. The
+result gives the canonical selected ID. An unknown ID gives an error and keeps
+the old connection profile.
+
+The call is connection-scoped:
+
+- Every later `newPage()` and `createBrowserContext()` on that CDP connection
+  inherits the selected profile.
+- Another root WebSocket connection to the same `serve` process may select a
+  different profile.
+- A page CDP session cannot set the connection profile.
+- The call is rejected after the connection has made its first page or browser
+  context, even if that object was later closed.
+- A second call is allowed only while the connection still has no page or
+  browser context.
+
+If the connection does not call `Obscura.setProfile`, it keeps the profile
+selected by `OBSCURA_PROFILE`, `OBSCURA_ROTATE_PROFILE`, or the fixed default
+when `serve` started.
+
+The same command works through Playwright's browser CDP session:
+
+```javascript
+import { chromium } from 'playwright';
+
+const browser = await chromium.connectOverCDP(
+  'http://127.0.0.1:9222',
+);
+const root = await browser.newBrowserCDPSession();
+await root.send('Obscura.setProfile', { profileId });
+
+const context = await browser.newContext();
+const page = await context.newPage();
+```
+
+This command changes fingerprint identity only. It does not select, load, or
+save cookies, `localStorage`, or other account state. Stock Playwright does not
+send a custom `profileId` option from `browser.newContext()` in this release,
+so use `Obscura.setProfile` before the first context or page.
 
 ## Find and inspect profile IDs
 
