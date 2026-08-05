@@ -1087,7 +1087,7 @@ impl ObscuraJsRuntime {
                     st = 'array'; cn = 'Array';
                     desc = 'Array(' + v.length + ')';
                 }}
-                else if (t === 'object' && typeof v._nid === 'number') {{
+                else if (t === 'object' && typeof globalThis.__obscura_nodeId === 'function' && typeof globalThis.__obscura_nodeId(v) === 'number') {{
                     st = 'node';
                     cn = v.constructor ? v.constructor.name : 'Node';
                     if (v.nodeType === 9) cn = 'HTMLDocument';
@@ -1405,7 +1405,7 @@ mod tests {
             "graphics":{"id":"test-graphics","maskedVendor":"WebKit","maskedRenderer":"WebKit WebGL","unmaskedVendor":"Google Inc. (NVIDIA)","unmaskedRenderer":"ANGLE (NVIDIA, D3D11)","preferredCanvasFormat":"bgra8unorm","wgslLanguageFeatures":["pointer_composite_access"],
               "webgl1":{"contextAttributes":{"alpha":true,"antialias":true,"depth":true,"stencil":false,"premultipliedAlpha":true,"preserveDrawingBuffer":false,"powerPreference":"default","failIfMajorPerformanceCaveat":false,"desynchronized":false,"xrCompatible":false},"parameters":{"3379":{"type":"Number","value":16384},"3386":{"type":"Int32Array","value":[32767,32767]},"7936":{"type":"String","value":"WebKit"},"7937":{"type":"String","value":"WebKit WebGL"},"7938":{"type":"String","value":"WebGL 1.0 (OpenGL ES 2.0 Chromium)"}},"initialState":{"2978":{"type":"Int32Array","value":[0,0,300,150]},"3088":{"type":"Int32Array","value":[0,0,300,150]},"3106":{"type":"Float32Array","value":[0,0,0,0]},"3107":{"type":"Array","value":[true,true,true,true]},"3333":{"type":"Number","value":4},"3317":{"type":"Number","value":4}},"extensions":{"37445":{"name":"WEBGL_debug_renderer_info","constantName":"UNMASKED_VENDOR_WEBGL"},"37446":{"name":"WEBGL_debug_renderer_info","constantName":"UNMASKED_RENDERER_WEBGL"}},"supportedExtensions":["WEBGL_debug_renderer_info","WEBGL_lose_context"],"shaderPrecisionFormats":[{"shaderType":35633,"precisionType":36338,"rangeMin":127,"rangeMax":127,"precision":23}]},
               "webgl2":{"contextAttributes":{"alpha":true,"antialias":true,"depth":true,"stencil":false,"premultipliedAlpha":true,"preserveDrawingBuffer":false,"powerPreference":"default","failIfMajorPerformanceCaveat":false,"desynchronized":false,"xrCompatible":false},"parameters":{"3379":{"type":"Number","value":16384},"7936":{"type":"String","value":"WebKit"}},"initialState":{"2978":{"type":"Int32Array","value":[0,0,300,150]},"3088":{"type":"Int32Array","value":[0,0,300,150]},"3106":{"type":"Float32Array","value":[0,0,0,0]},"3107":{"type":"Array","value":[true,true,true,true]},"3333":{"type":"Number","value":4},"3317":{"type":"Number","value":4}},"extensions":{"36429":{"name":"WEBGL_provoking_vertex","constantName":"FIRST_VERTEX_CONVENTION_WEBGL"},"36430":{"name":"WEBGL_provoking_vertex","constantName":"LAST_VERTEX_CONVENTION_WEBGL"},"36431":{"name":"WEBGL_provoking_vertex","constantName":"PROVOKING_VERTEX_WEBGL"}},"supportedExtensions":["WEBGL_provoking_vertex"],"shaderPrecisionFormats":[]},
-              "webgpu":{"adapters":{"default":{"info":{"vendor":"nvidia","architecture":"lovelace","device":"","description":"","isFallbackAdapter":false},"features":["shader-f16"],"limits":{"maxBufferSize":1048576,"maxTextureDimension2D":8192,"minUniformBufferOffsetAlignment":256},"defaultDeviceLimits":{"maxBufferSize":1048576,"maxTextureDimension2D":8192,"minUniformBufferOffsetAlignment":256}}}}
+              "webgpu":{"adapters":{"default":{"info":{"vendor":"nvidia","architecture":"lovelace","device":"","description":"","isFallbackAdapter":false},"features":["shader-f16","texture-compression-bc"],"limits":{"maxBufferSize":1048576,"maxTextureDimension2D":8192,"minUniformBufferOffsetAlignment":256},"defaultDeviceLimits":{"maxBufferSize":1048576,"maxTextureDimension2D":8192,"minUniformBufferOffsetAlignment":256}}}}
             }
         }"#);
         rt.run_page_init();
@@ -1479,6 +1479,43 @@ mod tests {
           return JSON.stringify([typeof d.getContext,c instanceof HTMLCanvasElement,c instanceof Element,c.width,c.height,a===b,c.getContext('2d')===null,illegal]);
         })()"#).unwrap();
         assert_eq!(value.as_str(), Some("[\"undefined\",true,true,300,150,true,true,\"TypeError\"]"));
+    }
+
+    #[test]
+    fn graphics_functions_have_native_non_constructor_shape() {
+        let mut rt = setup_graphics_runtime("https://example.com/");
+        let value = rt.evaluate(r#"(function(){
+          const getter=Object.getOwnPropertyDescriptor(WebGLRenderingContext.prototype,'canvas').get;
+          const fns=[Function.prototype.toString,WebGLRenderingContext.prototype.getParameter,
+            WebGL2RenderingContext.prototype.drawBuffers,GPU.prototype.requestAdapter,getter,
+            GPUSupportedFeatures.prototype.has,GPUSupportedFeatures.prototype[Symbol.iterator]];
+          function check(fn){
+            const names=Object.getOwnPropertyNames(fn).sort().join(',');
+            let construct=false,extend=false;
+            try{new fn()}catch(e){construct=e instanceof TypeError}
+            try{class Fake extends fn{}}catch(e){extend=e instanceof TypeError&&/not a constructor/i.test(e.message)}
+            return /\{ \[native code\] \}$/.test(Function.prototype.toString.call(fn))&&
+              !('prototype' in fn)&&names==='length,name'&&construct&&extend;
+          }
+          return JSON.stringify(fns.map(check));
+        })()"#).unwrap();
+        assert_eq!(value.as_str(), Some("[true,true,true,true,true,true,true]"));
+    }
+
+    #[test]
+    fn graphics_navigator_and_canvas_hide_internal_shape() {
+        let mut rt = setup_graphics_runtime("https://example.com/");
+        let value = rt.evaluate(r#"(function(){
+          const c=document.getElementById('c');c.style.color='red';
+          const gpu=Object.getOwnPropertyDescriptor(Navigator.prototype,'gpu');
+          let illegalGetter=false,illegalConstructor=false;
+          try{gpu.get.call(Navigator.prototype)}catch(e){illegalGetter=e instanceof TypeError}
+          try{new Navigator()}catch(e){illegalConstructor=e instanceof TypeError&&e.message==='Illegal constructor'}
+          return JSON.stringify([typeof Navigator,navigator instanceof Navigator,
+            !!gpu,/\{ \[native code\] \}$/.test(Function.prototype.toString.call(gpu.get)),
+            illegalGetter,illegalConstructor,Reflect.ownKeys(c).map(String),c.id,c.style.color]);
+        })()"#).unwrap();
+        assert_eq!(value.as_str(), Some("[\"function\",true,true,true,true,true,[],\"c\",\"red\"]"));
     }
 
     #[test]
@@ -1611,6 +1648,22 @@ mod tests {
           return JSON.stringify([bytes,ctx.getCurrentTexture()!==view]);
         })()"#, true, true).await.unwrap();
         assert_eq!(value.value.and_then(|v| v.as_str().map(str::to_owned)).as_deref(), Some("[[7,7,7,7,0,0,0,0,7,7,7,7,7,7,7,7],true]"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn webgpu_compressed_formats_require_the_matching_feature() {
+        let mut rt = setup_graphics_runtime("https://example.com/");
+        let value = rt.evaluate_for_cdp(r#"(async function(){
+          const adapter=await navigator.gpu.requestAdapter();
+          const device=await adapter.requestDevice({requiredFeatures:['texture-compression-bc']});
+          async function accepts(format){
+            device.pushErrorScope('validation');
+            device.createTexture({size:[4,4],format,usage:GPUTextureUsage.TEXTURE_BINDING});
+            return (await device.popErrorScope())===null;
+          }
+          return JSON.stringify([await accepts('bc1-rgba-unorm'),await accepts('etc2-rgb8unorm'),await accepts('astc-4x4-unorm')]);
+        })()"#, true, true).await.unwrap();
+        assert_eq!(value.value.and_then(|v| v.as_str().map(str::to_owned)).as_deref(), Some("[true,false,false]"));
     }
 
     #[test]

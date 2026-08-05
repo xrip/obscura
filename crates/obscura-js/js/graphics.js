@@ -26,14 +26,18 @@ function _canvasAttributeSize(value, fallback) {
   return _graphicsUint(value, fallback);
 }
 function _graphicsSetFunctionShape(fn, name, length) {
-  try { Object.defineProperty(fn, 'name', {value:name, configurable:true}); } catch (_) {}
-  try { Object.defineProperty(fn, 'length', {value:length, configurable:true}); } catch (_) {}
-  _markNative(fn);
-  return fn;
+  return _makeNativeFunction(fn, name, length);
 }
 function _graphicsDefineMethod(proto, name, length, fn) {
-  _graphicsSetFunctionShape(fn, name, length);
-  Object.defineProperty(proto, name, {value:fn, writable:true, enumerable:true, configurable:true});
+  Object.defineProperty(proto, name, {value:_graphicsSetFunctionShape(fn, name, length), writable:true, enumerable:true, configurable:true});
+}
+function _graphicsDefineProperties(proto, descriptors) {
+  for (const name of Object.keys(descriptors)) {
+    const d = descriptors[name];
+    if (typeof d.get === 'function') d.get = _makeNativeFunction(d.get, 'get ' + name, 0, 'function get ' + name + '() { [native code] }');
+    if (typeof d.set === 'function') d.set = _makeNativeFunction(d.set, 'set ' + name, 1, 'function set ' + name + '() { [native code] }');
+  }
+  Object.defineProperties(proto, descriptors);
 }
 function _graphicsTag(proto, name) {
   Object.defineProperty(proto, Symbol.toStringTag, {value:name, configurable:true});
@@ -559,7 +563,7 @@ Object.assign(_webglMethods,{
 function _installWebglMethods(C,manifest){for(const name of Object.keys(manifest)){let fn=_webglMethods[name];if(!fn)fn=function(){const s=_webglState(this);if(s.lost)return null;return undefined;};_graphicsDefineMethod(C.prototype,name,manifest[name],fn);}}
 _installWebglMethods(WebGLRenderingContext,_WEBGL1_METHODS);
 _installWebglMethods(WebGL2RenderingContext,_WEBGL2_METHODS);
-for(const C of [WebGLRenderingContext,WebGL2RenderingContext])Object.defineProperties(C.prototype,{
+for(const C of [WebGLRenderingContext,WebGL2RenderingContext])_graphicsDefineProperties(C.prototype,{
   canvas:{get:function(){return _webglState(this).canvas;},enumerable:true,configurable:true},
   drawingBufferWidth:{get:function(){return Math.max(1,_canvasSize(_webglState(this).canvas)[0]);},enumerable:true,configurable:true},
   drawingBufferHeight:{get:function(){return Math.max(1,_canvasSize(_webglState(this).canvas)[1]);},enumerable:true,configurable:true},
@@ -637,7 +641,7 @@ const GPU=_gpuClasses.GPU, GPUAdapter=_gpuClasses.GPUAdapter, GPUAdapterInfo=_gp
   GPUBindGroup=_gpuClasses.GPUBindGroup, GPUBindGroupLayout=_gpuClasses.GPUBindGroupLayout,
   GPUPipelineLayout=_gpuClasses.GPUPipelineLayout, GPUCanvasContext=_gpuClasses.GPUCanvasContext;
 for(const name of ['GPUDevice','GPUQueue','GPUBuffer','GPUTexture','GPUTextureView','GPUSampler','GPUShaderModule','GPUCommandEncoder','GPUCommandBuffer','GPURenderPassEncoder','GPUComputePassEncoder','GPURenderBundleEncoder','GPURenderBundle','GPURenderPipeline','GPUComputePipeline','GPUQuerySet','GPUBindGroup','GPUBindGroupLayout','GPUPipelineLayout']){
-  const C=_gpuClasses[name];Object.defineProperty(C.prototype,'label',{get:function(){return _gpuBrand(this,name).label||'';},set:function(v){_gpuBrand(this,name).label=String(v);},enumerable:true,configurable:true});
+  const C=_gpuClasses[name];_graphicsDefineProperties(C.prototype,{label:{get:function(){return _gpuBrand(this,name).label||'';},set:function(v){_gpuBrand(this,name).label=String(v);},enumerable:true,configurable:true}});
 }
 
 class _GPUSupportedSet {
@@ -670,9 +674,9 @@ function _gpuAdapterEntry(options){const adapters=_gpuProfile().adapters||{},o=o
 
 _graphicsDefineMethod(GPU.prototype,'requestAdapter',0,function(options){const entry=_gpuAdapterEntry(options);if(!entry)return Promise.resolve(null);const adapter=new GPUAdapter(_graphicsObjectToken,{kind:'GPUAdapter',entry});const s=_gpuSlots.get(adapter);s.features=new GPUSupportedFeatures(_graphicsObjectToken,entry.features);s.limits=new GPUSupportedLimits(_graphicsObjectToken,entry.limits);s.info=new GPUAdapterInfo(_graphicsObjectToken,{kind:'GPUAdapterInfo'});Object.assign(s.info,entry.info||{});return Promise.resolve(adapter);});
 _graphicsDefineMethod(GPU.prototype,'getPreferredCanvasFormat',0,function(){return _fingerprintProfile&&_fingerprintProfile.graphics&&_fingerprintProfile.graphics.preferredCanvasFormat||'bgra8unorm';});
-Object.defineProperties(GPU.prototype,{wgslLanguageFeatures:{get:function(){const s=_gpuBrand(this,'GPU');if(!s.wgsl)s.wgsl=new WGSLLanguageFeatures(_graphicsObjectToken,(_fingerprintProfile&&_fingerprintProfile.graphics&&_fingerprintProfile.graphics.wgslLanguageFeatures)||[]);return s.wgsl;},enumerable:true,configurable:true}});
+_graphicsDefineProperties(GPU.prototype,{wgslLanguageFeatures:{get:function(){const s=_gpuBrand(this,'GPU');if(!s.wgsl)s.wgsl=new WGSLLanguageFeatures(_graphicsObjectToken,(_fingerprintProfile&&_fingerprintProfile.graphics&&_fingerprintProfile.graphics.wgslLanguageFeatures)||[]);return s.wgsl;},enumerable:true,configurable:true}});
 
-Object.defineProperties(GPUAdapter.prototype,{
+_graphicsDefineProperties(GPUAdapter.prototype,{
   features:{get:function(){return _gpuBrand(this,'GPUAdapter').features;},enumerable:true,configurable:true},
   limits:{get:function(){return _gpuBrand(this,'GPUAdapter').limits;},enumerable:true,configurable:true},
   info:{get:function(){return _gpuBrand(this,'GPUAdapter').info;},enumerable:true,configurable:true},
@@ -681,7 +685,7 @@ Object.defineProperties(GPUAdapter.prototype,{
 _graphicsDefineMethod(GPUAdapter.prototype,'requestDevice',0,function(descriptor){const a=_gpuBrand(this,'GPUAdapter'),d=descriptor||{},required=Array.from(d.requiredFeatures||[],String);for(const feature of required)if(!a.features.has(feature))return Promise.reject(new DOMException("Unsupported required feature: "+feature,'OperationError'));const requested=d.requiredLimits||{},limits=Object.assign({},a.entry.defaultDeviceLimits||{});for(const name of Object.keys(requested)){if(!Object.prototype.hasOwnProperty.call(a.entry.limits,name))return Promise.reject(new DOMException("Unknown required limit: "+name,'OperationError'));const value=Number(requested[name]),available=Number(a.entry.limits[name]);if(!Number.isFinite(value)||value<0)return Promise.reject(new TypeError('A required limit must be a non-negative number.'));const isMin=name.startsWith('min');if((isMin&&value<available)||(!isMin&&value>available))return Promise.reject(new DOMException("Required limit is not supported: "+name,'OperationError'));limits[name]=isMin?Math.min(limits[name]??available,value):Math.max(limits[name]??0,value);}return Promise.resolve(_newGPUDevice(required,limits));});
 
 function _newGPUDevice(features,limits){let resolveLost;const lost=new Promise(r=>resolveLost=r);const device=new GPUDevice(_graphicsObjectToken,{kind:'GPUDevice',features:new GPUSupportedFeatures(_graphicsObjectToken,features),limits:new GPUSupportedLimits(_graphicsObjectToken,limits),errorScopes:[],destroyed:false,lost,resolveLost,serial:0,listeners:new Map()});const queue=new GPUQueue(_graphicsObjectToken,{kind:'GPUQueue',device,serial:0});const d=_gpuSlots.get(device);d.queue=queue;return device;}
-Object.defineProperties(GPUDevice.prototype,{
+_graphicsDefineProperties(GPUDevice.prototype,{
   features:{get:function(){return _gpuBrand(this,'GPUDevice').features;},enumerable:true,configurable:true},limits:{get:function(){return _gpuBrand(this,'GPUDevice').limits;},enumerable:true,configurable:true},queue:{get:function(){return _gpuBrand(this,'GPUDevice').queue;},enumerable:true,configurable:true},lost:{get:function(){return _gpuBrand(this,'GPUDevice').lost;},enumerable:true,configurable:true},
 });
 _graphicsDefineMethod(GPUDevice.prototype,'destroy',0,function(){const d=_gpuBrand(this,'GPUDevice');if(d.destroyed)return;d.destroyed=true;d.resolveLost(new GPUDeviceLostInfo(_graphicsObjectToken,'destroyed','The device was destroyed.'));});
@@ -693,7 +697,7 @@ _graphicsDefineMethod(GPUDevice.prototype,'dispatchEvent',1,function(event){cons
 
 function _gpuCreate(device,C,kind,state){const d=_gpuBrand(device,'GPUDevice');if(d.destroyed){_gpuError(device,'The device is lost.');return new C(_graphicsObjectToken,Object.assign({kind,device,destroyed:true},state||{}));}return new C(_graphicsObjectToken,Object.assign({kind,device},state||{}));}
 _graphicsDefineMethod(GPUDevice.prototype,'createBuffer',1,function(desc){desc=desc||{};const size=Number(desc.size),usage=Number(desc.usage);if(!Number.isSafeInteger(size)||size<0||size>Number(this.limits.maxBufferSize||0)){_gpuError(this,'Buffer size is invalid.');return _gpuCreate(this,GPUBuffer,'GPUBuffer',{size:0,usage,destroyed:true});}const exact=size<=_WEBGL_SHADOW_LIMIT?new Uint8Array(size):null;const buffer=_gpuCreate(this,GPUBuffer,'GPUBuffer',{size,usage,bytes:exact,mapState:desc.mappedAtCreation?'mapped':'unmapped',mapMode:desc.mappedAtCreation?2:0,mapOffset:0,mapSize:size,mappedRanges:[]});return buffer;});
-Object.defineProperties(GPUBuffer.prototype,{size:{get:function(){return _gpuBrand(this,'GPUBuffer').size;},enumerable:true,configurable:true},usage:{get:function(){return _gpuBrand(this,'GPUBuffer').usage;},enumerable:true,configurable:true},mapState:{get:function(){return _gpuBrand(this,'GPUBuffer').mapState;},enumerable:true,configurable:true}});
+_graphicsDefineProperties(GPUBuffer.prototype,{size:{get:function(){return _gpuBrand(this,'GPUBuffer').size;},enumerable:true,configurable:true},usage:{get:function(){return _gpuBrand(this,'GPUBuffer').usage;},enumerable:true,configurable:true},mapState:{get:function(){return _gpuBrand(this,'GPUBuffer').mapState;},enumerable:true,configurable:true}});
 _graphicsDefineMethod(GPUBuffer.prototype,'mapAsync',1,function(mode,offset,size){const b=_gpuBrand(this,'GPUBuffer');offset=Number(offset)||0;size=size===undefined?b.size-offset:Number(size);if(b.destroyed||b.mapState!=='unmapped'||offset<0||size<0||offset+size>b.size||!b.bytes)return Promise.reject(new DOMException('Buffer mapping validation failed.','OperationError'));b.mapState='pending';return Promise.resolve().then(()=>{b.mapState='mapped';b.mapMode=Number(mode);b.mapOffset=offset;b.mapSize=size;});});
 _graphicsDefineMethod(GPUBuffer.prototype,'mapSync',1,function(mode,offset,size){const b=_gpuBrand(this,'GPUBuffer');offset=Number(offset)||0;size=size===undefined?b.size-offset:Number(size);if(b.destroyed||b.mapState!=='unmapped'||!b.bytes||offset<0||size<0||offset+size>b.size)throw new DOMException('Buffer mapping validation failed.','OperationError');b.mapState='mapped';b.mapMode=Number(mode);b.mapOffset=offset;b.mapSize=size;});
 _graphicsDefineMethod(GPUBuffer.prototype,'getMappedRange',0,function(offset,size){const b=_gpuBrand(this,'GPUBuffer');offset=Number(offset)||0;size=size===undefined?b.mapSize-offset:Number(size);if(b.mapState!=='mapped'||!b.bytes||offset<0||size<0||offset+size>b.mapSize)throw new DOMException('Buffer is not mapped for this range.','OperationError');const copy=b.bytes.slice(b.mapOffset+offset,b.mapOffset+offset+size).buffer;b.mappedRanges.push({buffer:copy,offset:b.mapOffset+offset,size});return copy;});
@@ -706,8 +710,9 @@ _graphicsDefineMethod(GPUQueue.prototype,'submit',1,function(buffers){const q=_g
 _graphicsDefineMethod(GPUQueue.prototype,'onSubmittedWorkDone',0,function(){return Promise.resolve();});
 
 const _gpuCoreFormats=new Set(['r8unorm','r8snorm','r8uint','r8sint','r16uint','r16sint','r16float','rg8unorm','rg8snorm','rg8uint','rg8sint','r32uint','r32sint','r32float','rg16uint','rg16sint','rg16float','rgba8unorm','rgba8unorm-srgb','rgba8snorm','rgba8uint','rgba8sint','bgra8unorm','bgra8unorm-srgb','rgb10a2uint','rgb10a2unorm','rg11b10ufloat','rgb9e5ufloat','rg32uint','rg32sint','rg32float','rgba16uint','rgba16sint','rgba16float','rgba32uint','rgba32sint','rgba32float','stencil8','depth16unorm','depth24plus','depth24plus-stencil8','depth32float','depth32float-stencil8']);
-_graphicsDefineMethod(GPUDevice.prototype,'createTexture',1,function(desc){desc=desc||{};const size=_gpuSize3D(desc.size),max=Number(this.limits.maxTextureDimension2D||8192),format=String(desc.format||''),compressed=/^(bc|etc2|eac|astc)/.test(format),allowed=_gpuCoreFormats.has(format)||(compressed&&Array.from(this.features).some(v=>v.startsWith('texture-compression-')));if(!size.width||!size.height||size.width>max||size.height>max||!allowed){_gpuError(this,'Texture size or format is invalid.');return _gpuCreate(this,GPUTexture,'GPUTexture',{destroyed:true,size});}return _gpuCreate(this,GPUTexture,'GPUTexture',{size,format,usage:Number(desc.usage),dimension:String(desc.dimension||'2d'),mipLevelCount:Number(desc.mipLevelCount||1),sampleCount:Number(desc.sampleCount||1),surface:_newSurface(size.width,size.height),canvasContext:null});});
-Object.defineProperties(GPUTexture.prototype,{width:{get:function(){return _gpuBrand(this,'GPUTexture').size.width;},enumerable:true,configurable:true},height:{get:function(){return _gpuBrand(this,'GPUTexture').size.height;},enumerable:true,configurable:true},depthOrArrayLayers:{get:function(){return _gpuBrand(this,'GPUTexture').size.depthOrArrayLayers;},enumerable:true,configurable:true},mipLevelCount:{get:function(){return _gpuBrand(this,'GPUTexture').mipLevelCount;},enumerable:true,configurable:true},sampleCount:{get:function(){return _gpuBrand(this,'GPUTexture').sampleCount;},enumerable:true,configurable:true},dimension:{get:function(){return _gpuBrand(this,'GPUTexture').dimension;},enumerable:true,configurable:true},format:{get:function(){return _gpuBrand(this,'GPUTexture').format;},enumerable:true,configurable:true},usage:{get:function(){return _gpuBrand(this,'GPUTexture').usage;},enumerable:true,configurable:true}});
+function _gpuTextureFeature(format){if(format.startsWith('bc'))return'texture-compression-bc';if(format.startsWith('etc2')||format.startsWith('eac'))return'texture-compression-etc2';if(format.startsWith('astc'))return'texture-compression-astc';return null;}
+_graphicsDefineMethod(GPUDevice.prototype,'createTexture',1,function(desc){desc=desc||{};const size=_gpuSize3D(desc.size),max=Number(this.limits.maxTextureDimension2D||8192),format=String(desc.format||''),feature=_gpuTextureFeature(format),allowed=_gpuCoreFormats.has(format)||(feature&&this.features.has(feature));if(!size.width||!size.height||size.width>max||size.height>max||!allowed){_gpuError(this,'Texture size or format is invalid.');return _gpuCreate(this,GPUTexture,'GPUTexture',{destroyed:true,size});}return _gpuCreate(this,GPUTexture,'GPUTexture',{size,format,usage:Number(desc.usage),dimension:String(desc.dimension||'2d'),mipLevelCount:Number(desc.mipLevelCount||1),sampleCount:Number(desc.sampleCount||1),surface:_newSurface(size.width,size.height),canvasContext:null});});
+_graphicsDefineProperties(GPUTexture.prototype,{width:{get:function(){return _gpuBrand(this,'GPUTexture').size.width;},enumerable:true,configurable:true},height:{get:function(){return _gpuBrand(this,'GPUTexture').size.height;},enumerable:true,configurable:true},depthOrArrayLayers:{get:function(){return _gpuBrand(this,'GPUTexture').size.depthOrArrayLayers;},enumerable:true,configurable:true},mipLevelCount:{get:function(){return _gpuBrand(this,'GPUTexture').mipLevelCount;},enumerable:true,configurable:true},sampleCount:{get:function(){return _gpuBrand(this,'GPUTexture').sampleCount;},enumerable:true,configurable:true},dimension:{get:function(){return _gpuBrand(this,'GPUTexture').dimension;},enumerable:true,configurable:true},format:{get:function(){return _gpuBrand(this,'GPUTexture').format;},enumerable:true,configurable:true},usage:{get:function(){return _gpuBrand(this,'GPUTexture').usage;},enumerable:true,configurable:true}});
 _graphicsDefineMethod(GPUTexture.prototype,'createView',0,function(desc){const t=_gpuBrand(this,'GPUTexture');return _gpuCreate(t.device,GPUTextureView,'GPUTextureView',{texture:this,descriptor:Object.assign({},desc||{})});});
 _graphicsDefineMethod(GPUTexture.prototype,'destroy',0,function(){_gpuBrand(this,'GPUTexture').destroyed=true;});
 _graphicsDefineMethod(GPUDevice.prototype,'createSampler',0,function(desc){return _gpuCreate(this,GPUSampler,'GPUSampler',{descriptor:Object.assign({},desc||{})});});
@@ -761,7 +766,7 @@ const _oldCanvasGetContext=_canvasGetContext;
 _canvasGetContext=function(canvas,type,options){const value=_oldCanvasGetContext(canvas,type,options);if(value&&String(type).toLowerCase()==='webgpu'&&!_gpuCanvasSlots.has(value))_gpuCanvasSlots.set(value,{canvas,configuration:null,currentTexture:null});return value;};
 
 const _gpuSingleton=new GPU(_graphicsObjectToken,{kind:'GPU',wgsl:null});
-Object.defineProperty(Navigator.prototype,'gpu',{get:_graphicsSetFunctionShape(function gpu(){return _gpuSecureContext()?_gpuSingleton:undefined;},'get gpu',0),enumerable:true,configurable:true});
+_graphicsDefineProperties(Navigator.prototype,{gpu:{get:function(){if(!_navigatorInstances.has(this))throw new TypeError('Illegal invocation');return _gpuSecureContext()?_gpuSingleton:undefined;},enumerable:true,configurable:true}});
 
 // Fill any still-unimplemented Chrome 145 WebGPU method with a branded,
 // bounded logical no-op. Concrete work above keeps its own implementation.

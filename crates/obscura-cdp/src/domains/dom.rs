@@ -18,7 +18,7 @@ fn resolve_node_id(page: &mut Page, params: &Value) -> Result<u64, String> {
     if let Some(oid) = params.get("objectId").and_then(|v| v.as_str()) {
         let code = format!(
             "(function() {{ var o = globalThis.__obscura_objects && globalThis.__obscura_objects['{}']; \
-             return (o && typeof o._nid === 'number') ? o._nid : -1; }})()",
+             var n = o && globalThis.__obscura_nodeId && globalThis.__obscura_nodeId(o); return typeof n === 'number' ? n : -1; }})()",
             oid.replace('\'', "\\'")
         );
         let result = page.evaluate(&code);
@@ -142,7 +142,7 @@ pub async fn handle(
             } else if let Some(oid) = params.get("objectId").and_then(|v| v.as_str()) {
                 let escaped_oid = oid.replace('\\', "\\\\").replace('\'', "\\'");
                 let code = format!(
-                    "(function() {{ var o = globalThis.__obscura_objects['{}']; if (!o) return -1; return (typeof o._nid === 'number') ? o._nid : -1; }})()",
+                    "(function() {{ var o = globalThis.__obscura_objects['{}']; if (!o) return -1; var n = globalThis.__obscura_nodeId && globalThis.__obscura_nodeId(o); return typeof n === 'number' ? n : -1; }})()",
                     escaped_oid
                 );
                 let result = page.evaluate(&code);
@@ -164,7 +164,7 @@ pub async fn handle(
                 nid
             } else if let Some(oid) = params.get("objectId").and_then(|v| v.as_str()) {
                 let code = format!(
-                    "(function() {{ var o = globalThis.__obscura_objects['{}']; return (o && typeof o._nid === 'number') ? o._nid : -1; }})()",
+                    "(function() {{ var o = globalThis.__obscura_objects['{}']; var n = o && globalThis.__obscura_nodeId && globalThis.__obscura_nodeId(o); return typeof n === 'number' ? n : -1; }})()",
                     oid
                 );
                 let result = page.evaluate(&code);

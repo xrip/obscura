@@ -12,7 +12,7 @@
 (function _preHideInternals() {
   var _names = [
     // runtime-set by Rust (runtime.rs / page.rs)
-    '__obscura_errors', '__obscura_init', '__obscura_hide_list',
+    '__obscura_errors', '__obscura_init', '__obscura_hide_list', '__obscura_nodeId',
     '__obscura_objects', '__obscura_oid', '__obscura_ua',
     '__obscura_platform', '__obscura_ua_platform', '__obscura_ua_platform_version',
     '__obscura_fingerprint_profile',
@@ -45,7 +45,7 @@
     // the later `globalThis.X = X` assignments only update the value.
     'Node', 'Element', 'Document', 'DocumentFragment', 'DocumentType',
     'Text', 'Comment', 'CDATASection', 'ProcessingInstruction', 'CharacterData',
-    'CSSStyleDeclaration', 'DOMTokenList', 'Screen', 'NetworkInformation',
+    'CSSStyleDeclaration', 'DOMTokenList', 'Screen', 'NetworkInformation', 'Navigator',
     'MessageChannel', 'MessagePort', 'CustomElementRegistry',
     'XMLHttpRequestEventTarget', 'HTMLMediaElement', 'HTMLVideoElement',
     'HTMLAudioElement', 'WebGL2RenderingContext',
@@ -89,16 +89,23 @@ const _nativeFns = new Set();
 // or functions whose `.name` does not match the real builtin.
 const _nativeStr = new Map();
 const _origToString = Function.prototype.toString;
-Function.prototype.toString = function toString() {
+const _patchedFunctionToString = ({toString() {
   if (_nativeStr.has(this)) { return _nativeStr.get(this); }
   if (_nativeFns.has(this)) {
     return `function ${this.name || ''}() { [native code] }`;
   }
   return _origToString.call(this);
-};
+}}).toString;
+Function.prototype.toString = _patchedFunctionToString;
 function _markNative(fn) { if (typeof fn === 'function') _nativeFns.add(fn); return fn; }
 // Mark a function with an exact native-code toString (used for accessors).
 function _markNativeAs(fn, str) { if (typeof fn === 'function') _nativeStr.set(fn, str); return fn; }
+function _makeNativeFunction(fn, name, length, source) {
+  const holder = { [name](...args) { return Reflect.apply(fn, this, args); } };
+  const wrapped = holder[name];
+  try { Object.defineProperty(wrapped, 'length', {value:length, configurable:true}); } catch (_) {}
+  return source ? _markNativeAs(wrapped, source) : _markNative(wrapped);
+}
 _nativeFns.add(Function.prototype.toString);
 
 // unusualWindowProperties: obscura's internal globals are made non-enumerable
@@ -696,6 +703,11 @@ function _shallowCloneNode(node) {
   return el;
 }
 
+const _nodeSlots = new WeakMap();
+function _nodeId(node) { const slot = node && _nodeSlots.get(node); return slot && slot.nid; }
+function _nodeStyle(node) { const slot = node && _nodeSlots.get(node); return slot && slot.style; }
+globalThis.__obscura_nodeId = _nodeId;
+
 class Node {
   static ELEMENT_NODE = 1;
   static ATTRIBUTE_NODE = 2;
@@ -716,9 +728,9 @@ class Node {
   static DOCUMENT_POSITION_CONTAINED_BY = 16;
   static DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC = 32;
 
-  constructor(nid) { this._nid = nid; }
-  get nodeType() { return +_dom("node_type", this._nid); }
-  get nodeName() { return _domParse("node_name", this._nid) || ""; }
+  constructor(nid) { _nodeSlots.set(this, {nid, style:null}); }
+  get nodeType() { return +_dom("node_type", _nodeId(this)); }
+  get nodeName() { return _domParse("node_name", _nodeId(this)) || ""; }
   get ownerDocument() { return globalThis.document; }
   // https://dom.spec.whatwg.org/#dom-node-baseuri
   get baseURI() {
@@ -737,42 +749,42 @@ class Node {
       return "";
     }
   }
-  get textContent() { return _domParse("text_content", this._nid) ?? ""; }
+  get textContent() { return _domParse("text_content", _nodeId(this)) ?? ""; }
   set textContent(v) {
-    const oldChildren = _domParse("child_nodes", this._nid) || [];
+    const oldChildren = _domParse("child_nodes", _nodeId(this)) || [];
     for (const c of oldChildren) _dom("remove_child", c);
     let added = [];
     if (v != null && v !== "") {
       const tn = +_dom("create_text_node", String(v));
-      _dom("append_child", this._nid, tn);
+      _dom("append_child", _nodeId(this), tn);
       added = [tn];
     }
     // Real MutationObserver fires childList for the children swap.
     // Without this React 18+ hydration mismatch detection and many polling
     // libs (intersection-driven lazy load, content sync) silently stall.
     if (globalThis.__mutationObservers?.length) {
-      globalThis.__notifyMutation('childList', this._nid, added, oldChildren);
+      globalThis.__notifyMutation('childList', _nodeId(this), added, oldChildren);
     }
   }
   get nodeValue() {
     const t = this.nodeType;
-    if (t === 3 || t === 8) return _domParse("text_content", this._nid) ?? "";
+    if (t === 3 || t === 8) return _domParse("text_content", _nodeId(this)) ?? "";
     return null;
   }
   set nodeValue(v) {
     const t = this.nodeType;
-    if (t === 3 || t === 8) _dom("set_text_content", this._nid, String(v ?? ""));
+    if (t === 3 || t === 8) _dom("set_text_content", _nodeId(this), String(v ?? ""));
   }
-  get parentNode() { return _wrap(+_dom("parent_node", this._nid)); }
+  get parentNode() { return _wrap(+_dom("parent_node", _nodeId(this))); }
   get parentElement() { const p = this.parentNode; return p && p.nodeType === 1 ? p : null; }
   get childNodes() {
-    const ids = _domParse("child_nodes", this._nid) || [];
+    const ids = _domParse("child_nodes", _nodeId(this)) || [];
     return _nodeList(ids.map(_wrap).filter(Boolean));
   }
-  get firstChild() { return _wrap(+_dom("first_child", this._nid)); }
-  get lastChild() { return _wrap(+_dom("last_child", this._nid)); }
-  get nextSibling() { return _wrap(+_dom("next_sibling", this._nid)); }
-  get previousSibling() { return _wrap(+_dom("prev_sibling", this._nid)); }
+  get firstChild() { return _wrap(+_dom("first_child", _nodeId(this))); }
+  get lastChild() { return _wrap(+_dom("last_child", _nodeId(this))); }
+  get nextSibling() { return _wrap(+_dom("next_sibling", _nodeId(this))); }
+  get previousSibling() { return _wrap(+_dom("prev_sibling", _nodeId(this))); }
   appendChild(c) {
     if (!c) return c;
     if (c instanceof DocumentFragment) {
@@ -780,8 +792,8 @@ class Node {
       for (const child of children) this.appendChild(child);
       return c;
     }
-    _dom("append_child", this._nid, c._nid);
-    if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('childList', this._nid, [c._nid], []);
+    _dom("append_child", _nodeId(this), _nodeId(c));
+    if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('childList', _nodeId(this), [_nodeId(c)], []);
     if (c instanceof Element && c.tagName === 'SCRIPT') {
       const scriptType = c.getAttribute('type') || '';
       const isModule = scriptType === 'module';
@@ -820,7 +832,7 @@ class Node {
         __dynScriptQueue.push({
           url: fullUrl,
           isModule,
-          nid: c._nid,
+          nid: _nodeId(c),
           prevNid,
           pageOrigin,
           dispatchEvent: (ev) => { try { c.dispatchEvent(ev); } catch(e) {} },
@@ -834,14 +846,14 @@ class Node {
             __dynScriptQueue.push({
               url: dataUrl,
               isModule: true,
-              nid: c._nid,
+              nid: _nodeId(c),
               prevNid,
               pageOrigin: "",
               dispatchEvent: (ev) => { try { c.dispatchEvent(ev); } catch(e) {} },
             });
             __processDynScriptQueue();
           } else {
-            globalThis.__currentScriptNid = c._nid;
+            globalThis.__currentScriptNid = _nodeId(c);
             try { (0, eval)(code); }
             catch(e) { console.error('Dynamic inline script error:', e.message); }
             finally { globalThis.__currentScriptNid = prevNid || 0; }
@@ -856,8 +868,8 @@ class Node {
   }
   removeChild(c) {
     if (!c) return c;
-    _dom("remove_child", c._nid);
-    if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('childList', this._nid, [], [c._nid]);
+    _dom("remove_child", _nodeId(c));
+    if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('childList', _nodeId(this), [], [_nodeId(c)]);
     return c;
   }
   replaceChild(newChild, oldChild) {
@@ -868,8 +880,8 @@ class Node {
       this.removeChild(oldChild);
       return oldChild;
     }
-    _dom("insert_before", newChild._nid, oldChild._nid);
-    _dom("remove_child", oldChild._nid);
+    _dom("insert_before", _nodeId(newChild), _nodeId(oldChild));
+    _dom("remove_child", _nodeId(oldChild));
     return oldChild;
   }
   insertBefore(n, ref) {
@@ -880,11 +892,11 @@ class Node {
       for (const child of children) this.insertBefore(child, ref);
       return n;
     }
-    _dom("insert_before", n._nid, ref._nid);
+    _dom("insert_before", _nodeId(n), _nodeId(ref));
     return n;
   }
-  contains(o) { return o ? _dom("contains", this._nid, o._nid) === "true" : false; }
-  hasChildNodes() { return _dom("has_child_nodes", this._nid) === "true"; }
+  contains(o) { return o ? _dom("contains", _nodeId(this), _nodeId(o)) === "true" : false; }
+  hasChildNodes() { return _dom("has_child_nodes", _nodeId(this)) === "true"; }
   cloneNode(deep) {
     // Clone structurally via real DOM nodes rather than round-tripping through a
     // throwaway <div>.innerHTML: the fragment parser discards elements that are
@@ -921,17 +933,17 @@ class Node {
   }
   compareDocumentPosition(other) {
     if (!other) return 0;
-    if (this._nid === other._nid) return 0;
+    if (_nodeId(this) === _nodeId(other)) return 0;
     // Different roots: DISCONNECTED | IMPLEMENTATION_SPECIFIC plus a stable
     // (consistent across calls) PRECEDING/FOLLOWING bit, chosen by node-id order.
-    if (+_dom("node_root", this._nid) !== +_dom("node_root", other._nid)) {
-      return 1 | 32 | ((this._nid < other._nid) ? 4 : 2);
+    if (+_dom("node_root", _nodeId(this)) !== +_dom("node_root", _nodeId(other))) {
+      return 1 | 32 | ((_nodeId(this) < _nodeId(other)) ? 4 : 2);
     }
     if (this.contains(other)) return 16 | 4;          // CONTAINED_BY | FOLLOWING
     if (other.contains && other.contains(this)) return 8 | 2; // CONTAINS | PRECEDING
     // Same root, neither contains the other: real tree order (compare_order op:
     // -1 => this precedes other => other FOLLOWS this(4); +1 => this PRECEDING(2)).
-    return (+_dom("compare_order", this._nid, other._nid) < 0) ? 4 : 2;
+    return (+_dom("compare_order", _nodeId(this), _nodeId(other)) < 0) ? 4 : 2;
   }
   getRootNode() { return globalThis.document; }
   normalize() {
@@ -954,7 +966,7 @@ class Node {
   }
   isEqualNode(other) {
     if (!other) return false;
-    if (this._nid === other._nid) return true;
+    if (_nodeId(this) === _nodeId(other)) return true;
     if (this.nodeType !== other.nodeType) return false;
     if (this.nodeName !== other.nodeName) return false;
     if (this.nodeValue !== other.nodeValue) return false;
@@ -974,18 +986,18 @@ class Node {
     }
     return true;
   }
-  isSameNode(other) { return other && this._nid === other._nid; }
+  isSameNode(other) { return other && _nodeId(this) === _nodeId(other); }
   addEventListener() {} removeEventListener() {} dispatchEvent() { return true; }
 }
 class CharacterData extends Node {
   get data() {
-    return _domParse("text_content", this._nid) ?? "";
+    return _domParse("text_content", _nodeId(this)) ?? "";
   }
   set data(v) {
-    const oldValue = _domParse("text_content", this._nid) ?? "";
-    _dom("set_text_content", this._nid, String(v ?? ""));
+    const oldValue = _domParse("text_content", _nodeId(this)) ?? "";
+    _dom("set_text_content", _nodeId(this), String(v ?? ""));
     if (globalThis.__mutationObservers?.length) {
-      globalThis.__notifyMutation('characterData', this._nid, [], [], null, oldValue);
+      globalThis.__notifyMutation('characterData', _nodeId(this), [], [], null, oldValue);
     }
   }
   get length() { return this.data.length; }
@@ -1315,13 +1327,13 @@ function _parseHTMLFragment(html, context) {
 class Element extends Node {
   constructor(nid) {
     super(nid);
-    this._style = _styleProxy(new CSSStyleDeclaration(this));
+    _nodeSlots.get(this).style = _styleProxy(new CSSStyleDeclaration(this));
   }
   // Element wrappers always back a nodeType-1 node (_wrap/_wrapEl only build an
   // Element for element nodes, and node ids are never freed-and-reused), so this
   // is constant. Overrides Node's dynamic getter to drop one op per nodeType read.
   get nodeType() { return 1; }
-  get tagName() { return _domParse("tag_name", this._nid) || ""; }
+  get tagName() { return _domParse("tag_name", _nodeId(this)) || ""; }
   get localName() {
     // tagName is an op call and the tag never changes, so cache the lowercased
     // localName. This keeps the new <a>/<area> href getters (which read
@@ -1355,7 +1367,7 @@ class Element extends Node {
     // instead of an SVGAnimatedString. An element's namespace never changes,
     // so cache it like _lname.
     if (this._nsCache !== undefined) return this._nsCache;
-    let ns = _domParse("namespace_uri", this._nid) || "";
+    let ns = _domParse("namespace_uri", _nodeId(this)) || "";
     // Nodes with no element name recorded fall back to the previous heuristic.
     if (!ns) ns = this.localName === "svg" ? "http://www.w3.org/2000/svg" : "http://www.w3.org/1999/xhtml";
     this._nsCache = ns;
@@ -1363,7 +1375,7 @@ class Element extends Node {
   }
   // `inner_html` resolves a <template> to its contents document on the Rust
   // side (issue #463), so this needs no template special case.
-  get innerHTML() { return _domParse("inner_html", this._nid) ?? ""; }
+  get innerHTML() { return _domParse("inner_html", _nodeId(this)) ?? ""; }
   set innerHTML(v) {
     if (this.localName === 'template') {
       this.content.innerHTML = v;
@@ -1378,19 +1390,19 @@ class Element extends Node {
     let oldChildren = [];
     let newChildren = [];
     if (globalThis.__mutationObservers?.length) {
-      oldChildren = _domParse("child_nodes", this._nid) || [];
+      oldChildren = _domParse("child_nodes", _nodeId(this)) || [];
     }
-    _dom("set_inner_html", this._nid, String(v ?? ""));
+    _dom("set_inner_html", _nodeId(this), String(v ?? ""));
     if (globalThis.__mutationObservers?.length) {
-      newChildren = _domParse("child_nodes", this._nid) || [];
-      globalThis.__notifyMutation('childList', this._nid, newChildren, oldChildren);
+      newChildren = _domParse("child_nodes", _nodeId(this)) || [];
+      globalThis.__notifyMutation('childList', _nodeId(this), newChildren, oldChildren);
     }
   }
-  get outerHTML() { return _domParse("outer_html", this._nid) ?? ""; }
+  get outerHTML() { return _domParse("outer_html", _nodeId(this)) ?? ""; }
   get innerText() { return this.textContent; }
   set innerText(v) { this.textContent = v; }
   get children() {
-    const ids = _domParse("element_children", this._nid) || [];
+    const ids = _domParse("element_children", _nodeId(this)) || [];
     return HTMLCollection._from(ids.map(_wrapEl).filter(Boolean));
   }
   get content() {
@@ -1406,7 +1418,7 @@ class Element extends Node {
       // instead of under the element, so without this the getter handed back a
       // fabricated empty fragment and the parsed markup was unreachable.
       // `template_contents` allocates one on demand for created templates.
-      const nid = +_dom("template_contents", this._nid);
+      const nid = +_dom("template_contents", _nodeId(this));
       if (nid >= 0) {
         // Cache by node id so `.content` keeps a stable identity across reads —
         // frameworks stash the fragment and compare it later.
@@ -1470,46 +1482,46 @@ class Element extends Node {
       this.setAttribute("for", String(v));
     }
   }
-  get style() { return this._style; }
-  set style(v) { if (typeof v === "string") this._style.cssText = v; }
+  get style() { return _nodeStyle(this); }
+  set style(v) { if (typeof v === "string") _nodeStyle(this).cssText = v; }
   getAttribute(n) {
     // Fast path: HTML attributes are stored lowercase, so a direct hit needs no
     // case folding. Only on a miss do we lowercase (gated) and retry, so the hot
     // case (reading an existing lowercase attribute) pays zero scan.
-    let v = _domParse("get_attribute", this._nid, n);
-    if (v === null) { const ln = _htmlAttrName(this, n); if (ln !== n) v = _domParse("get_attribute", this._nid, ln); }
+    let v = _domParse("get_attribute", _nodeId(this), n);
+    if (v === null) { const ln = _htmlAttrName(this, n); if (ln !== n) v = _domParse("get_attribute", _nodeId(this), ln); }
     return v;
   }
   setAttribute(n, v) {
     n = _htmlAttrName(this, n);
     const popoverPrev = (n === "popover") ? this.popover : undefined;
     const value = String(v);
-    _dom("set_attribute", this._nid, n + "\0" + value);
-    if (n === "style") this._style._replaceFromAttribute(value);
+    _dom("set_attribute", _nodeId(this), n + "\0" + value);
+    if (n === "style") _nodeStyle(this)._replaceFromAttribute(value);
     if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev);
-    if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('attributes', this._nid, [], [], n);
+    if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('attributes', _nodeId(this), [], [], n);
   }
   setAttributeNS(ns, n, v) {
     ns = ns == null || ns === '' ? '' : String(ns);
     n = String(n);
     const value = String(v);
     _ns_validateQualifiedName(ns, n);
-    _dom("set_attribute_ns", this._nid, ns + "\0" + n + "\0" + value);
-    if (ns === "" && n === "style") this._style._replaceFromAttribute(value);
+    _dom("set_attribute_ns", _nodeId(this), ns + "\0" + n + "\0" + value);
+    if (ns === "" && n === "style") _nodeStyle(this)._replaceFromAttribute(value);
   }
-  removeAttribute(n) { n = _htmlAttrName(this, n); const popoverPrev = (n === "popover") ? this.popover : undefined; _dom("remove_attribute", this._nid, n); if (n === "style") this._style._replaceFromAttribute(""); if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev); }
+  removeAttribute(n) { n = _htmlAttrName(this, n); const popoverPrev = (n === "popover") ? this.popover : undefined; _dom("remove_attribute", _nodeId(this), n); if (n === "style") _nodeStyle(this)._replaceFromAttribute(""); if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev); }
   removeAttributeNS(ns, n) {
     ns = String(ns == null ? "" : ns);
     n = String(n);
-    _dom("remove_attribute_ns", this._nid, ns + "\0" + n);
-    if (ns === "" && n === "style") this._style._replaceFromAttribute("");
+    _dom("remove_attribute_ns", _nodeId(this), ns + "\0" + n);
+    if (ns === "" && n === "style") _nodeStyle(this)._replaceFromAttribute("");
   }
   hasAttribute(n) { return this.getAttribute(n) !== null; }
   hasAttributes() { return true; } // Simplified
-  getAttributeNames() { return _domParse("attribute_names", this._nid) || []; }
+  getAttributeNames() { return _domParse("attribute_names", _nodeId(this)) || []; }
   get attributes() {
     const el = this;
-    const names = _domParse("attribute_names", el._nid) || [];
+    const names = _domParse("attribute_names", _nodeId(el)) || [];
     const list = names.map((name) => {
       const v = el.getAttribute(name) ?? "";
       return {
@@ -1535,10 +1547,10 @@ class Element extends Node {
     }
     return list;
   }
-  getAttributeNS(ns, n) { return _domParse("get_attribute_ns", this._nid, String(ns == null ? "" : ns) + "\0" + String(n)); }
-  querySelector(s) { return _wrapEl(+_dom("query_selector_scoped", this._nid, s)); }
+  getAttributeNS(ns, n) { return _domParse("get_attribute_ns", _nodeId(this), String(ns == null ? "" : ns) + "\0" + String(n)); }
+  querySelector(s) { return _wrapEl(+_dom("query_selector_scoped", _nodeId(this), s)); }
   querySelectorAll(s) {
-    const ids = _domParse("query_selector_all_scoped", this._nid, s) || [];
+    const ids = _domParse("query_selector_all_scoped", _nodeId(this), s) || [];
     return _nodeList(ids.map(_wrapEl).filter(Boolean));
   }
   getElementsByTagName(t) { return HTMLCollection._from(this.querySelectorAll(t)); }
@@ -1565,7 +1577,7 @@ class Element extends Node {
     if (!parent || !parent.querySelectorAll) return false;
     const matches = parent.querySelectorAll(s);
     for (let i = 0; i < matches.length; i++) {
-      if (matches[i]._nid === this._nid) return true;
+      if (_nodeId(matches[i]) === _nodeId(this)) return true;
     }
     return false;
   }
@@ -1650,13 +1662,13 @@ class Element extends Node {
     return null;
   }
   addEventListener(type, handler, opts) {
-    const key = this._nid;
+    const key = _nodeId(this);
     if (!_eventRegistry[key]) _eventRegistry[key] = {};
     if (!_eventRegistry[key][type]) _eventRegistry[key][type] = [];
     _eventRegistry[key][type].push(handler);
   }
   removeEventListener(type, handler) {
-    const key = this._nid;
+    const key = _nodeId(this);
     if (_eventRegistry[key] && _eventRegistry[key][type]) {
       _eventRegistry[key][type] = _eventRegistry[key][type].filter(h => h !== handler);
     }
@@ -1679,7 +1691,7 @@ class Element extends Node {
         if (ret === false) event.preventDefault();
       } catch(e) { console.error(e); }
     }
-    const handlers = (_eventRegistry[this._nid] || {})[event.type] || [];
+    const handlers = (_eventRegistry[_nodeId(this)] || {})[event.type] || [];
     for (const h of handlers) {
       try { h.call(this, event); } catch(e) { console.error(e); }
       if (event._immediatePropagationStopped) break;
@@ -1741,7 +1753,7 @@ class Element extends Node {
   _popoverAttrValue() {
     const v = this.getAttribute("popover");
     if (v !== null) return v;
-    const names = _domParse("attribute_names", this._nid) || [];
+    const names = _domParse("attribute_names", _nodeId(this)) || [];
     for (let i = 0; i < names.length; i++) {
       if (names[i].toLowerCase() === "popover") return this.getAttribute(names[i]);
     }
@@ -1764,7 +1776,7 @@ class Element extends Node {
   }
   _popoverRemoveAttr() {
     if (this.getAttribute("popover") !== null) { this.removeAttribute("popover"); return; }
-    const names = _domParse("attribute_names", this._nid) || [];
+    const names = _domParse("attribute_names", _nodeId(this)) || [];
     for (let i = 0; i < names.length; i++) {
       if (names[i].toLowerCase() === "popover") { this.removeAttribute(names[i]); return; }
     }
@@ -1895,7 +1907,7 @@ class Element extends Node {
       if (opts.length) return opts[0].getAttribute('value') !== null ? opts[0].getAttribute('value') : opts[0].textContent;
       return '';
     }
-    if (_formValues[this._nid] !== undefined) return _formValues[this._nid];
+    if (_formValues[_nodeId(this)] !== undefined) return _formValues[_nodeId(this)];
     if (tag === 'textarea') return this.textContent;
     if (tag === 'option') {
       const attr = this.getAttribute('value');
@@ -1941,7 +1953,7 @@ class Element extends Node {
       if (matched) try { this.dispatchEvent(new Event('change', { bubbles: true })); } catch (e) {}
       return;
     }
-    _formValues[this._nid] = String(v);
+    _formValues[_nodeId(this)] = String(v);
     if (tag === 'textarea') {
       this.textContent = String(v);
     }
@@ -2019,10 +2031,10 @@ class Element extends Node {
     this.value = _inputFormatNumber(t, value);
   }
   get checked() {
-    if (_formChecked[this._nid] !== undefined) return _formChecked[this._nid];
+    if (_formChecked[_nodeId(this)] !== undefined) return _formChecked[_nodeId(this)];
     return this.hasAttribute("checked");
   }
-  set checked(v) { _formChecked[this._nid] = !!v; }
+  set checked(v) { _formChecked[_nodeId(this)] = !!v; }
   get selected() {
     if (this._selected !== undefined) return this._selected;
     return this.hasAttribute("selected");
@@ -2338,7 +2350,7 @@ class Element extends Node {
     // to fit a 1280x720 viewport. Stable across reads, different per node.
     const VW = 1280, VH = 720, COLS = 12, CW = 100, CH = 20, GX = 110, GY = 30;
     const rowsPerScreen = Math.max(1, Math.floor((VH - 10) / GY));
-    const cell = this._nid | 0;
+    const cell = _nodeId(this) | 0;
     const col = ((cell * 7) | 0) % COLS;
     const row = (((cell * 13) | 0) >> 0) % rowsPerScreen;
     const x = 10 + col * GX;
@@ -2446,7 +2458,7 @@ function _convertNodes(nodes) {
   const out = [];
   for (let i = 0; i < nodes.length; i++) {
     const n = nodes[i];
-    if (n && typeof n._nid === "number") out.push(n);
+    if (n && typeof _nodeId(n) === "number") out.push(n);
     else out.push(document.createTextNode(String(n)));
   }
   return out;
@@ -2669,7 +2681,7 @@ class Document extends Node {
   // (HTTP Content-Type -> <meta charset>). characterSet/charset/inputEncoding
   // are WHATWG aliases. A node-less document (DOMParser/createDocument) has no
   // backing encoding and reports UTF-8.
-  get characterSet() { return (this._nid === undefined || this._nid === null) ? "UTF-8" : _docEncoding(); }
+  get characterSet() { return (_nodeId(this) === undefined || _nodeId(this) === null) ? "UTF-8" : _docEncoding(); }
   get charset() { return this.characterSet; }
   get inputEncoding() { return this.characterSet; }
   get contentType() {
@@ -2678,7 +2690,7 @@ class Document extends Node {
     // `new Document()` (the WHATWG constructor, no backing node id) creates an
     // XML document, so createCDATASection/etc. must not throw. Live documents
     // wrapped from the tree carry a real nid and fall through to URL-derived.
-    if (this._nid === undefined || this._nid === null) return "application/xml";
+    if (_nodeId(this) === undefined || _nodeId(this) === null) return "application/xml";
     const url = this.URL || "";
     // data: URLs carry their MIME type explicitly.
     const dm = /^data:([^,;]+)/i.exec(url);
@@ -2844,14 +2856,14 @@ class Document extends Node {
       },
       _accept(node) { return this._filter(node) === 1; },
       nextNode() {
-        let node = _wrap(+_dom("next_in_subtree", this.root._nid, this.currentNode._nid));
+        let node = _wrap(+_dom("next_in_subtree", _nodeId(this.root), _nodeId(this.currentNode)));
         while (node) {
           const verdict = this._filter(node);
           if (verdict === 1) { this.currentNode = node; return node; }
           // FILTER_REJECT skips the node AND its subtree; FILTER_SKIP (and any
           // other non-accept value) skips only the node.
           const step = verdict === 2 ? "next_after_subtree" : "next_in_subtree";
-          node = _wrap(+_dom(step, this.root._nid, node._nid));
+          node = _wrap(+_dom(step, _nodeId(this.root), _nodeId(node)));
         }
         return null;
       },
@@ -2998,7 +3010,7 @@ class Document extends Node {
             before = !before;
           } else {
             const step = forward ? "next_in_subtree" : "prev_in_subtree";
-            const next = _wrap(+_dom(step, this.root._nid, node._nid));
+            const next = _wrap(+_dom(step, _nodeId(this.root), _nodeId(node)));
             // A failed traversal leaves referenceNode and the pointer
             // untouched, so the iterator can be resumed in either direction.
             if (!next) return null;
@@ -3125,15 +3137,15 @@ class DocumentFragment extends Node {
   }
   get nodeType() { return 11; }
   get nodeName() { return "#document-fragment"; }
-  get innerHTML() { return _domParse("inner_html", this._nid) ?? ""; }
-  set innerHTML(v) { _dom("set_inner_html", this._nid, String(v ?? "")); }
-  querySelector(s) { return _wrapEl(+_dom("query_selector_scoped", this._nid, s)); }
+  get innerHTML() { return _domParse("inner_html", _nodeId(this)) ?? ""; }
+  set innerHTML(v) { _dom("set_inner_html", _nodeId(this), String(v ?? "")); }
+  querySelector(s) { return _wrapEl(+_dom("query_selector_scoped", _nodeId(this), s)); }
   querySelectorAll(s) {
-    const ids = _domParse("query_selector_all_scoped", this._nid, s) || [];
+    const ids = _domParse("query_selector_all_scoped", _nodeId(this), s) || [];
     return _nodeList(ids.map(_wrapEl).filter(Boolean));
   }
   get children() {
-    const ids = _domParse("element_children", this._nid) || [];
+    const ids = _domParse("element_children", _nodeId(this)) || [];
     return HTMLCollection._from(ids.map(_wrapEl).filter(Boolean));
   }
   get firstElementChild() { return this.children[0] || null; }
@@ -3362,8 +3374,10 @@ for (let i = 0; i < 50; i++) {
 
 // Navigator constructor so that typeof Navigator !== 'undefined' and
 // navigatorPrototype checks don't throw a ReferenceError.
-function Navigator() {}
+const _navigatorInstances = new WeakSet();
+function Navigator() { throw new TypeError('Illegal constructor'); }
 _markNative(Navigator);
+globalThis.Navigator = Navigator;
 
 // PluginArray must exist before navigator is built so the plugins getter can use it.
 function PluginArray(items) {
@@ -3566,6 +3580,7 @@ globalThis.navigator = {
     persisted() { return Promise.resolve(false); },
   },
 };
+_navigatorInstances.add(globalThis.navigator);
 
 // Put spoofed navigator props on a thin prototype above Navigator.prototype
 // so hasOwnProperty/getOwnPropertyDescriptor on the instance match Chrome.
@@ -4487,7 +4502,7 @@ globalThis.matchMedia = _markNative(function matchMedia(q) {
 });
 globalThis.getComputedStyle = (el) => {
   if (!el) el = document.body || {};
-  const style = el?.style || el?._style || new CSSStyleDeclaration();
+  const style = el?.style || _nodeStyle(el) || new CSSStyleDeclaration();
   // React virtualization libraries (react-window, tanstack-virtual,
   // react-virtuoso) all compute container dimensions via getComputedStyle.
   // The defaults table previously returned `auto` for width/height and
@@ -4691,12 +4706,12 @@ globalThis.__notifyMutation = function(type, target_nid, addedNodes, removedNode
         (type === 'characterData' && t.options.characterData) ||
         (type === 'childList' && t.options.childList);
       if (!wantsType) continue;
-      if (root._nid === target_nid) { matched = true; break; }
+      if (_nodeId(root) === target_nid) { matched = true; break; }
       if (t.options.subtree) {
         // Walk parents until we hit the observed root or run off the tree.
         let cur = target.parentNode;
         while (cur) {
-          if (cur._nid === root._nid) { matched = true; break; }
+          if (_nodeId(cur) === _nodeId(root)) { matched = true; break; }
           cur = cur.parentNode;
         }
         if (matched) break;
@@ -6130,18 +6145,18 @@ function _rngNodeLength(n) {
 // whole childNodes list per call: the Range matrices call this heavily.
 function _rngNodeIndex(n) {
   if (!n.parentNode) return 0;
-  return +_dom("node_index", n._nid);
+  return +_dom("node_index", _nodeId(n));
 }
-function _rngSame(a, b) { return a === b || (!!a && !!b && a._nid === b._nid); }
-// Root nid in one op (callers only read ._nid), instead of an O(depth) walk.
-function _rngRoot(n) { return { _nid: +_dom("node_root", n._nid) }; }
+function _rngSame(a, b) { return a === b || (!!a && !!b && _nodeId(a) === _nodeId(b)); }
+// Root nid in one op, instead of an O(depth) walk.
+function _rngRoot(n) { return +_dom("node_root", _nodeId(n)); }
 function _rngAncestors(n) { const a = []; let c = n; while (c) { a.push(c); c = c.parentNode; } return a; }
 // document (preorder) tree order: -1 if a precedes b, 1 if a follows b, 0 same.
 // Computed in Rust (one op) rather than walking ancestor chains over per-step
 // DOM ops, which made the large dom/ranges matrices time out.
 function _rngOrder(a, b) {
   if (_rngSame(a, b)) return 0;
-  return +_dom("compare_order", a._nid, b._nid) || 0;
+  return +_dom("compare_order", _nodeId(a), _nodeId(b)) || 0;
 }
 // Position of (nA,oA) relative to (nB,oB): -1 before, 0 equal, 1 after.
 function _rngCmp(nA, oA, nB, oB) {
@@ -6149,8 +6164,8 @@ function _rngCmp(nA, oA, nB, oB) {
   if (_rngOrder(nA, nB) > 0) return -_rngCmp(nB, oB, nA, oA);
   if (nA.contains && nA.contains(nB)) { // nA is a strict ancestor of nB
     let child = nB;
-    while (child && child.parentNode && child.parentNode._nid !== nA._nid) child = child.parentNode;
-    if (child && child.parentNode && child.parentNode._nid === nA._nid && _rngNodeIndex(child) < oA) return 1;
+    while (child && child.parentNode && _nodeId(child.parentNode) !== _nodeId(nA)) child = child.parentNode;
+    if (child && child.parentNode && _nodeId(child.parentNode) === _nodeId(nA) && _rngNodeIndex(child) < oA) return 1;
     return -1;
   }
   return -1;
@@ -6171,13 +6186,13 @@ globalThis.Range = class Range {
   get collapsed() { return _rngSame(this._sc, this._ec) && this._so === this._eo; }
   get commonAncestorContainer() {
     if (!this._sc || !this._ec) return null;
-    const setA = new Set(_rngAncestors(this._sc).map(n => n._nid));
+    const setA = new Set(_rngAncestors(this._sc).map(n => _nodeId(n)));
     let c = this._ec;
-    while (c) { if (setA.has(c._nid)) return c; c = c.parentNode; }
+    while (c) { if (setA.has(_nodeId(c))) return c; c = c.parentNode; }
     return null;
   }
-  setStart(n, o) { _rngCheckOffset(n, o); this._sc = n; this._so = o; if (_rngRoot(n)._nid !== _rngRoot(this._ec)._nid || _rngCmp(this._sc, this._so, this._ec, this._eo) > 0) { this._ec = n; this._eo = o; } }
-  setEnd(n, o) { _rngCheckOffset(n, o); this._ec = n; this._eo = o; if (_rngRoot(n)._nid !== _rngRoot(this._sc)._nid || _rngCmp(this._sc, this._so, this._ec, this._eo) > 0) { this._sc = n; this._so = o; } }
+  setStart(n, o) { _rngCheckOffset(n, o); this._sc = n; this._so = o; if (_rngRoot(n) !== _rngRoot(this._ec) || _rngCmp(this._sc, this._so, this._ec, this._eo) > 0) { this._ec = n; this._eo = o; } }
+  setEnd(n, o) { _rngCheckOffset(n, o); this._ec = n; this._eo = o; if (_rngRoot(n) !== _rngRoot(this._sc) || _rngCmp(this._sc, this._so, this._ec, this._eo) > 0) { this._sc = n; this._so = o; } }
   setStartBefore(n) { const p = n.parentNode; if (!p) throw new DOMException("node has no parent", "InvalidNodeTypeError"); this.setStart(p, _rngNodeIndex(n)); }
   setStartAfter(n) { const p = n.parentNode; if (!p) throw new DOMException("node has no parent", "InvalidNodeTypeError"); this.setStart(p, _rngNodeIndex(n) + 1); }
   setEndBefore(n) { const p = n.parentNode; if (!p) throw new DOMException("node has no parent", "InvalidNodeTypeError"); this.setEnd(p, _rngNodeIndex(n)); }
@@ -6187,7 +6202,7 @@ globalThis.Range = class Range {
   selectNodeContents(n) { if (n && n.nodeType === 10) throw new DOMException("cannot select a DocumentType", "InvalidNodeTypeError"); const len = _rngNodeLength(n); this._sc = n; this._so = 0; this._ec = n; this._eo = len; }
   comparePoint(n, o) {
     o = o >>> 0; // offset is a WebIDL unsigned long: -1 -> 4294967295 -> IndexSizeError
-    if (_rngRoot(n)._nid !== _rngRoot(this._sc)._nid) throw new DOMException("nodes are in different trees", "WrongDocumentError");
+    if (_rngRoot(n) !== _rngRoot(this._sc)) throw new DOMException("nodes are in different trees", "WrongDocumentError");
     if (n.nodeType === 10) throw new DOMException("node is a DocumentType", "InvalidNodeTypeError");
     if (o > _rngNodeLength(n)) throw new DOMException("offset out of bounds", "IndexSizeError");
     if (_rngCmp(n, o, this._sc, this._so) < 0) return -1;
@@ -6196,7 +6211,7 @@ globalThis.Range = class Range {
   }
   isPointInRange(n, o) {
     o = o >>> 0;
-    if (!this._sc || _rngRoot(n)._nid !== _rngRoot(this._sc)._nid) return false;
+    if (!this._sc || _rngRoot(n) !== _rngRoot(this._sc)) return false;
     if (n.nodeType === 10) throw new DOMException("node is a DocumentType", "InvalidNodeTypeError");
     if (o > _rngNodeLength(n)) throw new DOMException("offset out of bounds", "IndexSizeError");
     return _rngCmp(n, o, this._sc, this._so) >= 0 && _rngCmp(n, o, this._ec, this._eo) <= 0;
@@ -6218,13 +6233,13 @@ globalThis.Range = class Range {
     // Different roots -> WrongDocumentError. Guard so a null/foreign container
     // raises that DOMException rather than a raw TypeError from _rngRoot.
     let differ;
-    try { differ = _rngRoot(a[0])._nid !== _rngRoot(b[0])._nid; }
+    try { differ = _rngRoot(a[0]) !== _rngRoot(b[0]); }
     catch (e) { differ = true; }
     if (differ) throw new DOMException("The two Ranges are not in the same tree.", "WrongDocumentError");
     return _rngCmp(a[0], a[1], b[0], b[1]);
   }
   intersectsNode(n) {
-    if (_rngRoot(n)._nid !== _rngRoot(this._sc)._nid) return false;
+    if (_rngRoot(n) !== _rngRoot(this._sc)) return false;
     const p = n.parentNode;
     if (!p) return true;
     const o = _rngNodeIndex(n);
@@ -6328,10 +6343,10 @@ globalThis.Selection = class Selection {
   setPosition(node, offset) { this.collapse(node, offset); }
   collapseToStart() { if (!this._range) throw new DOMException('There is no selection to collapse.', 'InvalidStateError'); const r = new Range(); r.setStart(this._range.startContainer, this._range.startOffset); r.setEnd(this._range.startContainer, this._range.startOffset); this._setRange(r, 'forwards'); }
   collapseToEnd() { if (!this._range) throw new DOMException('There is no selection to collapse.', 'InvalidStateError'); const r = new Range(); r.setStart(this._range.endContainer, this._range.endOffset); r.setEnd(this._range.endContainer, this._range.endOffset); this._setRange(r, 'forwards'); }
-  extend(node, offset) { if (!this._range) throw new DOMException('There is no selection to extend.', 'InvalidStateError'); if (!this._inDoc(node)) return; offset = offset >>> 0; _rngCheckOffset(node, offset); const a = this._anchor; const r = new Range(); if (_rngRoot(node)._nid !== _rngRoot(a[0])._nid) { r.setStart(node, offset); r.setEnd(node, offset); this._setRange(r, 'forwards'); return; } if (_rngCmp(a[0], a[1], node, offset) <= 0) { r.setStart(a[0], a[1]); r.setEnd(node, offset); this._setRange(r, 'forwards'); } else { r.setStart(node, offset); r.setEnd(a[0], a[1]); this._setRange(r, 'backwards'); } }
+  extend(node, offset) { if (!this._range) throw new DOMException('There is no selection to extend.', 'InvalidStateError'); if (!this._inDoc(node)) return; offset = offset >>> 0; _rngCheckOffset(node, offset); const a = this._anchor; const r = new Range(); if (_rngRoot(node) !== _rngRoot(a[0])) { r.setStart(node, offset); r.setEnd(node, offset); this._setRange(r, 'forwards'); return; } if (_rngCmp(a[0], a[1], node, offset) <= 0) { r.setStart(a[0], a[1]); r.setEnd(node, offset); this._setRange(r, 'forwards'); } else { r.setStart(node, offset); r.setEnd(a[0], a[1]); this._setRange(r, 'backwards'); } }
   setBaseAndExtent(aN, aO, fN, fO) { if (arguments.length < 4) throw new TypeError("Failed to execute 'setBaseAndExtent' on 'Selection': 4 arguments required."); if (aN == null || fN == null) throw new TypeError("Failed to execute 'setBaseAndExtent' on 'Selection': nodes must not be null."); aO = +aO; fO = +fO; if (aO < 0 || aO > _rngNodeLength(aN)) throw new DOMException('anchor offset out of range', 'IndexSizeError'); if (fO < 0 || fO > _rngNodeLength(fN)) throw new DOMException('focus offset out of range', 'IndexSizeError'); if (!this._inDoc(aN) || !this._inDoc(fN)) { this.removeAllRanges(); return; } const r = new Range(); if (_rngCmp(aN, aO, fN, fO) <= 0) { r.setStart(aN, aO); r.setEnd(fN, fO); this._setRange(r, 'forwards'); } else { r.setStart(fN, fO); r.setEnd(aN, aO); this._setRange(r, 'backwards'); } }
   selectAllChildren(node) { if (node && node.nodeType === 10) throw new DOMException('cannot selectAllChildren of a DocumentType', 'InvalidNodeTypeError'); if (!this._inDoc(node)) return; const len = _rngNodeLength(node); const r = new Range(); r.setStart(node, 0); r.setEnd(node, len); this._setRange(r, 'forwards'); }
-  containsNode(node, allowPartial) { const r = this._range; if (!r || !node) return false; if (_rngRoot(node)._nid !== _rngRoot(r.startContainer)._nid) return false; const len = _rngNodeLength(node); if (allowPartial) return _rngCmp(node, len, r.startContainer, r.startOffset) > 0 && _rngCmp(node, 0, r.endContainer, r.endOffset) < 0; return _rngCmp(node, 0, r.startContainer, r.startOffset) >= 0 && _rngCmp(node, len, r.endContainer, r.endOffset) <= 0; }
+  containsNode(node, allowPartial) { const r = this._range; if (!r || !node) return false; if (_rngRoot(node) !== _rngRoot(r.startContainer)) return false; const len = _rngNodeLength(node); if (allowPartial) return _rngCmp(node, len, r.startContainer, r.startOffset) > 0 && _rngCmp(node, 0, r.endContainer, r.endOffset) < 0; return _rngCmp(node, 0, r.startContainer, r.startOffset) >= 0 && _rngCmp(node, len, r.endContainer, r.endOffset) <= 0; }
   deleteFromDocument() { if (this._range) this._range.deleteContents(); }
   toString() { return this._range ? this._range.toString() : ''; }
   modify() {}
@@ -6902,6 +6917,7 @@ Element.prototype.attachShadow = function attachShadow(opts) {
   }
   const host = this;
   const children = [];
+  const shadowNid = +_dom("create_document_fragment");
   const shadow = {
     mode: opts.mode,
     host: host,
@@ -6971,7 +6987,7 @@ Element.prototype.attachShadow = function attachShadow(opts) {
     setHTMLUnsafe(v) { this.innerHTML = String(v == null ? "" : v); },
     getHTML() { return this.innerHTML; },
     // Own textContent: ShadowRoot now extends DocumentFragment, so without
-    // these the inherited Node accessors run against this._nid. The setter in
+    // these the inherited Node accessors run against _nodeId(this). The setter in
     // particular would target the host document and wipe it. Operate on the
     // shadow's own `children` store instead.
     get textContent() { return children.map(c => c.textContent || "").join(""); },
@@ -6980,14 +6996,11 @@ Element.prototype.attachShadow = function attachShadow(opts) {
       if (v != null && v !== "") children.push(document.createTextNode(String(v)));
     },
     hasChildNodes() { return children.length > 0; },
-    // A detached fragment id backs any inherited nid-based method we do not
-    // override, so they stay non-destructive (operate on an empty fragment)
-    // rather than falling through to node 0 / the document.
-    _nid: +_dom("create_document_fragment"),
     activeElement: null,
     get styleSheets() { return []; },
     cloneNode() { throw new DOMException('Failed to execute cloneNode on Node: ShadowRoot nodes are not clonable.', 'NotSupportedError'); },
   };
+  _nodeSlots.set(shadow, {nid:shadowNid, style:null});
   Object.setPrototypeOf(shadow, ShadowRoot.prototype);
   this._shadowRoot = shadow;
   return shadow;
@@ -8278,7 +8291,7 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
       var r = el.getBoundingClientRect();
       if (r.width === 0 || r.height === 0) continue;
       if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) {
-        var nid = el._nid | 0;
+        var nid = _nodeId(el) | 0;
         if (nid > bestNid) { best = el; bestNid = nid; }
       }
     }
@@ -8858,22 +8871,38 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
 // already report native, so only the JS-backed members are affected.
 (function _markBuiltinsNative() {
   var seen = new Set();
-  function walk(ctor) {
-    if (typeof ctor !== 'function') { return; }
-    _markNative(ctor);
-    var proto = ctor.prototype;
+  function walkPrototype(proto) {
     if (!proto || seen.has(proto)) { return; }
     seen.add(proto);
-    var keys = Object.getOwnPropertyNames(proto);
+    var keys = Reflect.ownKeys(proto);
     for (var i = 0; i < keys.length; i++) {
       var key = keys[i];
+      var keyName = typeof key === 'symbol' ? '[' + String(key).slice(7, -1) + ']' : key;
       var d;
       try { d = Object.getOwnPropertyDescriptor(proto, key); } catch (e) { continue; }
       if (!d) { continue; }
-      if (typeof d.value === 'function') { _markNative(d.value); }
-      if (typeof d.get === 'function') { _markNativeAs(d.get, 'function get ' + key + '() { [native code] }'); }
-      if (typeof d.set === 'function') { _markNativeAs(d.set, 'function set ' + key + '() { [native code] }'); }
+      var changed = false;
+      if (key !== 'constructor' && typeof d.value === 'function') {
+        if ('prototype' in d.value) { d.value = _makeNativeFunction(d.value, key, d.value.length); changed = true; }
+        else { _markNative(d.value); }
+      }
+      if (typeof d.get === 'function') {
+        if ('prototype' in d.get) { d.get = _makeNativeFunction(d.get, 'get ' + keyName, 0, 'function get ' + keyName + '() { [native code] }'); changed = true; }
+        else { _markNativeAs(d.get, 'function get ' + keyName + '() { [native code] }'); }
+      }
+      if (typeof d.set === 'function') {
+        if ('prototype' in d.set) { d.set = _makeNativeFunction(d.set, 'set ' + keyName, 1, 'function set ' + keyName + '() { [native code] }'); changed = true; }
+        else { _markNativeAs(d.set, 'function set ' + keyName + '() { [native code] }'); }
+      }
+      if (changed) { try { Object.defineProperty(proto, key, d); } catch (e) {} }
     }
+    var parent = Object.getPrototypeOf(proto);
+    if (parent && parent !== Object.prototype) { walkPrototype(parent); }
+  }
+  function walk(ctor) {
+    if (typeof ctor !== 'function') { return; }
+    _markNative(ctor);
+    walkPrototype(ctor.prototype);
   }
   var names = Object.getOwnPropertyNames(globalThis);
   for (var i = 0; i < names.length; i++) {
