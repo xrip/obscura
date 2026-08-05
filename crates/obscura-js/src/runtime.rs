@@ -264,6 +264,13 @@ impl ObscuraJsRuntime {
         );
     }
 
+    pub fn set_fingerprint_profile(&mut self, profile_json: &str) {
+        let _ = self.runtime.execute_script(
+            "<set-fingerprint-profile>",
+            format!("globalThis.__obscura_fingerprint_profile={profile_json};"),
+        );
+    }
+
     pub fn set_stealth(&mut self, enabled: bool) {
         let _ = self.runtime.execute_script(
             "<set-stealth>",
@@ -1314,6 +1321,265 @@ mod tests {
         rt.set_title("Test Page");
         rt.run_page_init();
         rt
+    }
+
+    fn setup_graphics_runtime(url: &str) -> ObscuraJsRuntime {
+        let dom = parse_html("<html><body><div id='d'></div><canvas id='c'></canvas></body></html>");
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_url(url);
+        rt.set_title("Graphics Test");
+        rt.set_fingerprint_profile(r#"{
+            "id":"c145w1:test-base:test-graphics:test-screen",
+            "catalogId":"chrome-145-windows-v1",
+            "renderSeed":"00112233445566778899aabbccddeeff",
+            "browser":{"version":"145.0.7632.75","userAgent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/145.0.0.0"},
+            "navigator":{"platform":"Win32","uaPlatform":"Windows","uaPlatformVersion":"19.0.0","architecture":"x86","bitness":"64","brands":[{"brand":"Chromium","version":"145"}],"fullVersionList":[{"brand":"Chromium","version":"145.0.7632.75"}],"languages":["en-US","en"],"hardwareConcurrency":8,"deviceMemory":8,"maxTouchPoints":0},
+            "screen":{"width":1920,"height":1080,"availWidth":1920,"availHeight":1040,"availLeft":0,"availTop":0,"colorDepth":24,"pixelDepth":24,"devicePixelRatio":1,"innerWidth":1280,"innerHeight":720,"outerWidth":1296,"outerHeight":808,"screenX":0,"screenY":0},
+            "graphics":{"id":"test-graphics","maskedVendor":"WebKit","maskedRenderer":"WebKit WebGL","unmaskedVendor":"Google Inc. (NVIDIA)","unmaskedRenderer":"ANGLE (NVIDIA, D3D11)","preferredCanvasFormat":"bgra8unorm","wgslLanguageFeatures":["pointer_composite_access"],
+              "webgl1":{"contextAttributes":{"alpha":true,"antialias":true,"depth":true,"stencil":false,"premultipliedAlpha":true,"preserveDrawingBuffer":false,"powerPreference":"default","failIfMajorPerformanceCaveat":false,"desynchronized":false,"xrCompatible":false},"parameters":{"3379":{"type":"Number","value":16384},"3386":{"type":"Int32Array","value":[32767,32767]},"7936":{"type":"String","value":"WebKit"},"7937":{"type":"String","value":"WebKit WebGL"},"7938":{"type":"String","value":"WebGL 1.0 (OpenGL ES 2.0 Chromium)"}},"initialState":{"2978":{"type":"Int32Array","value":[0,0,300,150]},"3088":{"type":"Int32Array","value":[0,0,300,150]},"3106":{"type":"Float32Array","value":[0,0,0,0]},"3107":{"type":"Array","value":[true,true,true,true]},"3333":{"type":"Number","value":4},"3317":{"type":"Number","value":4}},"extensions":{"37445":{"name":"WEBGL_debug_renderer_info","constantName":"UNMASKED_VENDOR_WEBGL"},"37446":{"name":"WEBGL_debug_renderer_info","constantName":"UNMASKED_RENDERER_WEBGL"}},"supportedExtensions":["WEBGL_debug_renderer_info","WEBGL_lose_context"],"shaderPrecisionFormats":[{"shaderType":35633,"precisionType":36338,"rangeMin":127,"rangeMax":127,"precision":23}]},
+              "webgl2":{"contextAttributes":{"alpha":true,"antialias":true,"depth":true,"stencil":false,"premultipliedAlpha":true,"preserveDrawingBuffer":false,"powerPreference":"default","failIfMajorPerformanceCaveat":false,"desynchronized":false,"xrCompatible":false},"parameters":{"3379":{"type":"Number","value":16384},"7936":{"type":"String","value":"WebKit"}},"initialState":{"2978":{"type":"Int32Array","value":[0,0,300,150]},"3088":{"type":"Int32Array","value":[0,0,300,150]},"3106":{"type":"Float32Array","value":[0,0,0,0]},"3107":{"type":"Array","value":[true,true,true,true]},"3333":{"type":"Number","value":4},"3317":{"type":"Number","value":4}},"extensions":{"36429":{"name":"WEBGL_provoking_vertex","constantName":"FIRST_VERTEX_CONVENTION_WEBGL"},"36430":{"name":"WEBGL_provoking_vertex","constantName":"LAST_VERTEX_CONVENTION_WEBGL"},"36431":{"name":"WEBGL_provoking_vertex","constantName":"PROVOKING_VERTEX_WEBGL"}},"supportedExtensions":["WEBGL_provoking_vertex"],"shaderPrecisionFormats":[]},
+              "webgpu":{"adapters":{"default":{"info":{"vendor":"nvidia","architecture":"lovelace","device":"","description":"","isFallbackAdapter":false},"features":["shader-f16"],"limits":{"maxBufferSize":1048576,"maxTextureDimension2D":8192,"minUniformBufferOffsetAlignment":256},"defaultDeviceLimits":{"maxBufferSize":1048576,"maxTextureDimension2D":8192,"minUniformBufferOffsetAlignment":256}}}}
+            }
+        }"#);
+        rt.run_page_init();
+        rt
+    }
+
+    fn setup_catalog_graphics_runtime(url: &str) -> ObscuraJsRuntime {
+        static RUNTIME_JSON: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        let runtime_json = RUNTIME_JSON.get_or_init(|| {
+            let catalog: serde_json::Value = serde_json::from_str(include_str!(
+                "../../obscura-browser/data/chrome-145-windows-v1.json"
+            )).unwrap();
+            let composition = &catalog["defaultComposition"];
+            let find = |table: &serde_json::Value, id: &str| {
+                table.as_array().unwrap().iter().find(|row| row["id"] == id).unwrap().clone()
+            };
+            let base = find(&catalog["baseProfiles"], composition["baseId"].as_str().unwrap());
+            let screen = find(&catalog["screenProfiles"], composition["screenId"].as_str().unwrap());
+            let graphics = find(&catalog["graphicsProfiles"], composition["graphicsId"].as_str().unwrap());
+            let component = |kind: &str, id: &str| {
+                let mut value = find(&catalog["components"][kind], id);
+                value.as_object_mut().unwrap().remove("id");
+                value
+            };
+            let id = format!(
+                "c145w1:{}:{}:{}",
+                composition["baseId"].as_str().unwrap(),
+                composition["graphicsId"].as_str().unwrap(),
+                composition["screenId"].as_str().unwrap()
+            );
+            serde_json::to_string(&serde_json::json!({
+                "id": id,
+                "catalogId": catalog["catalogId"],
+                "renderSeed": "00112233445566778899aabbccddeeff",
+                "browser": {"version":base["browserVersion"],"userAgent":base["userAgent"]},
+                "navigator": {
+                    "platform":"Win32","uaPlatform":base["platform"],"uaPlatformVersion":base["platformVersion"],
+                    "architecture":base["architecture"],"bitness":base["bitness"],"brands":base["brands"],
+                    "fullVersionList":base["fullVersionList"],"languages":base["languages"],
+                    "hardwareConcurrency":base["hardwareConcurrency"],"deviceMemory":base["deviceMemory"],
+                    "maxTouchPoints":base["maxTouchPoints"]
+                },
+                "screen": screen,
+                "graphics": {
+                    "id":graphics["id"],"maskedVendor":graphics["maskedVendor"],"maskedRenderer":graphics["maskedRenderer"],
+                    "unmaskedVendor":graphics["unmaskedVendor"],"unmaskedRenderer":graphics["unmaskedRenderer"],
+                    "preferredCanvasFormat":graphics["preferredCanvasFormat"],"wgslLanguageFeatures":graphics["wgslLanguageFeatures"],
+                    "webgl1":component("webgl1",graphics["webgl1Id"].as_str().unwrap()),
+                    "webgl2":component("webgl2",graphics["webgl2Id"].as_str().unwrap()),
+                    "webgpu":component("webgpu",graphics["webgpuId"].as_str().unwrap())
+                }
+            })).unwrap()
+        });
+        let dom = parse_html("<html><body><canvas id='c'></canvas></body></html>");
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_url(url);
+        rt.set_title("Graphics Library Test");
+        rt.set_fingerprint_profile(runtime_json);
+        rt.run_page_init();
+        rt
+    }
+
+    #[test]
+    fn graphics_canvas_has_real_host_shape_and_mode_rules() {
+        let mut rt = setup_graphics_runtime("https://example.com/");
+        let value = rt.evaluate(r#"(function(){
+          const c=document.getElementById('c'),d=document.getElementById('d');
+          const a=c.getContext('webgl'),b=c.getContext('experimental-webgl');
+          let illegal='';try{new HTMLCanvasElement()}catch(e){illegal=e.name}
+          return JSON.stringify([typeof d.getContext,c instanceof HTMLCanvasElement,c instanceof Element,c.width,c.height,a===b,c.getContext('2d')===null,illegal]);
+        })()"#).unwrap();
+        assert_eq!(value.as_str(), Some("[\"undefined\",true,true,300,150,true,true,\"TypeError\"]"));
+    }
+
+    #[test]
+    fn webgl_clear_readback_and_errors_are_exact() {
+        let mut rt = setup_graphics_runtime("https://example.com/");
+        let value = rt.evaluate(r#"(function(){try{
+          const c=document.getElementById('c');c.width=2;c.height=2;
+          const g=c.getContext('webgl');g.clearColor(1,.5,0,.25);g.clear(g.COLOR_BUFFER_BIT);
+          const p=new Uint8Array(16);g.readPixels(0,0,2,2,g.RGBA,g.UNSIGNED_BYTE,p);
+          const first=g.getParameter(g.MAX_VIEWPORT_DIMS),second=g.getParameter(g.MAX_VIEWPORT_DIMS);first[0]=1;
+          g.getParameter(0xdeadbeef);g.getParameter(0xdeadbeef);
+          return JSON.stringify([Array.from(p),second[0],g.getError(),g.getError()]);
+        }catch(e){return 'ERR:'+e.stack}})()"#).unwrap();
+        assert_eq!(value.as_str(), Some("[[255,128,0,64,255,128,0,64,255,128,0,64,255,128,0,64],32767,1280,0]"));
+    }
+
+    #[test]
+    fn webgl_read_pixels_common_types_offsets_and_pack_buffer() {
+        let mut rt = setup_graphics_runtime("https://example.com/");
+        let value = rt.evaluate(r#"(function(){try{
+          const g=new OffscreenCanvas(1,1).getContext('webgl2');
+          g.clearColor(.25,.5,.75,1);g.clear(g.COLOR_BUFFER_BIT);
+          const rgb=new Uint8Array(5);g.readPixels(0,0,1,1,g.RGB,g.UNSIGNED_BYTE,rgb,1);
+          const floats=new Float32Array(6);g.readPixels(0,0,1,1,g.RGBA,g.FLOAT,floats,1);
+          const pack=g.createBuffer();g.bindBuffer(g.PIXEL_PACK_BUFFER,pack);
+          g.bufferData(g.PIXEL_PACK_BUFFER,8,g.STREAM_READ);
+          g.readPixels(0,0,1,1,g.RGBA,g.UNSIGNED_BYTE,2);
+          g.bindBuffer(g.PIXEL_PACK_BUFFER,null);
+          const packed=new Uint8Array(8);g.bindBuffer(g.COPY_READ_BUFFER,pack);
+          g.getBufferSubData(g.COPY_READ_BUFFER,0,packed);
+          return JSON.stringify([Array.from(rgb),Array.from(floats).map(v=>Math.round(v*100000)),Array.from(packed),g.getError()]);
+        }catch(e){return 'ERR:'+e.stack}})()"#).unwrap();
+        assert_eq!(value.as_str(), Some("[[0,64,128,191,0],[0,25098,50196,74902,100000,0],[0,0,64,128,191,255,0,0],0]"));
+    }
+
+    #[test]
+    fn webgl2_common_library_state_survives_canvas_resize() {
+        let mut rt = setup_graphics_runtime("https://example.com/");
+        let value = rt.evaluate(r#"(function(){
+          const c=document.getElementById('c'),g=c.getContext('webgl2');
+          const t=g.createTexture();g.bindTexture(g.TEXTURE_2D,t);c.width=8;c.height=8;g.bindTexture(g.TEXTURE_2D,t);
+          const cube=g.createTexture();g.bindTexture(g.TEXTURE_CUBE_MAP,cube);
+          for(let face=0;face<6;face++)g.texImage2D(g.TEXTURE_CUBE_MAP_POSITIVE_X+face,0,g.RGBA,1,1,0,g.RGBA,g.UNSIGNED_BYTE,null);
+          const vs=g.createShader(g.VERTEX_SHADER),fs=g.createShader(g.FRAGMENT_SHADER),p=g.createProgram();
+          g.shaderSource(vs,'#version 300 es\nin vec2 pos;void main(){gl_Position=vec4(pos,0.,1.);}');
+          g.shaderSource(fs,'#version 300 es\nprecision mediump float;out vec4 color;void main(){color=vec4(1.);}');
+          g.compileShader(vs);g.compileShader(fs);g.attachShader(p,vs);g.attachShader(p,fs);g.linkProgram(p);
+          const ext=g.getExtension('webgl_provoking_vertex');ext.provokingVertexWEBGL(ext.FIRST_VERTEX_CONVENTION_WEBGL);
+          return JSON.stringify([g.isTexture(t),g.drawingBufferWidth,g.getProgramParameter(p,g.ACTIVE_UNIFORM_BLOCKS),typeof ext.provokingVertexWEBGL,g.getError()]);
+        })()"#).unwrap();
+        assert_eq!(value.as_str(), Some("[true,8,0,\"function\",0]"));
+    }
+
+    #[test]
+    fn three_r184_webgl_renderer_smoke() {
+        let mut rt = setup_catalog_graphics_runtime("https://example.com/");
+        rt.execute_script(
+            "three-r184.iife.js",
+            include_str!("../tests/fixtures/graphics/three-r184.iife.js"),
+        ).unwrap();
+        let value = rt.evaluate(r#"(function(){
+          const canvas=document.getElementById('c');
+          const renderer=new THREE.WebGLRenderer({canvas,antialias:true});renderer.setSize(8,8,false);
+          const scene=new THREE.Scene(),camera=new THREE.PerspectiveCamera(45,1,.1,100);camera.position.z=3;
+          scene.add(new THREE.Mesh(new THREE.BoxGeometry(1,1,1),new THREE.MeshBasicMaterial({color:0x33aa66})));
+          renderer.render(scene,camera);const g=renderer.getContext(),pixels=new Uint8Array(256);
+          g.readPixels(0,0,8,8,g.RGBA,g.UNSIGNED_BYTE,pixels);
+          return JSON.stringify([pixels.reduce((sum,value)=>sum+value,0),g.getError()]);
+        })()"#).unwrap();
+        let result: Vec<u64> = serde_json::from_str(value.as_str().unwrap()).unwrap();
+        assert!(result[0] > 0);
+        assert_eq!(result[1], 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn pixi_8_18_1_webgl_renderer_smoke() {
+        let mut rt = setup_catalog_graphics_runtime("https://example.com/");
+        rt.execute_script("stop-pixi-ticker", "globalThis.requestAnimationFrame=function(){return 1};globalThis.cancelAnimationFrame=function(){};").unwrap();
+        rt.execute_script(
+            "pixi-8.18.1.min.js",
+            include_str!("../tests/fixtures/graphics/pixi-8.18.1.min.js"),
+        ).unwrap();
+        let value = rt.evaluate_for_cdp(r#"(async function(){
+          const canvas=document.getElementById('c'),app=new PIXI.Application();
+          await app.init({canvas,width:8,height:8,preference:'webgl',antialias:false,autoStart:false,sharedTicker:false});
+          app.stop();const shape=new PIXI.Graphics().rect(0,0,8,8).fill(0x3366aa);app.stage.addChild(shape);app.renderer.render(app.stage);
+          const g=app.renderer.gl,pixels=new Uint8Array(256);g.readPixels(0,0,8,8,g.RGBA,g.UNSIGNED_BYTE,pixels);
+          return JSON.stringify([pixels.reduce((sum,item)=>sum+item,0),g.getError()]);
+        })()"#, true, true).await.unwrap();
+        let text = value.value.and_then(|item| item.as_str().map(str::to_owned)).unwrap();
+        let result: Vec<u64> = serde_json::from_str(&text).unwrap();
+        assert!(result[0] > 0);
+        assert_eq!(result[1], 0);
+    }
+
+    #[test]
+    fn webgl_shader_draw_is_stable_and_non_empty() {
+        let mut rt = setup_graphics_runtime("https://example.com/");
+        let value = rt.evaluate(r#"(function(){
+          const c=document.getElementById('c');c.width=4;c.height=4;const g=c.getContext('webgl');
+          const vs=g.createShader(g.VERTEX_SHADER),fs=g.createShader(g.FRAGMENT_SHADER),p=g.createProgram();
+          g.shaderSource(vs,'attribute vec2 pos; void main(){gl_Position=vec4(pos,0.,1.);}');
+          g.shaderSource(fs,'precision mediump float; uniform vec4 color; void main(){gl_FragColor=color;}');
+          g.compileShader(vs);g.compileShader(fs);g.attachShader(p,vs);g.attachShader(p,fs);g.linkProgram(p);g.useProgram(p);
+          g.uniform4f(g.getUniformLocation(p,'color'),1,0,0,1);g.drawArrays(g.TRIANGLES,0,3);
+          const a=new Uint8Array(64);g.readPixels(0,0,4,4,g.RGBA,g.UNSIGNED_BYTE,a);
+          return JSON.stringify([g.getShaderParameter(vs,g.COMPILE_STATUS),g.getProgramParameter(p,g.LINK_STATUS),Array.from(a),g.getError()]);
+        })()"#).unwrap();
+        let text = value.as_str().unwrap();
+        assert!(text.starts_with("[true,true,["));
+        assert!(!text.contains("[0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]"));
+        assert!(text.ends_with(",0]"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn webgpu_buffer_clear_copy_and_canvas_clear_work() {
+        let mut rt = setup_graphics_runtime("https://example.com/");
+        let value = rt.evaluate_for_cdp(r#"(async function(){
+          const adapter=await navigator.gpu.requestAdapter();const device=await adapter.requestDevice();
+          const a=device.createBuffer({size:16,usage:GPUBufferUsage.COPY_SRC|GPUBufferUsage.COPY_DST,mappedAtCreation:true});
+          new Uint8Array(a.getMappedRange()).fill(7);a.unmap();
+          const b=device.createBuffer({size:16,usage:GPUBufferUsage.COPY_SRC|GPUBufferUsage.COPY_DST|GPUBufferUsage.MAP_READ});
+          const enc=device.createCommandEncoder();enc.copyBufferToBuffer(a,0,b,0,16);enc.clearBuffer(b,4,4);device.queue.submit([enc.finish()]);
+          await b.mapAsync(GPUMapMode.READ);const bytes=Array.from(new Uint8Array(b.getMappedRange()));b.unmap();
+          const c=document.getElementById('c'),ctx=c.getContext('webgpu');ctx.configure({device,format:navigator.gpu.getPreferredCanvasFormat()});
+          const view=ctx.getCurrentTexture().createView(),e=device.createCommandEncoder(),pass=e.beginRenderPass({colorAttachments:[{view,loadOp:'clear',storeOp:'store',clearValue:{r:0,g:1,b:0,a:1}}]});pass.end();device.queue.submit([e.finish()]);
+          return JSON.stringify([bytes,ctx.getCurrentTexture()!==view]);
+        })()"#, true, true).await.unwrap();
+        assert_eq!(value.value.and_then(|v| v.as_str().map(str::to_owned)).as_deref(), Some("[[7,7,7,7,0,0,0,0,7,7,7,7,7,7,7,7],true]"));
+    }
+
+    #[test]
+    fn webgpu_is_hidden_on_an_insecure_page() {
+        let mut rt = setup_graphics_runtime("http://example.com/");
+        assert_eq!(rt.evaluate("navigator.gpu === undefined").unwrap(), serde_json::json!(true));
+    }
+
+    #[test]
+    fn iframe_uses_the_same_identity_with_separate_graphics_state() {
+        let mut rt = setup_graphics_runtime("https://example.com/");
+        let value = rt.evaluate(r#"(function(){
+          const frame=document.createElement('iframe');document.body.appendChild(frame);
+          const a=document.createElement('canvas').getContext('webgl');
+          const b=frame.contentDocument.createElement('canvas').getContext('webgl');
+          const ea=a.getExtension('WEBGL_debug_renderer_info'),eb=b.getExtension('WEBGL_debug_renderer_info');
+          const ba=a.createBuffer(),bb=b.createBuffer();
+          return JSON.stringify([frame.contentWindow.navigator.userAgent===navigator.userAgent,frame.contentWindow.screen.width===screen.width,frame.contentWindow.WebGLRenderingContext===WebGLRenderingContext,a!==b,a.isBuffer(bb),a.getParameter(ea.UNMASKED_RENDERER_WEBGL)===b.getParameter(eb.UNMASKED_RENDERER_WEBGL)]);
+        })()"#).unwrap();
+        assert_eq!(value.as_str(), Some("[true,true,true,true,false,true]"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_scope_has_profile_backed_offscreen_graphics() {
+        let mut rt = setup_graphics_runtime("https://example.com/");
+        rt.execute_script("worker-test", r#"
+          globalThis.__workerGraphics='pending';
+          const source=`const c=new self.OffscreenCanvas(2,2);const g=c.getContext('webgl');const e=g.getExtension('WEBGL_debug_renderer_info');postMessage(JSON.stringify([self.navigator.userAgent,self.navigator.hardwareConcurrency,!!self.navigator.gpu,g.getParameter(e.UNMASKED_RENDERER_WEBGL)]));`;
+          const worker=new Worker(URL.createObjectURL(new Blob([source],{type:'text/javascript'})));
+          worker.onmessage=e=>{globalThis.__workerGraphics=e.data;worker.terminate();};
+        "#).unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        let value = rt.evaluate("globalThis.__workerGraphics").unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(value.as_str().unwrap()).unwrap();
+        assert_eq!(parsed[0], rt.evaluate("navigator.userAgent").unwrap());
+        assert_eq!(parsed[1], serde_json::json!(8));
+        assert_eq!(parsed[2], serde_json::json!(true));
+        assert_eq!(parsed[3], serde_json::json!("ANGLE (NVIDIA, D3D11)"));
     }
 
     #[tokio::test(flavor = "current_thread")]

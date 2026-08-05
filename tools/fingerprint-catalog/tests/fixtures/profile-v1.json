@@ -1,0 +1,42 @@
+{
+  "profileVersion": "1.9.1",
+  "clientName": "private-test-name",
+  "subscriptionExpires": 9999999999,
+  "fingerprints": {
+    "system": {
+      "osType": "win",
+      "osVersion": "19.0.0"
+    },
+    "browser": {
+      "version": "145.0.7632.75",
+      "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+      "navigator": {
+        "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+        "languages": ["en-US", "en"],
+        "hardwareConcurrency": 8,
+        "deviceMemory": 8,
+        "maxTouchPoints": 0
+      },
+      "userAgentData": {
+        "brands": [
+          {"brand": "Not:A-Brand", "version": "99"},
+          {"brand": "Google Chrome", "version": "145"},
+          {"brand": "Chromium", "version": "145"}
+        ],
+        "fullVersionList": [
+          {"brand": "Not:A-Brand", "version": "99.0.0.0"},
+          {"brand": "Google Chrome", "version": "145.0.7632.75"},
+          {"brand": "Chromium", "version": "145.0.7632.75"}
+        ],
+        "uaFullVersion": "145.0.7632.75",
+        "platform": "Windows",
+        "platformVersion": "19.0.0",
+        "architecture": "x86",
+        "bitness": "64"
+      }
+    },
+    "hardware": {
+      "cpu": {"arch": "x86", "bitness": "64"}
+    }
+  }
+}

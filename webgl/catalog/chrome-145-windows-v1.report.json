@@ -1,0 +1,56 @@
+{
+  "accepted": {
+    "adapterGroups": 388,
+    "baseObservations": 100,
+    "windowGroups": 90
+  },
+  "assumptions": [
+    "preferredCanvasFormat is fixed to bgra8unorm for Chrome 145 Windows",
+    "wgslLanguageFeatures uses the most common set from exact 145.0.7632.75 reference profiles"
+  ],
+  "bannedFieldScan": {
+    "fields": [
+      "clientName",
+      "subscriptionExpires",
+      "chargeMoney",
+      "profileExpires",
+      "textureHashs",
+      "computeBenchmark",
+      "raytraceBenchmark",
+      "advancedFingerprint2025"
+    ],
+    "passed": true
+  },
+  "catalogBytes": 1499389,
+  "catalogId": "chrome-145-windows-v1",
+  "catalogLimitBytes": 2097152,
+  "exactOverlap": {
+    "baseProfiles": 100,
+    "fullProfiles": 28,
+    "graphicsProfiles": 100,
+    "screenProfiles": 28
+  },
+  "input": {
+    "adapterGroups": 388,
+    "adapterObservations": 431,
+    "profileFiles": 100,
+    "windowGroups": 90,
+    "windowObservations": 225
+  },
+  "rejected": {
+    "adapters": [],
+    "profiles": [],
+    "windows": []
+  },
+  "schemaValidation": "passed",
+  "schemaVersion": 1,
+  "status": "valid",
+  "unique": {
+    "baseProfiles": 77,
+    "graphicsProfiles": 298,
+    "screenProfiles": 225,
+    "webgl1Components": 9,
+    "webgl2Components": 18,
+    "webgpuComponents": 110
+  }
+}

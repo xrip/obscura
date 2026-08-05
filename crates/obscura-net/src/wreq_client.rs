@@ -35,6 +35,7 @@ pub const STEALTH_UA_PLATFORM_VERSION: &str = "15.0.0";
 #[cfg(feature = "stealth")]
 pub struct StealthHttpClient {
     client: wreq::Client,
+    user_agent: String,
     pub cookie_jar: Arc<CookieJar>,
     pub extra_headers: RwLock<HashMap<String, String>>,
     pub in_flight: Arc<std::sync::atomic::AtomicU32>,
@@ -47,6 +48,14 @@ impl StealthHttpClient {
     }
 
     pub fn with_proxy(cookie_jar: Arc<CookieJar>, proxy_url: Option<&str>) -> Self {
+        Self::with_proxy_and_user_agent(cookie_jar, proxy_url, STEALTH_USER_AGENT)
+    }
+
+    pub fn with_proxy_and_user_agent(
+        cookie_jar: Arc<CookieJar>,
+        proxy_url: Option<&str>,
+        user_agent: &str,
+    ) -> Self {
         let emulation_opts = wreq_util::Emulation::builder()
             .profile(wreq_util::Profile::Chrome145)
             .platform(wreq_util::Platform::Windows)
@@ -100,6 +109,7 @@ impl StealthHttpClient {
 
         StealthHttpClient {
             client,
+            user_agent: user_agent.to_owned(),
             cookie_jar,
             extra_headers: RwLock::new(HashMap::new()),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -125,7 +135,10 @@ impl StealthHttpClient {
         let mut redirects = Vec::new();
 
         for _ in 0..20 {
-            let mut req = self.client.get(current_url.as_str());
+            let mut req = self
+                .client
+                .get(current_url.as_str())
+                .header("user-agent", self.user_agent.as_str());
 
             let cookie_header = self.cookie_jar.get_cookie_header(&current_url);
             if !cookie_header.is_empty() {
@@ -217,7 +230,10 @@ impl StealthHttpClient {
         let req_method = method
             .parse::<wreq::Method>()
             .map_err(|e| ObscuraNetError::Network(format!("invalid method '{}': {}", method, e)))?;
-        let mut req = self.client.request(req_method, url.as_str());
+        let mut req = self
+            .client
+            .request(req_method, url.as_str())
+            .header("user-agent", self.user_agent.as_str());
 
         let cookie_header = self.cookie_jar.get_cookie_header(url);
         if !cookie_header.is_empty() {

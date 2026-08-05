@@ -15,8 +15,8 @@
     '__obscura_errors', '__obscura_init', '__obscura_hide_list',
     '__obscura_objects', '__obscura_oid', '__obscura_ua',
     '__obscura_platform', '__obscura_ua_platform', '__obscura_ua_platform_version',
+    '__obscura_fingerprint_profile',
     '__obscura_stealth', '__obscura_markTrusted',
-    '__obscura_hw', '__obscura_mem',
     '__documentReadyState__', '__currentUrl',
     // internal helpers (var-declared throughout the file)
     '__processDynScriptQueue', '_decodeDataScriptUrl', '_markNative', '_fpRand', '_fpNoise',
@@ -325,61 +325,11 @@ function _fpNoise(x, y, channel) {
 var _fpCache = null;
 function _getFp() {
   if (_fpCache) return _fpCache;
-  const _uaPlat = globalThis.__obscura_ua_platform || 'Windows';
-  const isMac = _uaPlat === 'macOS';
-  const isLinux = _uaPlat === 'Linux';
-  const gpuPool = isMac ? [
-    'ANGLE (Apple, ANGLE Metal Renderer: Apple M1, Unspecified Version)',
-    'ANGLE (Apple, ANGLE Metal Renderer: Apple M1 Pro, Unspecified Version)',
-    'ANGLE (Apple, ANGLE Metal Renderer: Apple M2, Unspecified Version)',
-    'ANGLE (Apple, ANGLE Metal Renderer: Apple M2 Pro, Unspecified Version)',
-    'ANGLE (Apple, ANGLE Metal Renderer: Apple M3, Unspecified Version)',
-    'ANGLE (Intel Inc., ANGLE Metal Renderer: Intel(R) Iris(TM) Plus Graphics, Unspecified Version)',
-  ] : isLinux ? [
-    'ANGLE (Intel, Mesa Intel(R) UHD Graphics 630 (CFL GT2), OpenGL 4.6)',
-    'ANGLE (Intel, Mesa Intel(R) Iris(R) Xe Graphics (TGL GT2), OpenGL 4.6)',
-    'ANGLE (Intel, Mesa Intel(R) UHD Graphics 770 (RPL-S), OpenGL 4.6)',
-    'ANGLE (AMD, AMD Radeon RX 580 (polaris10, LLVM 15.0.7, DRM 3.54, LLVM 15.0.7), OpenGL 4.6)',
-    'ANGLE (AMD, AMD Radeon RX 6700 XT (navi22, LLVM 16.0.6, DRM 3.54, LLVM 16.0.6), OpenGL 4.6)',
-    'ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 OpenGL 4.6)',
-    'ANGLE (NVIDIA, NVIDIA GeForce RTX 4070 OpenGL 4.6)',
-  ] : [
-    'ANGLE (NVIDIA, NVIDIA GeForce RTX 3060 Direct3D11 vs_5_0 ps_5_0, D3D11)',
-    'ANGLE (NVIDIA, NVIDIA GeForce GTX 1660 SUPER Direct3D11 vs_5_0 ps_5_0, D3D11)',
-    'ANGLE (NVIDIA, NVIDIA GeForce RTX 2070 SUPER Direct3D11 vs_5_0 ps_5_0, D3D11)',
-    'ANGLE (Intel, Intel(R) UHD Graphics 630 Direct3D11 vs_5_0 ps_5_0, D3D11)',
-    'ANGLE (Intel, Intel(R) Iris(R) Xe Graphics Direct3D11 vs_5_0 ps_5_0, D3D11)',
-    'ANGLE (AMD, AMD Radeon RX 580 Direct3D11 vs_5_0 ps_5_0, D3D11)',
-    'ANGLE (AMD, AMD Radeon RX 6700 XT Direct3D11 vs_5_0 ps_5_0, D3D11)',
-    'ANGLE (NVIDIA, NVIDIA GeForce RTX 4070 Direct3D11 vs_5_0 ps_5_0, D3D11)',
-    'ANGLE (NVIDIA, NVIDIA GeForce GTX 1080 Ti Direct3D11 vs_5_0 ps_5_0, D3D11)',
-    'ANGLE (Intel, Intel(R) UHD Graphics 770 Direct3D11 vs_5_0 ps_5_0, D3D11)',
-    'ANGLE (AMD, AMD Radeon RX 5700 XT Direct3D11 vs_5_0 ps_5_0, D3D11)',
-    'ANGLE (NVIDIA, NVIDIA GeForce RTX 3080 Direct3D11 vs_5_0 ps_5_0, D3D11)',
-  ];
-  const gpuVendorPool = isMac ? [
-    'Google Inc. (Apple)','Google Inc. (Apple)','Google Inc. (Apple)',
-    'Google Inc. (Apple)','Google Inc. (Apple)',
-    'Google Inc. (Intel Inc.)',
-  ] : isLinux ? [
-    'Google Inc. (Intel)','Google Inc. (Intel)','Google Inc. (Intel)',
-    'Google Inc. (AMD)','Google Inc. (AMD)',
-    'Google Inc. (NVIDIA)','Google Inc. (NVIDIA)',
-  ] : [
-    'Google Inc. (NVIDIA)','Google Inc. (NVIDIA)','Google Inc. (NVIDIA)',
-    'Google Inc. (Intel)','Google Inc. (Intel)',
-    'Google Inc. (AMD)','Google Inc. (AMD)',
-    'Google Inc. (NVIDIA)','Google Inc. (NVIDIA)',
-    'Google Inc. (Intel)','Google Inc. (AMD)','Google Inc. (NVIDIA)',
-  ];
-  const idx = Math.floor(_fpRand(42) * gpuPool.length);
-  const screenPool = [[1920,1080],[2560,1440],[1366,768],[1536,864],[1440,900],[1680,1050],[1280,720],[3840,2160]];
   const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
   let cfp = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUg';
   for (let i = 0; i < 40; i++) cfp += chars[Math.floor(_fpRand(500 + i) * 64)];
   cfp += '==';
   _fpCache = {
-    gpu: gpuPool[idx], gpuVendor: gpuVendorPool[idx],
     audioBaseLatency: 0.002 + _fpRand(100) * 0.008,
     audioSampleRate: [44100, 48000][Math.floor(_fpRand(101) * 2)],
     compThreshold: -24 + (_fpRand(102) - 0.5) * 4,
@@ -387,12 +337,21 @@ function _getFp() {
     compRatio: 12 + (_fpRand(104) - 0.5) * 4,
     batteryLevel: 0.5 + _fpRand(200) * 0.5,
     batteryCharging: _fpRand(201) > 0.3,
-    screen: screenPool[Math.floor(_fpRand(300) * screenPool.length)],
     canvasFingerprint: cfp,
   };
   return _fpCache;
 }
 function _fp(key) { return _getFp()[key]; }
+let _fingerprintProfile = null;
+function _freezeFingerprintProfile(value) {
+  if (!value || typeof value !== 'object' || Object.isFrozen(value)) return value;
+  const keys = Object.keys(value);
+  for (let i = 0; i < keys.length; i++) _freezeFingerprintProfile(value[keys[i]]);
+  return Object.freeze(value);
+}
+function _profileNavigator() {
+  return _fingerprintProfile && _fingerprintProfile.navigator || null;
+}
 globalThis._eventRegistry = globalThis._eventRegistry || {};
 globalThis._formValues = globalThis._formValues || {};
 globalThis._formChecked = globalThis._formChecked || {};
@@ -3261,14 +3220,16 @@ function _elementClassFor(nid) {
   if (tag === "FORM" && globalThis.HTMLFormElement) return globalThis.HTMLFormElement;
   if (tag === "AUDIO") return HTMLAudioElement;
   if (tag === "VIDEO") return HTMLVideoElement;
+  if (tag === "CANVAS" && globalThis.HTMLCanvasElement) return globalThis.HTMLCanvasElement;
   return Element;
 }
+let _constructElement = function(C, nid) { return new C(nid); };
 function _wrap(nid) {
   if (nid < 0 || nid === null || nid === undefined || isNaN(nid)) return null;
   if (_cache.has(nid)) return _cache.get(nid);
   const t = +_dom("node_type", nid);
   let n;
-  if (t === 1) { const C = _elementClassFor(nid); n = new C(nid); }
+  if (t === 1) { const C = _elementClassFor(nid); n = _constructElement(C, nid); }
   else if (t === 3) n = new Text(nid);
   else if (t === 8) n = new Comment(nid);
   else if (t === 9) n = new Document(nid);
@@ -3280,7 +3241,7 @@ function _wrapEl(nid) {
   if (nid < 0 || nid === null || nid === undefined || isNaN(nid)) return null;
   if (_cache.has(nid)) return _cache.get(nid);
   const C = _elementClassFor(nid);
-  const n = new C(nid);
+  const n = _constructElement(C, nid);
   _cache.set(nid, n);
   return n;
 }
@@ -3492,60 +3453,52 @@ globalThis.NetworkInformation = NetworkInformation;
 
 globalThis.ContentIndex = class ContentIndex {};
 
-function _chromeMajor() {
-  var m = (globalThis.__obscura_ua || '').match(/Chrome\/(\d+)/);
-  return m ? (m[1] | 0) : 145;
-}
-// Chromium derives the sec-ch-ua GREASE brand, version, and brand order
-// deterministically from the Chrome major version
-// (components/embedder_support/user_agent_utils.cc). Replicating it keeps
-// sec-ch-ua and userAgentData exact for every profile version rather than
-// hardcoding one static token.
-var _GREASE_CHARS = [' ', '(', ':', '-', '.', '/', ')', ';', '=', '?', '_'];
-var _GREASE_VER = ['8', '99', '24'];
-var _BRAND_PERMS = [[0,1,2],[0,2,1],[1,0,2],[1,2,0],[2,0,1],[2,1,0]];
-function _uaBrands() {
-  var seed = _chromeMajor();
-  var grease = {
-    brand: 'Not' + _GREASE_CHARS[seed % 11] + 'A' + _GREASE_CHARS[(seed + 1) % 11] + 'Brand',
-    version: _GREASE_VER[seed % 3],
-  };
-  var ordered = [
-    grease,
-    {brand: 'Chromium', version: String(seed)},
-    {brand: 'Google Chrome', version: String(seed)},
-  ];
-  var p = _BRAND_PERMS[seed % 6];
-  return [ordered[p[0]], ordered[p[1]], ordered[p[2]]];
+function _copyBrands(values) {
+  return (values || []).map(function(value) {
+    return {brand: value.brand, version: value.version};
+  });
 }
 
 // Fingerprint surfaces (UA, plugins, webdriver, etc.) live on the prototype
 // hop below, not as own props here: own accessors are a bot tell.
 globalThis.navigator = {
   onLine: true, cookieEnabled: true,
-  maxTouchPoints: 0,
   vendor: "Google Inc.", product: "Gecko", productSub: "20030107",
   doNotTrack: null,
   connection: new NetworkInformation(),
   pdfViewerEnabled: true,
   userAgentData: {
     mobile: false,
-    get brands() { return _uaBrands(); },
-    get platform() { return globalThis.__obscura_ua_platform || "Windows"; },
+    get brands() {
+      var profile = _profileNavigator();
+      return _copyBrands(profile && profile.brands);
+    },
+    get platform() {
+      var profile = _profileNavigator();
+      return profile && profile.uaPlatform || globalThis.__obscura_ua_platform || "Windows";
+    },
     getHighEntropyValues(hints) {
-      var brands = _uaBrands();
-      return Promise.resolve({
-        architecture: "x86",
-        bitness: "64",
-        brands: brands,
-        fullVersionList: brands.map(function(b) { return {brand: b.brand, version: b.version + ".0.0.0"}; }),
+      var profile = _profileNavigator() || {};
+      var browser = _fingerprintProfile && _fingerprintProfile.browser || {};
+      var out = {
+        brands: _copyBrands(profile.brands),
         mobile: false,
+        platform: profile.uaPlatform || globalThis.__obscura_ua_platform || "Windows",
+      };
+      var high = {
+        architecture: profile.architecture || "x86",
+        bitness: profile.bitness || "64",
+        fullVersionList: _copyBrands(profile.fullVersionList),
         model: "",
-        platform: globalThis.__obscura_ua_platform || "Windows",
-        platformVersion: globalThis.__obscura_ua_platform_version || "15.0.0",
-        uaFullVersion: _chromeMajor() + ".0.0.0",
+        platformVersion: profile.uaPlatformVersion || globalThis.__obscura_ua_platform_version || "19.0.0",
+        uaFullVersion: browser.version || "145.0.7632.75",
         wow64: false,
-      });
+      };
+      var requested = hints === undefined ? [] : Array.from(hints, String);
+      for (var i = 0; i < requested.length; i++) {
+        if (Object.prototype.hasOwnProperty.call(high, requested[i])) out[requested[i]] = high[requested[i]];
+      }
+      return Promise.resolve(out);
     },
     toJSON() { return {brands:this.brands,mobile:this.mobile,platform:this.platform}; },
   },
@@ -3641,8 +3594,14 @@ globalThis.navigator = {
   defGetter('platform', function() {
     return globalThis.__obscura_platform || "Win32";
   });
-  defGetter('language', function() { return "en-US"; });
-  defGetter('languages', function() { return ["en-US", "en"]; });
+  defGetter('language', function() {
+    var values = _profileNavigator() && _profileNavigator().languages;
+    return values && values.length ? values[0] : "en-US";
+  });
+  defGetter('languages', function() {
+    var values = _profileNavigator() && _profileNavigator().languages;
+    return values || ["en-US", "en"];
+  });
 
   // Cache plugins/mimeTypes so navigator.plugins === navigator.plugins.
   var _plugins = new PluginArray([
@@ -3659,9 +3618,16 @@ globalThis.navigator = {
   defGetter('plugins', function() { return _plugins; });
   defGetter('mimeTypes', function() { return _mimeTypes; });
 
-  // Values set per-page by __obscura_init (avoids own data props on navigator).
-  defGetter('hardwareConcurrency', function() { return globalThis.__obscura_hw || 8; });
-  defGetter('deviceMemory', function() { return globalThis.__obscura_mem || 8; });
+  defGetter('hardwareConcurrency', function() {
+    return _profileNavigator() && _profileNavigator().hardwareConcurrency || 8;
+  });
+  defGetter('deviceMemory', function() {
+    return _profileNavigator() && _profileNavigator().deviceMemory || 8;
+  });
+  defGetter('maxTouchPoints', function() {
+    var value = _profileNavigator() && _profileNavigator().maxTouchPoints;
+    return value === undefined ? 0 : value;
+  });
 
   _navProto.share = _markNative(function share(data) {
     return Promise.reject(new DOMException('Not allowed', 'NotAllowedError'));
@@ -3705,30 +3671,35 @@ globalThis.Notification = class Notification {
   constructor() {}
 };
 
-globalThis.WebGLRenderingContext = class WebGLRenderingContext {};
-globalThis.WebGL2RenderingContext = class WebGL2RenderingContext {};
-
 class Screen {
-  constructor(w, h) {
-    this._w = w; this._h = h;
-    this.colorDepth = 24; this.pixelDepth = 24; this.availTop = 0; this.availLeft = 0;
+  constructor(token, profile) {
+    if (token !== _screenToken) throw new TypeError('Illegal constructor');
+    _screenSlots.set(this, profile);
     this.orientation = {type:'landscape-primary',angle:0,addEventListener(){},removeEventListener(){},dispatchEvent(){return true;}};
   }
-  get width() { return this._w; }
-  get height() { return this._h; }
-  get availWidth() { return this._w; }
-  get availHeight() { return this._h - 40; }
+  get width() { return _screenSlots.get(this).width; }
+  get height() { return _screenSlots.get(this).height; }
+  get availWidth() { return _screenSlots.get(this).availWidth; }
+  get availHeight() { return _screenSlots.get(this).availHeight; }
+  get availLeft() { return _screenSlots.get(this).availLeft; }
+  get availTop() { return _screenSlots.get(this).availTop; }
+  get colorDepth() { return _screenSlots.get(this).colorDepth; }
+  get pixelDepth() { return _screenSlots.get(this).pixelDepth; }
 }
-['width','height','availWidth','availHeight'].forEach(function(k) {
+const _screenToken = {};
+const _screenSlots = new WeakMap();
+['width','height','availWidth','availHeight','availLeft','availTop','colorDepth','pixelDepth'].forEach(function(k) {
   var d = Object.getOwnPropertyDescriptor(Screen.prototype, k);
   if (d && d.get) _markNative(d.get);
 });
 globalThis.Screen = Screen;
-globalThis.screen = new Screen(1920, 1080);
+globalThis.screen = new Screen(_screenToken, {width:1920,height:1080,availWidth:1920,availHeight:1040,availLeft:0,availTop:0,colorDepth:24,pixelDepth:24});
 globalThis.visualViewport = { width:1920, height:1000, offsetLeft:0, offsetTop:0, scale:1, addEventListener(){}, removeEventListener(){} };
 globalThis.devicePixelRatio = 1;
 globalThis.innerWidth = 1920; globalThis.innerHeight = 1000;
 globalThis.outerWidth = 1920; globalThis.outerHeight = 1080;
+globalThis.screenX = 0; globalThis.screenY = 0;
+globalThis.screenLeft = 0; globalThis.screenTop = 0;
 globalThis.scrollX = 0; globalThis.scrollY = 0;
 globalThis.pageXOffset = 0; globalThis.pageYOffset = 0;
 
@@ -6400,7 +6371,6 @@ _markNative(globalThis.Selection);
   Element.prototype.append, Element.prototype.prepend, Element.prototype.remove,
   Element.prototype.before, Element.prototype.after, Element.prototype.replaceWith,
   HTMLFormElement.prototype.reset,
-  Element.prototype.getContext, Element.prototype.toDataURL, Element.prototype.toBlob,
   Element.prototype.getBBox,
   Node.prototype.appendChild, Node.prototype.removeChild,
   Node.prototype.replaceChild, Node.prototype.insertBefore,
@@ -6560,6 +6530,19 @@ class _IframeWindow {
     this.crypto = globalThis.crypto;
     this.console = globalThis.console;
     this.chrome = globalThis.chrome;
+    // This is not a separate realm, but it exposes the same profile-backed
+    // graphics constructors and keeps canvas resource state per object.
+    for (const name of [
+      'HTMLCanvasElement','OffscreenCanvas','CanvasRenderingContext2D',
+      'WebGLRenderingContext','WebGL2RenderingContext','WebGLBuffer','WebGLTexture',
+      'WebGLFramebuffer','WebGLRenderbuffer','WebGLShader','WebGLProgram',
+      'WebGLUniformLocation','WebGLVertexArrayObject','WebGLQuery','WebGLSampler',
+      'WebGLSync','WebGLTransformFeedback','GPU','GPUAdapter','GPUDevice','GPUQueue',
+      'GPUBuffer','GPUTexture','GPUTextureView','GPUSampler','GPUShaderModule',
+      'GPUCanvasContext','GPUCommandEncoder','GPUCommandBuffer','GPURenderPassEncoder',
+      'GPUComputePassEncoder','GPUBufferUsage','GPUTextureUsage','GPUShaderStage',
+      'GPUMapMode','GPUColorWrite'
+    ]) if (globalThis[name] !== undefined) this[name] = globalThis[name];
 
     try {
       const u = new URL(url);
@@ -6898,78 +6881,12 @@ class _Canvas2D {
   getContextAttributes() { return { alpha: true, desynchronized: false, colorSpace: "srgb", willReadFrequently: false }; }
 }
 
-Element.prototype.getContext = function getContext(type) {
-  if (type === '2d') {
-    if (!this._ctx) {
-      this._ctx = new _Canvas2D(this);
-    }
-    return this._ctx;
-  }
-  if (type === 'webgl' || type === 'experimental-webgl' || type === 'webgl2') {
-    return {
-      canvas: this,
-      MAX_VIEWPORT_DIMS: 0x0D33,
-      MAX_TEXTURE_SIZE: 0x0D33,
-      MAX_RENDERBUFFER_SIZE: 0x84E8,
-      MAX_TEXTURE_MAX_ANISOTROPY_EXT: 0x84EA,
-      MAX_DRAW_BUFFERS_WEBGL: 0x8824,
-      getContextAttributes() { return { alpha: true, antialias: true, depth: true, failIfMajorPerformanceCaveat: false, powerPreference: "default", premultipliedAlpha: true, preserveDrawingBuffer: false, stencil: true, desynchronized: false }; },
-      uniform2f() {},
-      getExtension(name) {
-        if (name === 'WEBGL_debug_renderer_info') return { UNMASKED_VENDOR_WEBGL: 0x9245, UNMASKED_RENDERER_WEBGL: 0x9246 };
-        return null;
-      },
-      getParameter(pname) {
-        if (pname === 0x9245) return _fp('gpuVendor');
-        if (pname === 0x9246) return _fp('gpu');
-        if (pname === 0x1F01) return 'WebKit WebGL';  // GL_RENDERER
-        if (pname === 0x1F00) return 'WebKit';          // GL_VENDOR
-        if (pname === 0x1F02) return 'OpenGL ES 3.0 (ANGLE)'; // GL_VERSION
-        if (pname === 0x8B8C) return 'WebGL GLSL ES 3.00 (ANGLE)'; // GL_SHADING_LANGUAGE_VERSION
-        if (pname === undefined) return [0, 0];
-        // Some properties like MAX_VIEWPORT_DIMS return arrays
-        if (pname === 0x0D33) return [8192, 8192];
-        if (pname === 0x8A2A) return [8192, 8192];
-        return 0;
-      },
-      getSupportedExtensions() { return ['WEBGL_debug_renderer_info','EXT_texture_filter_anisotropic','WEBGL_compressed_texture_s3tc','WEBGL_lose_context']; },
-      getShaderPrecisionFormat() { return { rangeMin: 127, rangeMax: 127, precision: 23 }; },
-      createBuffer() { return {}; }, createShader() { return {}; }, createProgram() { return {}; },
-      shaderSource() {}, compileShader() {}, attachShader() {}, linkProgram() {},
-      getProgramParameter() { return true; }, useProgram() {}, deleteShader() {},
-      bindBuffer() {}, bufferData() {}, enableVertexAttribArray() {}, vertexAttribPointer() {},
-      drawArrays() {}, drawElements() {}, viewport() {}, clear() {}, clearColor() {},
-      enable() {}, disable() {}, blendFunc() {}, depthFunc() {},
-      getUniformLocation() { return {}; }, getAttribLocation() { return 0; },
-      uniform1f() {}, uniform1i() {}, uniformMatrix4fv() {},
-      createTexture() { return {}; }, bindTexture() {}, texImage2D() {}, texParameteri() {},
-      activeTexture() {}, pixelStorei() {}, generateMipmap() {},
-      createFramebuffer() { return {}; }, bindFramebuffer() {}, framebufferTexture2D() {},
-      readPixels(x,y,w,h,f,t,d) { if(d) for(let i=0;i<d.length;i++) d[i]=Math.floor(Math.random()*256); },
-      VERTEX_SHADER: 0x8B31, FRAGMENT_SHADER: 0x8B30, LINK_STATUS: 0x8B82,
-      ARRAY_BUFFER: 0x8892, STATIC_DRAW: 0x88E4, FLOAT: 0x1406,
-      TRIANGLES: 0x0004, COLOR_BUFFER_BIT: 0x4000, DEPTH_BUFFER_BIT: 0x100,
-      TEXTURE_2D: 0x0DE1, RGBA: 0x1908, UNSIGNED_BYTE: 0x1401,
-    };
-  }
-  return null;
-};
-Element.prototype.toDataURL = function(type) {
-  if (this._ctx && this._ctx._buf) {
-    const ctx = this._ctx;
-    return _encodePNG(ctx._w, ctx._h, ctx._buf);
-  }
-  return _fp('canvasFingerprint');
-};
-Element.prototype.toBlob = function(cb, type, q) { cb(new Blob([''])); };
+/* __OBSCURA_GRAPHICS_MODULE__ */
+
 Element.prototype.getBBox = function() { return { x: 0, y: 0, width: 0, height: 0 }; };
 Element.prototype.getComputedTextLength = function() { return 0; };
 Element.prototype.getExtentOfChar = function(ch) { return { x: 0, y: 0, width: 0, height: 0 }; };
 Element.prototype.getSubStringLength = function(ch, len) { return 0; };
-
-_markNative(Element.prototype.getContext);
-_markNative(Element.prototype.toDataURL);
-_markNative(Element.prototype.toBlob);
 
 Element.prototype.attachShadow = function attachShadow(opts) {
   var _mode = opts == null ? undefined : opts.mode;
@@ -7382,7 +7299,6 @@ navigator.keyboard = {
   lock() { return Promise.resolve(); },
   unlock() {},
 };
-navigator.gpu = { requestAdapter() { return Promise.resolve(null); } };
 navigator.wakeLock = { request() { return Promise.reject(new DOMException('Not allowed', 'NotAllowedError')); } };
 
 globalThis.opener = null;
@@ -7450,6 +7366,19 @@ globalThis.Worker = class Worker {
       console: globalThis.console,
       performance: globalThis.performance,
       location: globalThis.location,
+      navigator: globalThis.navigator,
+      OffscreenCanvas: globalThis.OffscreenCanvas,
+      WebGLRenderingContext: globalThis.WebGLRenderingContext,
+      WebGL2RenderingContext: globalThis.WebGL2RenderingContext,
+      GPU: globalThis.GPU,
+      GPUAdapter: globalThis.GPUAdapter,
+      GPUDevice: globalThis.GPUDevice,
+      GPUBuffer: globalThis.GPUBuffer,
+      GPUTexture: globalThis.GPUTexture,
+      GPUBufferUsage: globalThis.GPUBufferUsage,
+      GPUTextureUsage: globalThis.GPUTextureUsage,
+      GPUShaderStage: globalThis.GPUShaderStage,
+      GPUMapMode: globalThis.GPUMapMode,
     };
     scope.self = scope;
     return scope;
@@ -8203,19 +8132,6 @@ if (typeof ImageData === 'undefined') {
   };
 }
 
-if (typeof CanvasRenderingContext2D === 'undefined') {
-  globalThis.CanvasRenderingContext2D = class CanvasRenderingContext2D {};
-}
-
-if (typeof OffscreenCanvas === 'undefined') {
-  globalThis.OffscreenCanvas = class OffscreenCanvas {
-    constructor(w, h) { this.width = w; this.height = h; }
-    getContext(type) { return globalThis.document?.createElement('canvas')?.getContext(type) || null; }
-    convertToBlob() { return Promise.resolve(new Blob([''])); }
-    transferToImageBitmap() { return {}; }
-  };
-}
-
 if (typeof Path2D === 'undefined') {
   globalThis.Path2D = class Path2D { constructor(){} moveTo(){} lineTo(){} arc(){} rect(){} closePath(){} addPath(){} };
 }
@@ -8391,20 +8307,26 @@ globalThis.__obscura_init = function() {
   globalThis.__virtualUrl = null;
   _installWasmStreamingFallback();
 
+  const injectedProfile = globalThis.__obscura_fingerprint_profile;
+  if (injectedProfile && typeof injectedProfile === 'object') {
+    _fingerprintProfile = _freezeFingerprintProfile(injectedProfile);
+  }
+  delete globalThis.__obscura_fingerprint_profile;
+
   globalThis.document = new Document(+_dom("document_node_id"));
 
-  const scr = _fp('screen');
-  const sw = scr[0], sh = scr[1];
-  globalThis.screen = new Screen(sw, sh);
-  globalThis.visualViewport = { width:sw, height:sh-80, offsetLeft:0, offsetTop:0, scale:1, addEventListener(){}, removeEventListener(){} };
-  globalThis.devicePixelRatio = sw >= 2560 ? 2 : 1;
-  globalThis.innerWidth = sw; globalThis.innerHeight = sh - 80;
-  globalThis.outerWidth = sw; globalThis.outerHeight = sh - 40;
-
-  var hwValues = globalThis.__obscura_stealth ? [4, 6, 8, 12, 16] : [2, 4, 6, 8, 12, 16];
-  globalThis.__obscura_hw = hwValues[Math.floor(_fpRand(400) * hwValues.length)];
-  var memValues = globalThis.__obscura_stealth ? [4, 8] : [0.25, 0.5, 1, 2, 4, 8];
-  globalThis.__obscura_mem = memValues[Math.floor(_fpRand(401) * memValues.length)];
+  const scr = _fingerprintProfile && _fingerprintProfile.screen || {
+    width:1920,height:1080,availWidth:1920,availHeight:1040,availLeft:0,availTop:0,
+    colorDepth:24,pixelDepth:24,devicePixelRatio:1,innerWidth:1920,innerHeight:1000,
+    outerWidth:1920,outerHeight:1080,screenX:0,screenY:0
+  };
+  globalThis.screen = new Screen(_screenToken, scr);
+  globalThis.visualViewport = { width:scr.innerWidth, height:scr.innerHeight, offsetLeft:0, offsetTop:0, scale:1, addEventListener(){}, removeEventListener(){} };
+  globalThis.devicePixelRatio = scr.devicePixelRatio;
+  globalThis.innerWidth = scr.innerWidth; globalThis.innerHeight = scr.innerHeight;
+  globalThis.outerWidth = scr.outerWidth; globalThis.outerHeight = scr.outerHeight;
+  globalThis.screenX = scr.screenX; globalThis.screenY = scr.screenY;
+  globalThis.screenLeft = scr.screenX; globalThis.screenTop = scr.screenY;
 
   const t0 = Date.now() + Math.floor(_fpRand(641) * 100) - 50;
   globalThis.performance.timeOrigin = t0;
@@ -8416,10 +8338,6 @@ globalThis.__obscura_init = function() {
     usedJSHeapSize: Math.floor(_totalHeap * (0.3 + _fpRand(621) * 0.5)),
   };
   globalThis.Notification.permission = "default";
-
-  // userAgentData brands and getHighEntropyValues now derive the Chrome
-  // version from navigator.userAgent and read the platform from the page
-  // globals, so every stealth surface agrees without a per-mode override.
 
   // Hide internals (_*, obscura, Obscura). The set of keys is static at
   // snapshot-build time, so we precompute it ONCE below (after this

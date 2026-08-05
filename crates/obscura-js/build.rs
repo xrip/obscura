@@ -2,12 +2,19 @@ use std::path::PathBuf;
 
 fn main() {
     println!("cargo:rerun-if-changed=js/bootstrap.js");
+    println!("cargo:rerun-if-changed=js/graphics.js");
+    println!("cargo:rerun-if-changed=js/graphics_api_v145.js");
     println!("cargo:rerun-if-changed=build.rs");
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let snapshot_path = out_dir.join("OBSCURA_SNAPSHOT.bin");
 
-    let bootstrap_js = include_str!("js/bootstrap.js");
+    let graphics_api_js = include_str!("js/graphics_api_v145.js");
+    let graphics_js = include_str!("js/graphics.js");
+    let bootstrap_js = include_str!("js/bootstrap.js").replace(
+        "/* __OBSCURA_GRAPHICS_MODULE__ */",
+        &format!("{graphics_api_js}\n{graphics_js}"),
+    );
 
     let output = deno_core::snapshot::create_snapshot(
         deno_core::snapshot::CreateSnapshotOptions {
@@ -18,7 +25,7 @@ fn main() {
             extension_transpiler: None,
             with_runtime_cb: Some(Box::new(move |runtime| {
                 runtime
-                    .execute_script("<obscura:bootstrap>", bootstrap_js.to_string())
+                    .execute_script("<obscura:bootstrap>", bootstrap_js.clone())
                     .expect("bootstrap.js should not fail during snapshot creation");
             })),
         },

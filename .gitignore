@@ -1,2 +1,5 @@
 target/
 .DS_Store
+/webgl/adapters.json
+/webgl/window.json
+/webgl/profiles/

@@ -1,0 +1,8 @@
+{
+  "chromiumCommit": "ab0b95409566de9da1ed76e690022f774aec7793",
+  "chromiumTag": "145.0.7632.75",
+  "sourceDigest": "44157441a56412dda74190e99543f1f37250367fbad5d540501a7ccdde3dac92",
+  "webgl1Spec": "https://registry.khronos.org/webgl/specs/latest/1.0/webgl.idl",
+  "webgl2Spec": "https://registry.khronos.org/webgl/specs/latest/2.0/webgl2.idl",
+  "webgpuSpec": "https://gpuweb.github.io/gpuweb/"
+}

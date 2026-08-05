@@ -64,17 +64,25 @@ obscura fetch https://example.com --user-agent "Mozilla/5.0 (...) ..."
 obscura serve --user-agent "Mozilla/5.0 (...) ..."
 ```
 
-Default UA matches a recent Chrome on the build platform.
+The default UA is the UA from the selected Chrome 145 Windows profile. A custom
+UA changes the HTTP header and `navigator.userAgent` only. If it is not an exact
+Chrome 145 Windows UA, Obscura gives one warning. The caller then owns the match
+between the custom UA and all other profile data.
 
 ## Browser profile, timezone, and geolocation
 
-The engine presents one of a built-in pool of realistic browser profiles (a mix of Windows and macOS, recent Chrome versions). Each profile keeps `navigator.platform`, `navigator.userAgentData` (platform and platform version), the UA string, and the WebGL/GPU renderer internally consistent, so the surfaces a site fingerprints agree with each other. Windows profiles report ANGLE Direct3D11 renderers, macOS profiles report ANGLE Metal renderers.
+The engine has a Chrome 145 Windows catalog. One profile joins the browser,
+navigator, screen, window, WebGL, and WebGPU data for a `BrowserContext`. All
+pages, navigation, iframe shims, and worker shims in that context use the same
+profile. Graphics data always stays with its captured ANGLE/D3D11 adapter row.
 
 A single stable profile is used by default. One IP cycling through different identities is itself a signal, so rotation is opt-in:
 
 ```bash
-OBSCURA_PROFILE=2 obscura serve          # pin a specific profile by index
-OBSCURA_ROTATE_PROFILE=1 obscura serve   # random profile per browser context
+OBSCURA_PROFILE=0 obscura serve          # fixed catalog default
+OBSCURA_PROFILE=42 obscura serve         # stable catalog seed
+OBSCURA_PROFILE=c145w1:BASE:GRAPHICS:SCREEN obscura serve  # exact ID
+OBSCURA_ROTATE_PROFILE=1 obscura serve   # weighted random parts per context
 ```
 
 Timezone is driven by the process zone so `Date` (`getTimezoneOffset`, `toString`) and `Intl.DateTimeFormat` report the same region. Default is `Europe/Berlin`; set it to match the exit IP:
@@ -97,5 +105,5 @@ Keep these aligned. A rotated or mismatched profile carries no matching TLS or t
 obscura serve \
   --stealth \
   --proxy http://user:pass@proxy.example.com:8080 \
-  --user-agent "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 ..."
+  --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ... Chrome/145.0.0.0 Safari/537.36"
 ```

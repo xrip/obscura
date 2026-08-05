@@ -219,9 +219,10 @@ impl Page {
             // http://, which only works when the upstream happens to be a
             // Clash-style mixed-mode proxy and breaks plain SOCKS5 servers
             // like `ssh -ND` (#160).
-            Some(Arc::new(StealthHttpClient::with_proxy(
+            Some(Arc::new(StealthHttpClient::with_proxy_and_user_agent(
                 context.cookie_jar.clone(),
                 context.proxy_url.as_deref(),
+                &context.user_agent,
             )))
         } else {
             None
@@ -307,33 +308,16 @@ impl Page {
         #[cfg(feature = "stealth")]
         if self.stealth_client.is_some() {
             rt.set_stealth(true);
-            rt.set_user_agent(obscura_net::STEALTH_USER_AGENT);
-            rt.set_platform(
-                obscura_net::STEALTH_NAVIGATOR_PLATFORM,
-                obscura_net::STEALTH_UA_PLATFORM,
-                obscura_net::STEALTH_UA_PLATFORM_VERSION,
-            );
-        } else {
-            if let Ok(ua) = self.http_client.user_agent.try_read() {
-                rt.set_user_agent(&ua);
-            }
-            rt.set_platform(
-                &self.context.platform,
-                &self.context.ua_platform,
-                &self.context.ua_platform_version,
-            );
         }
-        #[cfg(not(feature = "stealth"))]
-        {
-            if let Ok(ua) = self.http_client.user_agent.try_read() {
-                rt.set_user_agent(&ua);
-            }
-            rt.set_platform(
-                &self.context.platform,
-                &self.context.ua_platform,
-                &self.context.ua_platform_version,
-            );
+        if let Ok(ua) = self.http_client.user_agent.try_read() {
+            rt.set_user_agent(&ua);
         }
+        rt.set_platform(
+            &self.context.platform,
+            &self.context.ua_platform,
+            &self.context.ua_platform_version,
+        );
+        rt.set_fingerprint_profile(self.context.fingerprint_profile.runtime_json());
         if let Some((lat, lon)) = env_geolocation() {
             rt.set_geolocation(lat, lon);
         }

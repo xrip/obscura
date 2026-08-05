@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use obscura_net::{CookieJar, ObscuraHttpClient, RobotsCache};
 
@@ -11,6 +11,7 @@ pub struct BrowserContext {
     pub platform: String,
     pub ua_platform: String,
     pub ua_platform_version: String,
+    pub(crate) fingerprint_profile: Arc<crate::profiles::ResolvedFingerprintProfile>,
     pub proxy_url: Option<String>,
     pub robots_cache: Arc<RobotsCache>,
     pub obey_robots: bool,
@@ -31,6 +32,8 @@ pub struct BrowserContext {
     /// the broader SSRF gate from issue #4.
     pub allow_private_network: bool,
 }
+
+static WARNED_CUSTOM_USER_AGENT: OnceLock<()> = OnceLock::new();
 
 impl BrowserContext {
     pub fn new(id: String) -> Self {
@@ -106,11 +109,21 @@ impl BrowserContext {
         if stealth {
             client.block_trackers = true;
         }
-        let profile = crate::profiles::select_profile();
-        let resolved_ua = user_agent.unwrap_or_else(|| profile.user_agent.to_string());
-        let platform = profile.platform.to_string();
-        let ua_platform = profile.ua_platform.to_string();
-        let ua_platform_version = profile.ua_platform_version.to_string();
+        let profile = crate::profiles::resolve_profile()
+            .unwrap_or_else(|error| panic!("failed to load the browser fingerprint profile: {error}"));
+        if user_agent
+            .as_deref()
+            .is_some_and(|value| value != profile.browser.user_agent)
+            && WARNED_CUSTOM_USER_AGENT.set(()).is_ok()
+        {
+            tracing::warn!(
+                "custom user agent does not match the Chrome 145 Windows catalog; the caller owns cross-surface consistency"
+            );
+        }
+        let resolved_ua = user_agent.unwrap_or_else(|| profile.browser.user_agent.clone());
+        let platform = profile.navigator.platform.clone();
+        let ua_platform = profile.navigator.ua_platform.clone();
+        let ua_platform_version = profile.navigator.ua_platform_version.clone();
         // Sync the http client's UA at construction so navigation requests pick it
         // up before any async setup runs. The lock has no other holders here, so
         // try_write always succeeds; we fall back silently if it ever fails.
@@ -126,6 +139,7 @@ impl BrowserContext {
             platform,
             ua_platform,
             ua_platform_version,
+            fingerprint_profile: profile,
             proxy_url,
             robots_cache: Arc::new(RobotsCache::new()),
             obey_robots: false,
@@ -183,6 +197,7 @@ impl BrowserContext {
             platform: self.platform.clone(),
             ua_platform: self.ua_platform.clone(),
             ua_platform_version: self.ua_platform_version.clone(),
+            fingerprint_profile: self.fingerprint_profile.clone(),
             proxy_url: self.proxy_url.clone(),
             robots_cache: Arc::new(RobotsCache::new()),
             obey_robots: self.obey_robots,
@@ -191,6 +206,10 @@ impl BrowserContext {
             storage_dir: persistent.then(|| self.storage_dir.clone()).flatten(),
             allow_private_network: self.allow_private_network,
         }
+    }
+
+    pub fn profile_id(&self) -> &str {
+        &self.fingerprint_profile.id
     }
 
     /// Persist cookies to disk if storage_dir is configured.
@@ -265,5 +284,24 @@ mod tests {
 
         assert_eq!(source.cookie_jar.get_all_cookies().len(), 1);
         assert_eq!(source.http_client.user_agent.read().await.as_str(), "Template-UA/1.0");
+        assert_eq!(source.profile_id(), persistent.profile_id());
+        assert_eq!(source.profile_id(), incognito.profile_id());
+        assert!(Arc::ptr_eq(
+            &source.fingerprint_profile,
+            &persistent.fingerprint_profile
+        ));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn default_profile_is_coherent_and_stable_across_contexts() {
+        let first = BrowserContext::new("first".to_string());
+        let second = BrowserContext::new("second".to_string());
+        assert_eq!(first.profile_id(), second.profile_id());
+        assert!(first.profile_id().starts_with("c145w1:"));
+        assert!(first.user_agent.contains("Chrome/145.0.0.0"));
+        assert_eq!(first.platform, "Win32");
+        assert_eq!(first.ua_platform, "Windows");
+        assert!(first.fingerprint_profile.browser.version.starts_with("145."));
+        assert_eq!(first.user_agent, first.http_client.user_agent.read().await.as_str());
     }
 }
