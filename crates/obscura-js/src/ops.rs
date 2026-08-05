@@ -834,7 +834,7 @@ async fn op_fetch_url(
         }
     }
 
-    let (cookie_jar, in_flight, intercept_tx, proxy_url, callbacks, http_client) = {
+    let (cookie_jar, in_flight, intercept_tx, proxy_url, callbacks, http_client, _document_url) = {
         let state_borrow = state.borrow();
         let gs = state_borrow.borrow::<SharedState>().clone();
         let mut gs = gs.borrow_mut();
@@ -873,6 +873,7 @@ async fn op_fetch_url(
             proxy_url,
             gs.callbacks.clone(),
             gs.http_client.clone(),
+            gs.url.clone(),
         )
     };
 
@@ -1021,6 +1022,7 @@ async fn op_fetch_url(
                 page_origin.clone(),
                 is_cross_origin,
                 mode.clone(),
+                _document_url.clone(),
                 callbacks.clone(),
             )
             .await;
@@ -1332,6 +1334,7 @@ async fn stealth_fetch_all(
     page_origin: String,
     is_cross_origin: bool,
     mode: String,
+    document_url: String,
     callbacks: Option<Arc<CallbackRegistry>>,
 ) -> Result<String, deno_error::JsErrorBox> {
     let mut current_url = url.clone();
@@ -1351,11 +1354,50 @@ async fn stealth_fetch_all(
         };
 
         let mut req_headers: HashMap<String, String> = HashMap::new();
-        if is_cross_origin {
+        let fetch_mode = if mode.is_empty() { "cors" } else { mode.as_str() };
+        req_headers.insert(
+            "accept".to_string(),
+            custom_headers
+                .get("accept")
+                .cloned()
+                .unwrap_or_else(|| "*/*".to_string()),
+        );
+        req_headers.insert(
+            "sec-fetch-dest".to_string(),
+            if fetch_mode == "no-cors" { "script" } else { "empty" }.to_string(),
+        );
+        req_headers.insert("sec-fetch-mode".to_string(), fetch_mode.to_string());
+        req_headers.insert(
+            "sec-fetch-site".to_string(),
+            if is_cross_origin { "cross-site" } else { "same-origin" }.to_string(),
+        );
+        // Browsers send Origin on non-GET same-origin fetches too. This is
+        // important for token and challenge endpoints that bind the issued
+        // token to the page origin.
+        if (!is_cross_origin && current_method != "GET" && current_method != "HEAD")
+            || is_cross_origin
+        {
             req_headers.insert("origin".to_string(), page_origin.clone());
         }
         for (k, v) in &custom_headers {
             req_headers.insert(k.to_lowercase(), v.clone());
+        }
+
+        // Fetch uses the document as its referrer. Same-origin requests carry
+        // the full document URL; cross-origin requests carry only the origin
+        // under the default strict-origin-when-cross-origin policy.
+        if let Ok(mut referrer_url) = url::Url::parse(&document_url) {
+            referrer_url.set_fragment(None);
+            let referer = if referrer_url.origin().ascii_serialization()
+                == parsed_current.origin().ascii_serialization()
+            {
+                referrer_url.to_string()
+            } else {
+                page_origin.clone()
+            };
+            if !referer.is_empty() {
+                req_headers.insert("referer".to_string(), referer);
+            }
         }
 
         let r = stealth

@@ -46,6 +46,8 @@
     'Node', 'Element', 'Document', 'DocumentFragment', 'DocumentType',
     'Text', 'Comment', 'CDATASection', 'ProcessingInstruction', 'CharacterData',
     'CSSStyleDeclaration', 'DOMTokenList', 'Screen', 'NetworkInformation', 'Navigator',
+    'NavigatorUAData', 'Permissions', 'ScreenOrientation',
+    'HTMLDocument',
     'MessageChannel', 'MessagePort', 'CustomElementRegistry',
     'XMLHttpRequestEventTarget', 'HTMLMediaElement', 'HTMLVideoElement',
     'HTMLAudioElement', 'WebGL2RenderingContext',
@@ -55,6 +57,17 @@
     try { Object.defineProperty(globalThis, _names[_i], _desc); } catch (_e) {}
   }
 })();
+
+// deno_core exposes its host bridge as an enumerable global by default. Keep
+// it available to the runtime, but hide it from ordinary page enumeration.
+try {
+  Object.defineProperty(globalThis, 'Deno', {
+    value: globalThis.Deno,
+    writable: true,
+    configurable: true,
+    enumerable: false,
+  });
+} catch (_) {}
 
 globalThis.__obscura_errors = [];
 
@@ -406,11 +419,12 @@ const _consoleFn = (level, args) => {
     if (a === null) return "null";
     if (a === undefined) return "undefined";
     if (a instanceof Error) {
-      const _pst = Error.prepareStackTrace;
-      if (_pst !== undefined) Error.prepareStackTrace = undefined;
-      const _s = a.stack || a.message || String(a);
-      if (_pst !== undefined) Error.prepareStackTrace = _pst;
-      return _s;
+      // Chrome's console transport does not read Error.stack while the page
+      // logs an Error. Reading it here triggers the common DevTools/CDP
+      // getter probe before any inspector is involved.
+      const name = a.name || "Error";
+      const message = a.message || "";
+      return message ? name + ": " + message : name;
     }
     if (typeof a === "object") {
       try {
@@ -425,11 +439,22 @@ const _consoleFn = (level, args) => {
 globalThis.console = {
   log: (...a) => _consoleFn("log", a), warn: (...a) => _consoleFn("warn", a),
   error: (...a) => _consoleFn("error", a), info: (...a) => _consoleFn("log", a),
-  debug: () => {}, dir: () => {}, trace: () => {}, table: () => {}, group: () => {},
+  debug: () => {}, dir: () => {}, dirxml: () => {}, trace: () => {}, table: () => {}, group: () => {},
   groupEnd: () => {}, groupCollapsed: () => {}, time: () => {}, timeEnd: () => {},
-  timeLog: () => {}, count: () => {}, countReset: () => {}, clear: () => {},
+  timeLog: () => {}, timeStamp: () => {}, count: () => {}, countReset: () => {}, clear: () => {},
+  profile: () => {}, profileEnd: () => {}, context: () => globalThis.console,
+  createTask: () => ({ run: () => {} }),
   assert: (c, ...a) => { if (!c) _consoleFn("error", ["Assertion failed:", ...a]); },
 };
+Object.defineProperty(globalThis.console, Symbol.toStringTag, {
+  value: "console", configurable: true,
+});
+Object.defineProperty(globalThis.console, "memory", {
+  get() { return {}; }, set() {}, configurable: true,
+});
+for (const _consoleKey of Object.getOwnPropertyNames(globalThis.console)) {
+  if (typeof globalThis.console[_consoleKey] === "function") _markNative(globalThis.console[_consoleKey]);
+}
 
 let _tid = 0;
 const _clearedTimers = new Set();
@@ -452,7 +477,7 @@ const _coerceTimerFn = (fn) => {
   return typeof fn === "function" ? fn : null;
 };
 
-globalThis.setTimeout = (fn, delay = 0, ...args) => {
+const _setTimeout = (fn, delay = 0, ...args) => {
   const f = _coerceTimerFn(fn);
   if (f === null) return ++_tid;
   const id = ++_tid;
@@ -462,8 +487,12 @@ globalThis.setTimeout = (fn, delay = 0, ...args) => {
   });
   return id;
 };
+Object.defineProperty(_setTimeout, "name", { value: "setTimeout", configurable: true });
+globalThis.setTimeout = _markNative(_setTimeout);
 
-globalThis.clearTimeout = (id) => { _clearedTimers.add(id); };
+const _clearTimeout = (id) => { _clearedTimers.add(id); };
+Object.defineProperty(_clearTimeout, "name", { value: "clearTimeout", configurable: true });
+globalThis.clearTimeout = _markNative(_clearTimeout);
 
 globalThis.setInterval = (fn, delay = 0, ...args) => {
   const f = _coerceTimerFn(fn);
@@ -1279,6 +1308,9 @@ Object.assign(Node.prototype, {
   DOCUMENT_POSITION_FOLLOWING: 4, DOCUMENT_POSITION_CONTAINS: 8,
   DOCUMENT_POSITION_CONTAINED_BY: 16, DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC: 32,
 });
+// Native Node has a zero-argument WebIDL constructor signature even though
+// this shim accepts an internal node id when it wraps a Rust DOM node.
+Object.defineProperty(Node, 'length', { value: 0, configurable: true });
 
 // HTML elements ASCII-lowercase attribute names (setAttribute('accessKey') is
 // stored as 'accesskey'). The toLowerCase is gated behind a cheap uppercase
@@ -1325,7 +1357,7 @@ function _parseHTMLFragment(html, context) {
 }
 
 class Element extends Node {
-  constructor(nid) {
+  constructor(nid = 0) {
     super(nid);
     _nodeSlots.get(this).style = _styleProxy(new CSSStyleDeclaration(this));
   }
@@ -1334,6 +1366,19 @@ class Element extends Node {
   // is constant. Overrides Node's dynamic getter to drop one op per nodeType read.
   get nodeType() { return 1; }
   get tagName() { return _domParse("tag_name", _nodeId(this)) || ""; }
+  get src() {
+    const tag = this.localName;
+    if (!['audio', 'embed', 'iframe', 'img', 'input', 'script', 'source', 'track', 'video'].includes(tag)) {
+      return undefined;
+    }
+    return this.getAttribute('src') || '';
+  }
+  set src(v) {
+    const tag = this.localName;
+    if (['audio', 'embed', 'iframe', 'img', 'input', 'script', 'source', 'track', 'video'].includes(tag)) {
+      this.setAttribute('src', v == null ? '' : String(v));
+    }
+  }
   get localName() {
     // tagName is an op call and the tag never changes, so cache the lowercased
     // localName. This keeps the new <a>/<area> href getters (which read
@@ -2670,8 +2715,6 @@ class Document extends Node {
   set title(v) {}
   get URL() { return _domParse("document_url") ?? ""; }
   get documentURI() { return this.URL; }
-  get location() { return globalThis.location; }
-  set location(url) { Deno.core.ops.op_navigate(_resolveUrl(String(url)), 'GET', ''); }
   get defaultView() { return globalThis; }
   get nodeType() { return 9; }
   get nodeName() { return "#document"; }
@@ -3244,7 +3287,7 @@ function _wrap(nid) {
   if (t === 1) { const C = _elementClassFor(nid); n = _constructElement(C, nid); }
   else if (t === 3) n = new Text(nid);
   else if (t === 8) n = new Comment(nid);
-  else if (t === 9) n = new Document(nid);
+  else if (t === 9) n = new (globalThis.HTMLDocument || Document)(nid);
   else n = new Node(nid);
   _cache.set(nid, n);
   return n;
@@ -3342,6 +3385,14 @@ for (const _ev of [
 }
 
 globalThis.Window = globalThis.Window || function Window() {};
+_markNative(globalThis.Window);
+Object.defineProperty(globalThis.Window.prototype, Symbol.toStringTag, {
+  value: 'Window', configurable: true,
+});
+Object.defineProperty(globalThis, Symbol.toStringTag, {
+  value: 'Window', configurable: true,
+});
+try { Object.setPrototypeOf(globalThis, globalThis.Window.prototype); } catch (_) {}
 Object.defineProperty(globalThis.Window, Symbol.hasInstance, {
   value(obj) { return obj === globalThis || (obj && obj.window === obj); },
   configurable: true,
@@ -3357,20 +3408,9 @@ Object.defineProperty(globalThis, 'length', {
   enumerable: true
 });
 
-// Since we cannot define a Proxy on globalThis easily, we'll define a reasonable number of indexed getters.
-for (let i = 0; i < 50; i++) {
-  Object.defineProperty(globalThis, i, {
-    get() {
-      const iframes = document.querySelectorAll('iframe');
-      if (i < iframes.length) {
-        return iframes[i].contentWindow;
-      }
-      return undefined;
-    },
-    configurable: true,
-    enumerable: false
-  });
-}
+// Native Window exposes indexed properties only for existing child frames.
+// Defining a fixed range of empty getters makes a blank page expose 50 own
+// numeric properties, which is not a browser-compatible Window shape.
 
 // Navigator constructor so that typeof Navigator !== 'undefined' and
 // navigatorPrototype checks don't throw a ReferenceError.
@@ -3378,6 +3418,9 @@ const _navigatorInstances = new WeakSet();
 function Navigator() { throw new TypeError('Illegal constructor'); }
 _markNative(Navigator);
 globalThis.Navigator = Navigator;
+Object.defineProperty(Navigator.prototype, Symbol.toStringTag, {
+  value: 'Navigator', configurable: true,
+});
 
 // PluginArray must exist before navigator is built so the plugins getter can use it.
 function PluginArray(items) {
@@ -3449,23 +3492,76 @@ _markNative(MimeTypeArray);
 _markNative(MimeTypeArray.prototype.item);
 _markNative(MimeTypeArray.prototype.namedItem);
 
+const _networkInfoListeners = new WeakMap();
+const _networkInfoEventTarget = Object.create(Node.prototype);
+Object.defineProperties(_networkInfoEventTarget, {
+  addEventListener: { value: function addEventListener(type, fn) {
+    if (typeof fn !== 'function') return;
+    const map = _networkInfoListeners.get(this);
+    if (!map.has(type)) map.set(type, []);
+    map.get(type).push(fn);
+  }, writable: true, configurable: true },
+  removeEventListener: { value: function removeEventListener(type, fn) {
+    const map = _networkInfoListeners.get(this);
+    const list = map && map.get(type);
+    if (list) map.set(type, list.filter(value => value !== fn));
+  }, writable: true, configurable: true },
+  dispatchEvent: { value: function dispatchEvent(event) {
+    const map = _networkInfoListeners.get(this);
+    const list = map && map.get(event && event.type) || [];
+    for (const fn of list.slice()) { try { fn.call(this, event); } catch (_) {} }
+    return true;
+  }, writable: true, configurable: true },
+});
+_markNative(_networkInfoEventTarget.addEventListener);
+_markNative(_networkInfoEventTarget.removeEventListener);
+_markNative(_networkInfoEventTarget.dispatchEvent);
+
 class NetworkInformation {
-  constructor() { _makeListenerBox(this); }
-  get downlink() { return 10; }
-  get downlinkMax() { return Infinity; }
+  constructor() { _networkInfoListeners.set(this, new Map()); }
+  get downlink() { return 1.5; }
   get effectiveType() { return '4g'; }
-  get rtt() { return 50; }
+  get rtt() { return 100; }
   get saveData() { return false; }
-  get type() { return 'wifi'; }
   get onchange() { return null; }
   set onchange(v) {}
-  get ontypechange() { return null; }
-  set ontypechange(v) {}
 }
 _markNative(NetworkInformation);
+Object.setPrototypeOf(NetworkInformation.prototype, _networkInfoEventTarget);
+for (const name of ['downlink', 'effectiveType', 'rtt', 'saveData', 'onchange']) {
+  const descriptor = Object.getOwnPropertyDescriptor(NetworkInformation.prototype, name);
+  if (descriptor && descriptor.get) {
+    _markNativeAs(descriptor.get, `function get ${name}() { [native code] }`);
+  }
+}
 globalThis.NetworkInformation = NetworkInformation;
 
 globalThis.ContentIndex = class ContentIndex {};
+
+// Permissions is a global platform interface in Chrome. Keep the service
+// object on Navigator, but expose the constructor as well so checks of
+// `navigator.permissions instanceof Permissions` and constructor shape work.
+class Permissions {
+  query(params) {
+    var n = params && params.name;
+    // Chrome defaults privacy-sensitive permissions to "prompt", not
+    // "granted". Returning "granted" for camera or microphone is a bot tell.
+    if (n === 'notifications') {
+      return Promise.resolve({
+        state: (globalThis.Notification && Notification.permission === 'granted') ? 'granted' : 'prompt',
+        onchange: null,
+      });
+    }
+    if (n === 'geolocation' || n === 'camera' || n === 'microphone' || n === 'midi') {
+      return Promise.resolve({state: 'prompt', onchange: null});
+    }
+    return Promise.resolve({state: 'granted', onchange: null});
+  }
+}
+_markNative(Permissions);
+_markNative(Permissions.prototype.query);
+globalThis.Permissions = Permissions;
+const _permissions = new Permissions();
 
 function _copyBrands(values) {
   return (values || []).map(function(value) {
@@ -3473,49 +3569,62 @@ function _copyBrands(values) {
   });
 }
 
+class NavigatorUAData {
+  get brands() {
+    var profile = _profileNavigator();
+    return _copyBrands(profile && profile.brands);
+  }
+  get mobile() { return false; }
+  get platform() {
+    var profile = _profileNavigator();
+    return profile && profile.uaPlatform || globalThis.__obscura_ua_platform || "Windows";
+  }
+  getHighEntropyValues(hints) {
+    var profile = _profileNavigator() || {};
+    var browser = _fingerprintProfile && _fingerprintProfile.browser || {};
+    var out = {
+      brands: this.brands,
+      mobile: this.mobile,
+      platform: this.platform,
+    };
+    var high = {
+      architecture: profile.architecture || "x86",
+      bitness: profile.bitness || "64",
+      fullVersionList: _copyBrands(profile.fullVersionList),
+      model: "",
+      platformVersion: profile.uaPlatformVersion || globalThis.__obscura_ua_platform_version || "19.0.0",
+      uaFullVersion: browser.version || "145.0.7632.75",
+      wow64: false,
+    };
+    var requested = hints === undefined ? [] : Array.from(hints, String);
+    for (var i = 0; i < requested.length; i++) {
+      if (Object.prototype.hasOwnProperty.call(high, requested[i])) out[requested[i]] = high[requested[i]];
+    }
+    return Promise.resolve(out);
+  }
+  toJSON() { return {brands:this.brands,mobile:this.mobile,platform:this.platform}; }
+}
+_markNative(NavigatorUAData);
+_markNative(NavigatorUAData.prototype.getHighEntropyValues);
+_markNative(NavigatorUAData.prototype.toJSON);
+for (const name of ['brands', 'mobile', 'platform']) {
+  const descriptor = Object.getOwnPropertyDescriptor(NavigatorUAData.prototype, name);
+  if (descriptor && descriptor.get) {
+    _markNativeAs(descriptor.get, `function get ${name}() { [native code] }`);
+  }
+}
+globalThis.NavigatorUAData = NavigatorUAData;
+const _userAgentData = new NavigatorUAData();
+
 // Fingerprint surfaces (UA, plugins, webdriver, etc.) live on the prototype
 // hop below, not as own props here: own accessors are a bot tell.
-globalThis.navigator = {
+const _navigatorData = {
   onLine: true, cookieEnabled: true,
   vendor: "Google Inc.", product: "Gecko", productSub: "20030107",
   doNotTrack: null,
   connection: new NetworkInformation(),
   pdfViewerEnabled: true,
-  userAgentData: {
-    mobile: false,
-    get brands() {
-      var profile = _profileNavigator();
-      return _copyBrands(profile && profile.brands);
-    },
-    get platform() {
-      var profile = _profileNavigator();
-      return profile && profile.uaPlatform || globalThis.__obscura_ua_platform || "Windows";
-    },
-    getHighEntropyValues(hints) {
-      var profile = _profileNavigator() || {};
-      var browser = _fingerprintProfile && _fingerprintProfile.browser || {};
-      var out = {
-        brands: _copyBrands(profile.brands),
-        mobile: false,
-        platform: profile.uaPlatform || globalThis.__obscura_ua_platform || "Windows",
-      };
-      var high = {
-        architecture: profile.architecture || "x86",
-        bitness: profile.bitness || "64",
-        fullVersionList: _copyBrands(profile.fullVersionList),
-        model: "",
-        platformVersion: profile.uaPlatformVersion || globalThis.__obscura_ua_platform_version || "19.0.0",
-        uaFullVersion: browser.version || "145.0.7632.75",
-        wow64: false,
-      };
-      var requested = hints === undefined ? [] : Array.from(hints, String);
-      for (var i = 0; i < requested.length; i++) {
-        if (Object.prototype.hasOwnProperty.call(high, requested[i])) out[requested[i]] = high[requested[i]];
-      }
-      return Promise.resolve(out);
-    },
-    toJSON() { return {brands:this.brands,mobile:this.mobile,platform:this.platform}; },
-  },
+  userAgentData: _userAgentData,
   serviceWorker: { ready: Promise.resolve(), register(){return Promise.resolve();}, getRegistrations(){return Promise.resolve([]);}, controller: null, oncontrollerchange: null, onmessage: null, addEventListener(){}, removeEventListener(){}, dispatchEvent(){return true;} },
   mediaDevices: {
     enumerateDevices() {
@@ -3531,14 +3640,7 @@ globalThis.navigator = {
     addEventListener(){}, removeEventListener(){},
   },
   clipboard: { writeText(){return Promise.resolve();}, readText(){return Promise.resolve("");} },
-  permissions: { query(params){
-    var n = params && params.name;
-    // Chrome defaults privacy-sensitive permissions to "prompt", not "granted";
-    // returning "granted" for camera/microphone is a bot tell.
-    if (n === 'notifications') return Promise.resolve({state: (globalThis.Notification && Notification.permission === 'granted') ? 'granted' : 'prompt', onchange: null});
-    if (n === 'geolocation' || n === 'camera' || n === 'microphone' || n === 'midi') return Promise.resolve({state: 'prompt', onchange: null});
-    return Promise.resolve({state: 'granted', onchange: null});
-  } },
+  permissions: _permissions,
   getBattery() { return Promise.resolve({ charging: _fp('batteryCharging'), chargingTime: _fp('batteryCharging') ? 0 : Infinity, dischargingTime: _fp('batteryCharging') ? Infinity : Math.floor(3600 + _fpRand(250) * 7200), level: _fp('batteryLevel'), addEventListener(){} }); },
   getGamepads() { return []; },
   sendBeacon() { return true; },
@@ -3580,16 +3682,20 @@ globalThis.navigator = {
     persisted() { return Promise.resolve(false); },
   },
 };
+// Chrome keeps Navigator's platform properties on its prototype. An empty
+// instance matters because Object.keys(navigator) and Reflect.ownKeys(navigator)
+// are common fingerprinting probes.
+globalThis.navigator = {};
 _navigatorInstances.add(globalThis.navigator);
 
-// Put spoofed navigator props on a thin prototype above Navigator.prototype
-// so hasOwnProperty/getOwnPropertyDescriptor on the instance match Chrome.
+// Put spoofed navigator props directly on Navigator.prototype so the
+// prototype chain matches Chrome and the instance stays empty.
 // Getters read __obscura_* lazily (snapshot vs per-page) and are _markNative'd.
 (function() {
-  var _navProto = Object.create(Navigator.prototype);
+  var _navProto = Navigator.prototype;
 
   function defGetter(key, fn) {
-    _markNative(fn);
+    _markNativeAs(fn, `function get ${key}() { [native code] }`);
     Object.defineProperty(_navProto, key, {
       get: fn, set: undefined, enumerable: true, configurable: true,
     });
@@ -3644,6 +3750,20 @@ _navigatorInstances.add(globalThis.navigator);
     return value === undefined ? 0 : value;
   });
 
+  for (const key of Object.keys(_navigatorData)) {
+    const value = _navigatorData[key];
+    if (typeof value === 'function') {
+      Object.defineProperty(_navProto, key, {
+        value: _markNative(value), writable: true, enumerable: true, configurable: true,
+      });
+    } else {
+      const getter = _markNativeAs(function() { return _navigatorData[key]; }, `function get ${key}() { [native code] }`);
+      Object.defineProperty(_navProto, key, {
+        get: getter, set: undefined, enumerable: true, configurable: true,
+      });
+    }
+  }
+
   _navProto.share = _markNative(function share(data) {
     return Promise.reject(new DOMException('Not allowed', 'NotAllowedError'));
   });
@@ -3652,9 +3772,18 @@ _navigatorInstances.add(globalThis.navigator);
   Object.setPrototypeOf(globalThis.navigator, _navProto);
 })();
 
+function _defineNavigatorValue(name, value) {
+  const getter = _markNativeAs(function() { return value; }, `function get ${name}() { [native code] }`);
+  Object.defineProperty(Object.getPrototypeOf(globalThis.navigator), name, {
+    get: getter,
+    set: undefined,
+    enumerable: true,
+    configurable: true,
+  });
+}
+
 globalThis.chrome = {
   app: { isInstalled: false, InstallState: { DISABLED: "disabled", INSTALLED: "installed", NOT_INSTALLED: "not_installed" }, RunningState: { CANNOT_RUN: "cannot_run", READY_TO_RUN: "ready_to_run", RUNNING: "running" } },
-  runtime: { OnInstalledReason: {}, OnRestartRequiredReason: {}, PlatformArch: {}, PlatformNaclArch: {}, PlatformOs: {}, RequestUpdateCheckStatus: {}, connect() { throw new Error("Could not establish connection. Receiving end does not exist."); }, sendMessage() { throw new Error("Could not establish connection. Receiving end does not exist."); } },
   csi() {
     const t = Date.now();
     return { onloadT: t, startE: t - Math.floor(100 + _fpRand(610) * 200), pageT: 0, tran: 5, flashVersion: "" };
@@ -3689,25 +3818,54 @@ globalThis.Notification = class Notification {
 class Screen {
   constructor(token, profile) {
     if (token !== _screenToken) throw new TypeError('Illegal constructor');
-    _screenSlots.set(this, profile);
-    this.orientation = {type:'landscape-primary',angle:0,addEventListener(){},removeEventListener(){},dispatchEvent(){return true;}};
+    _screenSlots.set(this, {profile, orientation: new ScreenOrientation(_screenOrientationToken)});
   }
-  get width() { return _screenSlots.get(this).width; }
-  get height() { return _screenSlots.get(this).height; }
-  get availWidth() { return _screenSlots.get(this).availWidth; }
-  get availHeight() { return _screenSlots.get(this).availHeight; }
-  get availLeft() { return _screenSlots.get(this).availLeft; }
-  get availTop() { return _screenSlots.get(this).availTop; }
-  get colorDepth() { return _screenSlots.get(this).colorDepth; }
-  get pixelDepth() { return _screenSlots.get(this).pixelDepth; }
+  get width() { return _screenSlots.get(this).profile.width; }
+  get height() { return _screenSlots.get(this).profile.height; }
+  get availWidth() { return _screenSlots.get(this).profile.availWidth; }
+  get availHeight() { return _screenSlots.get(this).profile.availHeight; }
+  get availLeft() { return _screenSlots.get(this).profile.availLeft; }
+  get availTop() { return _screenSlots.get(this).profile.availTop; }
+  get colorDepth() { return _screenSlots.get(this).profile.colorDepth; }
+  get pixelDepth() { return _screenSlots.get(this).profile.pixelDepth; }
+  get orientation() { return _screenSlots.get(this).orientation; }
 }
 const _screenToken = {};
 const _screenSlots = new WeakMap();
-['width','height','availWidth','availHeight','availLeft','availTop','colorDepth','pixelDepth'].forEach(function(k) {
+const _screenOrientationToken = {};
+const _screenOrientationSlots = new WeakMap();
+class ScreenOrientation {
+  constructor(token) {
+    if (token !== _screenOrientationToken) throw new TypeError('Illegal constructor');
+    _networkInfoListeners.set(this, new Map());
+    _screenOrientationSlots.set(this, {type:'landscape-primary', angle:0, onchange:null});
+  }
+  get type() { return _screenOrientationSlots.get(this).type; }
+  get angle() { return _screenOrientationSlots.get(this).angle; }
+  get onchange() { return _screenOrientationSlots.get(this).onchange; }
+  set onchange(value) { _screenOrientationSlots.get(this).onchange = value; }
+  lock() { return Promise.resolve(); }
+  unlock() {}
+}
+_markNative(ScreenOrientation);
+Object.setPrototypeOf(ScreenOrientation.prototype, _networkInfoEventTarget);
+for (const name of ['type', 'angle', 'onchange']) {
+  const descriptor = Object.getOwnPropertyDescriptor(ScreenOrientation.prototype, name);
+  if (descriptor && descriptor.get) {
+    _markNativeAs(descriptor.get, `function get ${name}() { [native code] }`);
+  }
+}
+_markNative(ScreenOrientation.prototype.lock);
+_markNative(ScreenOrientation.prototype.unlock);
+globalThis.ScreenOrientation = ScreenOrientation;
+['width','height','availWidth','availHeight','availLeft','availTop','colorDepth','pixelDepth','orientation'].forEach(function(k) {
   var d = Object.getOwnPropertyDescriptor(Screen.prototype, k);
   if (d && d.get) _markNative(d.get);
 });
 globalThis.Screen = Screen;
+Object.defineProperty(Screen.prototype, Symbol.toStringTag, {
+  value: 'Screen', configurable: true,
+});
 globalThis.screen = new Screen(_screenToken, {width:1920,height:1080,availWidth:1920,availHeight:1040,availLeft:0,availTop:0,colorDepth:24,pixelDepth:24});
 globalThis.visualViewport = { width:1920, height:1000, offsetLeft:0, offsetTop:0, scale:1, addEventListener(){}, removeEventListener(){} };
 globalThis.devicePixelRatio = 1;
@@ -4477,7 +4635,7 @@ if (typeof TextDecoder === 'undefined') {
   };
 }
 
-globalThis.matchMedia = _markNative(function matchMedia(q) {
+const _matchMedia = _markNative((q) => {
   var s = (q || '').toLowerCase().replace(/\s+/g, '');
   var matches = false;
   if (s.includes('prefers-color-scheme:light')) matches = false;
@@ -5151,14 +5309,16 @@ globalThis.UIEvent = class extends Event {
 };
 globalThis.WheelEvent = class extends Event { constructor(t,o={}) { super(t,o);this.deltaX=o.deltaX||0;this.deltaY=o.deltaY||0;this.deltaZ=o.deltaZ||0;this.deltaMode=o.deltaMode||0; } };
 
-globalThis.CompositionEvent = class extends Event {
-  constructor(t,o={}) { super(t,o);this.view=o.view||null;this.detail=o.detail||0;this.data=o.data||""; }
+const _compositionEventData = new WeakMap();
+globalThis.CompositionEvent = class CompositionEvent extends Event {
+  constructor(t,o={}) { super(t,o);this.view=o.view||null;this.detail=o.detail||0;_compositionEventData.set(this, o.data||""); }
+  get data() { return _compositionEventData.get(this) || ""; }
   // Legacy DOM Level 3 initializer. Positional signature per UI Events spec.
   initCompositionEvent(type,canBubble,cancelable,view,data) {
     if (arguments.length < 1) throw new TypeError("Failed to execute 'initCompositionEvent' on 'CompositionEvent': 1 argument required, but only 0 present.");
     this.initEvent(type,canBubble,cancelable);
     this.view=view===undefined?null:view;
-    this.data=data===undefined?"":String(data);
+    _compositionEventData.set(this, data===undefined?"":String(data));
   }
 };
 globalThis.PopStateEvent = class extends Event {
@@ -5583,33 +5743,74 @@ globalThis.XMLSerializer = class XMLSerializer {
     return "";
   }
 };
-globalThis.performance = globalThis.performance || {
-  now: (function() {
+const _performanceSlots = new WeakMap();
+class Performance {
+  constructor() {
+    _performanceSlots.set(this, {
+      timeOrigin: 0,
+      timing: { navigationStart: 0, domContentLoadedEventEnd: 0, loadEventEnd: 0 },
+      navigation: { type: 0, redirectCount: 0 },
+      memory: {
+        jsHeapSizeLimit: 4294705152,
+        totalJSHeapSize: 19321856,
+        usedJSHeapSize: 16781520,
+      },
+      lastNow: -Infinity,
+    });
+  }
+  get timeOrigin() { return _performanceSlots.get(this).timeOrigin; }
+  set timeOrigin(value) { _performanceSlots.get(this).timeOrigin = Number(value) || 0; }
+  get timing() { return _performanceSlots.get(this).timing; }
+  set timing(value) { _performanceSlots.get(this).timing = value; }
+  get navigation() { return _performanceSlots.get(this).navigation; }
+  set navigation(value) { _performanceSlots.get(this).navigation = value; }
+  get memory() { return _performanceSlots.get(this).memory; }
+  set memory(value) { _performanceSlots.get(this).memory = value; }
+  get eventCounts() { return new Map(); }
+  get interactionCount() { return 0; }
+  get onresourcetimingbufferfull() { return null; }
+  set onresourcetimingbufferfull(_) {}
+  now() {
     // Monotonically non-decreasing: return the wall-clock offset, but never a
     // value below the last one. Equal readings are allowed, and avoiding a
     // synthetic per-call increment keeps tight loops from advancing the clock
     // faster than real elapsed time.
-    var _last = -Infinity;
-    return function() {
-      var ms = Date.now() - (globalThis.performance.timeOrigin || 0);
-      if (ms < _last) return _last;
-      _last = ms;
-      return _last;
-    };
-  })(),
-  mark(){}, measure(){},
-  clearMarks(){}, clearMeasures(){}, clearResourceTimings(){},
-  getEntries(){return [];}, getEntriesByName(){return [];}, getEntriesByType(){return [];},
-  setResourceTimingBufferSize(){},
-  timeOrigin: 0,
-  timing: { navigationStart: 0, domContentLoadedEventEnd: 0, loadEventEnd: 0 },
-  navigation: { type: 0, redirectCount: 0 },
-  memory: {
-    jsHeapSizeLimit: 4294705152,
-    totalJSHeapSize: 19321856,
-    usedJSHeapSize: 16781520,
-  },
-};
+    const slot = _performanceSlots.get(this);
+    const ms = Date.now() - slot.timeOrigin;
+    if (ms < slot.lastNow) return slot.lastNow;
+    slot.lastNow = ms;
+    return slot.lastNow;
+  }
+  mark() {}
+  measure() {}
+  clearMarks() {}
+  clearMeasures() {}
+  clearResourceTimings() {}
+  getEntries() { return []; }
+  getEntriesByName() { return []; }
+  getEntriesByType() { return []; }
+  setResourceTimingBufferSize() {}
+  toJSON() { return {}; }
+}
+_markNative(Performance);
+for (const _performanceMethod of [
+  'now', 'mark', 'measure', 'clearMarks', 'clearMeasures',
+  'clearResourceTimings', 'getEntries', 'getEntriesByName',
+  'getEntriesByType', 'setResourceTimingBufferSize', 'toJSON',
+]) _markNative(Performance.prototype[_performanceMethod]);
+for (const _performanceGetter of [
+  'timeOrigin', 'timing', 'navigation', 'memory',
+  'eventCounts', 'interactionCount', 'onresourcetimingbufferfull',
+]) {
+  const _descriptor = Object.getOwnPropertyDescriptor(Performance.prototype, _performanceGetter);
+  if (_descriptor?.get) _markNativeAs(_descriptor.get, `function get ${_performanceGetter}() { [native code] }`);
+  if (_descriptor?.set) _markNativeAs(_descriptor.set, `function set ${_performanceGetter}() { [native code] }`);
+}
+Object.defineProperty(Performance.prototype, Symbol.toStringTag, {
+  value: 'Performance', configurable: true,
+});
+globalThis.Performance = Performance;
+globalThis.performance = new Performance();
 
 var _commonFonts = [
   'Arial', 'Arial Black', 'Arial Narrow',
@@ -5853,6 +6054,8 @@ Object.defineProperty(Storage.prototype, 'length', {
   get: function() { return _storageSnapshot(_storageSlot(this)).length; },
   configurable: true,
 });
+Object.defineProperty(_matchMedia, 'name', { value: 'matchMedia', configurable: true });
+globalThis.matchMedia = _matchMedia;
 
 const _mkStore = (local) => {
   const target = Object.create(Storage.prototype);
@@ -5880,7 +6083,27 @@ const _mkStore = (local) => {
 globalThis.localStorage = _mkStore(true);
 globalThis.sessionStorage = _mkStore(false);
 
-globalThis.btoa = globalThis.btoa || ((s) => { const b = new TextEncoder().encode(s); const c="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"; let r=""; for(let i=0;i<b.length;i+=3){const a=b[i],bb=b[i+1]??0,cc=b[i+2]??0; r+=c[a>>2]+c[((a&3)<<4)|(bb>>4)]+(i+1<b.length?c[((bb&15)<<2)|(cc>>6)]:"=")+(i+2<b.length?c[cc&63]:"=");} return r; });
+// btoa consumes one Latin-1 byte per code unit. UTF-8 encoding here changes
+// the result for code units above 0x7f and breaks binary protocols such as the
+// fingerprint VM's payload encoder.
+globalThis.btoa = (s) => {
+  s = String(s);
+  const c = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  const bytes = new Uint8Array(s.length);
+  for (let i = 0; i < s.length; i++) {
+    const code = s.charCodeAt(i);
+    if (code > 0xFF) throw new DOMException("The string to be encoded contains characters outside of the Latin1 range.", "InvalidCharacterError");
+    bytes[i] = code;
+  }
+  let r = "";
+  for (let i = 0; i < bytes.length; i += 3) {
+    const a = bytes[i], b = bytes[i + 1] ?? 0, d = bytes[i + 2] ?? 0;
+    r += c[a >> 2] + c[((a & 3) << 4) | (b >> 4)]
+      + (i + 1 < bytes.length ? c[((b & 15) << 2) | (d >> 6)] : "=")
+      + (i + 2 < bytes.length ? c[d & 63] : "=");
+  }
+  return r;
+};
 globalThis.atob = globalThis.atob || ((s) => { const c="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"; let r=[]; for(let i=0;i<s.length;i+=4){const a=c.indexOf(s[i]),b=c.indexOf(s[i+1]),cc=c.indexOf(s[i+2]),d=c.indexOf(s[i+3]); r.push((a<<2)|(b>>4)); if(cc>=0)r.push(((b&15)<<4)|(cc>>2)); if(d>=0)r.push(((cc&3)<<6)|d);} return String.fromCharCode(...r); });
 
 // Functional History API. The earlier stub returned constant state and was a
@@ -6081,6 +6304,26 @@ globalThis.DocumentType = DocumentType;
 globalThis.Node = Node;
 globalThis.Element = Element;
 globalThis.Document = Document;
+Object.defineProperty(Document.prototype, Symbol.toStringTag, {
+  value: 'Document', configurable: true,
+});
+globalThis.HTMLDocument = class HTMLDocument extends Document {
+  constructor(nid) {
+    super(nid);
+    // Chrome exposes location as an own Document property. Keep the internal
+    // navigation behavior, but match the native descriptor shape.
+    Object.defineProperty(this, 'location', {
+      get() { return globalThis.location; },
+      set(url) { Deno.core.ops.op_navigate(_resolveUrl(String(url)), 'GET', ''); },
+      enumerable: true,
+      configurable: false,
+    });
+  }
+};
+_markNative(globalThis.HTMLDocument);
+Object.defineProperty(globalThis.HTMLDocument.prototype, Symbol.toStringTag, {
+  value: 'HTMLDocument', configurable: true,
+});
 globalThis.XPathResult = globalThis.XPathResult || class XPathResult {};
 Object.assign(globalThis.XPathResult, {
   ANY_TYPE: 0,
@@ -7342,31 +7585,31 @@ if (typeof PointerEvent === 'undefined') {
 }
 
 if (typeof navigator.credentials === 'undefined') {
-  navigator.credentials = { get(){return Promise.resolve(null);}, create(){return Promise.resolve(null);}, store(){return Promise.resolve();}, preventSilentAccess(){return Promise.resolve();} };
+  _defineNavigatorValue('credentials', { get(){return Promise.resolve(null);}, create(){return Promise.resolve(null);}, store(){return Promise.resolve();}, preventSilentAccess(){return Promise.resolve();} });
 }
 
-navigator.mediaCapabilities = {
+_defineNavigatorValue('mediaCapabilities', {
   decodingInfo(cfg) {
     return Promise.resolve({ supported: true, smooth: true, powerEfficient: true, keySystemAccess: null, configuration: cfg });
   },
   encodingInfo(cfg) {
     return Promise.resolve({ supported: true, smooth: true, powerEfficient: true, configuration: cfg });
   },
-};
-navigator.locks = {
+});
+_defineNavigatorValue('locks', {
   request(name, opts, cb) {
     if (typeof opts === 'function') { cb = opts; opts = {}; }
     if (typeof cb === 'function') return Promise.resolve(cb({ name, mode: (opts && opts.mode) || 'exclusive' }));
     return Promise.resolve(null);
   },
   query() { return Promise.resolve({ held: [], pending: [] }); },
-};
-navigator.keyboard = {
+});
+_defineNavigatorValue('keyboard', {
   getLayoutMap() { return Promise.resolve(new Map()); },
   lock() { return Promise.resolve(); },
   unlock() {},
-};
-navigator.wakeLock = { request() { return Promise.reject(new DOMException('Not allowed', 'NotAllowedError')); } };
+});
+_defineNavigatorValue('wakeLock', { request() { return Promise.reject(new DOMException('Not allowed', 'NotAllowedError')); } });
 
 globalThis.opener = null;
 
@@ -8016,12 +8259,13 @@ if (typeof Image === 'undefined') {
     }
     return img;
   };
+  Object.defineProperty(globalThis.Image, 'length', { value: 0, configurable: true });
   globalThis.Image.prototype = globalThis.HTMLImageElement.prototype;
 }
 
 if (typeof Audio === 'undefined') {
   globalThis.Audio = class Audio {
-    constructor(src) { this.src = src || ''; this.paused = true; this.volume = 1; this.currentTime = 0; this.duration = 0; }
+    constructor(src = '') { this.src = src; this.paused = true; this.volume = 1; this.currentTime = 0; this.duration = 0; }
     play() { return Promise.resolve(); } pause() { this.paused = true; } load() {}
     addEventListener() {} removeEventListener() {}
   };
@@ -8380,7 +8624,7 @@ globalThis.__obscura_init = function() {
   }
   delete globalThis.__obscura_fingerprint_profile;
 
-  globalThis.document = new Document(+_dom("document_node_id"));
+  globalThis.document = new (globalThis.HTMLDocument || Document)(+_dom("document_node_id"));
 
   const scr = _fingerprintProfile && _fingerprintProfile.screen || {
     width:1920,height:1080,availWidth:1920,availHeight:1040,availLeft:0,availTop:0,
@@ -8395,7 +8639,10 @@ globalThis.__obscura_init = function() {
   globalThis.screenX = scr.screenX; globalThis.screenY = scr.screenY;
   globalThis.screenLeft = scr.screenX; globalThis.screenTop = scr.screenY;
 
-  const t0 = Date.now() + Math.floor(_fpRand(641) * 100) - 50;
+  // The navigation origin must not be in the future. A future origin makes
+  // performance.now() negative, which is impossible in Chrome and is an
+  // immediate fingerprinting signal.
+  const t0 = Date.now() - Math.floor(_fpRand(641) * 100);
   globalThis.performance.timeOrigin = t0;
   globalThis.performance.timing = { navigationStart: t0, domContentLoadedEventEnd: t0, loadEventEnd: t0 };
   var _totalHeap = 15000000 + Math.floor(_fpRand(620) * 85000000);
@@ -8430,6 +8677,9 @@ globalThis.__obscura_init = function() {
 globalThis.__obscura_hide_list = Object.getOwnPropertyNames(globalThis).filter(k =>
   k.startsWith('_') || k.includes('obscura') || k.includes('Obscura')
 );
+// deno_core's bridge is required internally but is not a browser global.
+// Keep the property for the host runtime and hide it from global reflection.
+globalThis.__obscura_hide_list.push('Deno');
 
 /* ===== WPT conformance shims: batch 2 ===== */
 
@@ -8911,6 +9161,22 @@ if (typeof Response !== 'undefined' && Response.prototype && !Response.prototype
 // arrayBuffer is the body primitive that blob/text/json derive from; the
 // engine's Response provides it natively, so it is intentionally not shimmed
 // here (a JS fallback could only recurse into itself).
+
+// Window interface constructors are non-enumerable in Chrome. Most of the
+// platform shims above are assigned from JS and would otherwise leak through
+// Object.keys(window), exposing the implementation rather than the web API.
+(function _hideEnumerableInterfaceGlobals() {
+  const names = Object.getOwnPropertyNames(globalThis);
+  for (const name of names) {
+    if (!/^[A-Z]/.test(name)) continue;
+    try {
+      const descriptor = Object.getOwnPropertyDescriptor(globalThis, name);
+      if (descriptor && descriptor.enumerable) {
+        Object.defineProperty(globalThis, name, { ...descriptor, enumerable: false });
+      }
+    } catch (_) {}
+  }
+})();
 
 // tamperedFunctions: obscura reimplements much of the DOM/Web platform in JS.
 // Real Chrome reports "[native code]" from toString() for every builtin method,

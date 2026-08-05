@@ -125,10 +125,25 @@ impl ObscuraJsRuntime {
     /// through `proxy_url` (#139). `None` is equivalent to `with_base_url`
     /// (direct connection).
     pub fn with_base_url_and_proxy(base_url: &str, proxy_url: Option<String>) -> Self {
+        Self::with_module_loader(Rc::new(ObscuraModuleLoader::with_proxy(base_url, proxy_url)))
+    }
+
+    /// Construct a runtime whose ES-module loader uses the page's stealth
+    /// client for dynamic imports as well as the initial module fetch.
+    #[cfg(feature = "stealth")]
+    pub fn with_base_url_and_proxy_and_stealth(
+        base_url: &str,
+        proxy_url: Option<String>,
+        stealth_client: Option<std::sync::Arc<obscura_net::StealthHttpClient>>,
+    ) -> Self {
+        Self::with_module_loader(Rc::new(
+            ObscuraModuleLoader::with_proxy_and_stealth(base_url, proxy_url, stealth_client),
+        ))
+    }
+
+    fn with_module_loader(module_loader: Rc<ObscuraModuleLoader>) -> Self {
         let state = Rc::new(RefCell::new(ObscuraState::new()));
         let state_clone = state.clone();
-
-        let module_loader = Rc::new(ObscuraModuleLoader::with_proxy(base_url, proxy_url));
 
         // Build the isolate under the process-wide creation lock so two
         // connection threads never construct isolates concurrently (#430).
@@ -673,6 +688,34 @@ impl ObscuraJsRuntime {
             let st = self.state.borrow();
             (st.http_client.clone(), st.callbacks.clone())
         };
+        #[cfg(feature = "stealth")]
+        let source_code = {
+            let stealth_client = self.state.borrow().stealth_client.clone();
+            if let Some(stealth) = stealth_client {
+                match stealth.fetch(&specifier).await {
+                    Ok(resp) => obscura_net::decode_non_html(&resp.body, resp.content_type()),
+                    Err(e) => {
+                        tracing::warn!("Module fetch failed ({}): {}", url, e);
+                        String::new()
+                    }
+                }
+            } else {
+                match client {
+                    Some(c) => match c.fetch_with_callbacks(&specifier, callbacks.as_deref()).await {
+                        Ok(resp) => obscura_net::decode_non_html(&resp.body, resp.content_type()),
+                        Err(e) => {
+                            tracing::warn!("Module fetch failed ({}): {}", url, e);
+                            String::new()
+                        }
+                    },
+                    None => {
+                        tracing::warn!("No http_client wired to runtime; module {} will be empty", url);
+                        String::new()
+                    }
+                }
+            }
+        };
+        #[cfg(not(feature = "stealth"))]
         let source_code = match client {
             Some(c) => match c.fetch_with_callbacks(&specifier, callbacks.as_deref()).await {
                 Ok(resp) => obscura_net::decode_non_html(&resp.body, resp.content_type()),
@@ -1800,6 +1843,13 @@ mod tests {
             )
             .unwrap();
         assert_eq!(violations.as_f64(), Some(0.0), "performance.now() went backwards");
+    }
+
+    #[test]
+    fn performance_now_is_not_negative_after_page_init() {
+        let mut rt = setup_runtime("<div></div>");
+        let result = rt.evaluate("performance.now() >= 0").unwrap();
+        assert_eq!(result, serde_json::json!(true));
     }
 
     #[test]
@@ -2989,6 +3039,26 @@ mod tests {
             )
             .unwrap(),
             serde_json::json!(false)
+        );
+    }
+
+    #[test]
+    fn script_src_property_is_reflected_for_dynamic_loading() {
+        let mut rt = setup_runtime("<html><head></head><body></body></html>");
+        rt.execute_script(
+            "dynamic-script-src",
+            r#"
+                const script = document.createElement('script');
+                script.src = 'data:text/javascript,globalThis.__dynamicScriptRan = true';
+                globalThis.__dynamicScriptAttribute = script.getAttribute('src');
+                document.head.appendChild(script);
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            rt.evaluate("globalThis.__dynamicScriptAttribute").unwrap(),
+            serde_json::json!("data:text/javascript,globalThis.__dynamicScriptRan = true")
         );
     }
 
@@ -4388,6 +4458,33 @@ mod tests {
             return called;
         "#).unwrap();
         assert_eq!(result, serde_json::json!(false));
+    }
+
+    #[test]
+    fn console_log_error_does_not_read_custom_stack_getter() {
+        let mut rt = setup_runtime("<div></div>");
+        let result = rt.evaluate(r#"
+            let called = false;
+            const e = new Error("test");
+            Object.defineProperty(e, "stack", { get() { called = true; return "probe"; } });
+            console.log(e);
+            return called;
+        "#).unwrap();
+        assert_eq!(result, serde_json::json!(false));
+    }
+
+    #[test]
+    fn btoa_uses_latin1_code_units_for_binary_data() {
+        let mut rt = setup_runtime("<div></div>");
+        let result = rt
+            .evaluate(
+                r#"
+                const encoded = btoa("\u00e3\u0091\u00ee");
+                return [encoded, Array.from(atob(encoded), value => value.charCodeAt(0))];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!(["45Hu", [0xe3, 0x91, 0xee]]));
     }
 
     #[test]

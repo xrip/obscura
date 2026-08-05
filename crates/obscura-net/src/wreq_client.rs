@@ -20,6 +20,8 @@ use crate::client::{Response, ObscuraNetError};
 #[cfg(feature = "stealth")]
 pub const STEALTH_USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
+#[cfg(feature = "stealth")]
+const STEALTH_SEC_CH_UA: &str = r#""Not:A-Brand";v="99", "Google Chrome";v="145", "Chromium";v="145""#;
 
 // The wreq emulation (Profile::Chrome145, Platform::Windows) sends this exact
 // UA and sec-ch-ua-platform "Windows" on the wire. navigator has to report the
@@ -117,6 +119,14 @@ impl StealthHttpClient {
     }
 
     pub async fn fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {
+        self.fetch_with_referrer(url, None).await
+    }
+
+    pub async fn fetch_with_referrer(
+        &self,
+        url: &Url,
+        referrer: Option<&Url>,
+    ) -> Result<Response, ObscuraNetError> {
         let mut current_url = url.clone();
 
         if let Some(host) = current_url.host_str() {
@@ -139,6 +149,9 @@ impl StealthHttpClient {
                 .client
                 .get(current_url.as_str())
                 .header("user-agent", self.user_agent.as_str());
+            if let Some(referrer) = referrer {
+                req = req.header("referer", referrer.as_str());
+            }
 
             let cookie_header = self.cookie_jar.get_cookie_header(&current_url);
             if !cookie_header.is_empty() {
@@ -233,6 +246,13 @@ impl StealthHttpClient {
         let mut req = self
             .client
             .request(req_method, url.as_str())
+            // The emulation profile's defaults describe a top-level document
+            // navigation. JS fetch()/XHR has a different Fetch metadata
+            // contract, so build that small common browser header set here.
+            .default_headers(false)
+            .header("sec-ch-ua", STEALTH_SEC_CH_UA)
+            .header("sec-ch-ua-mobile", "?0")
+            .header("sec-ch-ua-platform", "\"Windows\"")
             .header("user-agent", self.user_agent.as_str());
 
         let cookie_header = self.cookie_jar.get_cookie_header(url);

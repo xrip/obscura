@@ -273,14 +273,47 @@ impl Page {
     }
 
     async fn do_fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {
+        let referrer = self.referrer_for_request(url);
+        self.do_fetch_with_referrer(url, referrer.as_ref()).await
+    }
+
+    fn referrer_for_request(&self, url: &Url) -> Option<Url> {
+        let document_url = self.url.as_ref()?;
+        if !matches!(document_url.scheme(), "http" | "https") {
+            return None;
+        }
+        if document_url.origin().ascii_serialization() == url.origin().ascii_serialization() {
+            let mut referrer = document_url.clone();
+            referrer.set_fragment(None);
+            Some(referrer)
+        } else {
+            Url::parse(&document_url.origin().ascii_serialization()).ok()
+        }
+    }
+
+    async fn do_fetch_with_referrer(
+        &self,
+        url: &Url,
+        referrer: Option<&Url>,
+    ) -> Result<Response, ObscuraNetError> {
         #[cfg(feature = "stealth")]
         if let Some(ref stealth) = self.stealth_client {
-            return stealth.fetch(url).await;
+            return stealth.fetch_with_referrer(url, referrer).await;
         }
         self.http_client
             .fetch_with_callbacks(url, Some(&self.callbacks))
             .await
     }
+
+    fn active_network_requests(&self) -> u32 {
+        let mut active = self.http_client.active_requests();
+        #[cfg(feature = "stealth")]
+        if let Some(ref stealth) = self.stealth_client {
+            active = active.saturating_add(stealth.active_requests());
+        }
+        active
+    }
+
     fn init_js(&mut self) {
         // Drop any existing runtime so the JS realm starts clean on
         // every navigation. The old code reused the V8 isolate and
@@ -297,6 +330,13 @@ impl Page {
         // and op_fetch_url so dynamic imports and JS fetch() honour the
         // configured upstream proxy (#139). When proxy_url is None this is
         // equivalent to with_base_url() (direct connection).
+        #[cfg(feature = "stealth")]
+        let mut rt = ObscuraJsRuntime::with_base_url_and_proxy_and_stealth(
+            &self.url_string(),
+            self.context.proxy_url.clone(),
+            self.stealth_client.clone(),
+        );
+        #[cfg(not(feature = "stealth"))]
         let mut rt = ObscuraJsRuntime::with_base_url_and_proxy(
             &self.url_string(),
             self.context.proxy_url.clone(),
@@ -525,11 +565,9 @@ impl Page {
             }
         }
 
-        let client = self.http_client.clone();
-        let page_callbacks = self.callbacks.clone();
+        let page = &*self;
         let fetch_futures: Vec<_> = fetch_tasks.iter().map(|(idx, url)| {
-            let client = client.clone();
-            let cbs = page_callbacks.clone();
+            let page = page;
             let url = url.clone();
             let idx = *idx;
             async move {
@@ -558,7 +596,7 @@ impl Page {
                     };
                     return Some((idx, url, resp));
                 }
-                match client.fetch_with_callbacks(&parsed, Some(&cbs)).await {
+                match page.do_fetch(&parsed).await {
                     Ok(resp) => Some((idx, url, resp)),
                     Err(e) => {
                         tracing::warn!("Failed to fetch script {}: {}", url, e);
@@ -732,7 +770,7 @@ impl Page {
             let dynamic_settle_ms = std::env::var("OBSCURA_DYNAMIC_SCRIPT_SETTLE_MS")
                 .ok()
                 .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(3_000)
+                .unwrap_or(10_000)
                 .max(500);
             // Bound the post-script settle loop by wall clock, not just by the
             // 10ms-tick branch. The old code only consulted `deadline` inside
@@ -754,11 +792,11 @@ impl Page {
             let deadline = started + tokio::time::Duration::from_millis(500);
             let dynamic_deadline = started + tokio::time::Duration::from_millis(dynamic_settle_ms);
             let mut idle_count = 0u32;
+            let mut saw_async_work = false;
+            let mut idle_since: Option<tokio::time::Instant> = None;
             loop {
                 let now = tokio::time::Instant::now();
-                if now >= deadline
-                    && (now >= dynamic_deadline || !js.has_pending_dynamic_scripts())
-                {
+                if now >= dynamic_deadline {
                     break;
                 }
                 let result = tokio::time::timeout(
@@ -768,13 +806,36 @@ impl Page {
 
                 match result {
                     Ok(Ok(())) => {
-                        if self.http_client.active_requests() == 0 {
-                            idle_count += 1;
-                            if idle_count >= 2 {
-                                break;
+                        let mut active_requests = self.http_client.active_requests();
+                        #[cfg(feature = "stealth")]
+                        if let Some(ref stealth) = self.stealth_client {
+                            active_requests = active_requests.saturating_add(stealth.active_requests());
+                        }
+                        let pending_dynamic = js.has_pending_dynamic_scripts();
+                        if active_requests == 0 && !pending_dynamic {
+                            if saw_async_work {
+                                let idle_start = idle_since.get_or_insert(now);
+                                // Keep pumping briefly after the last network or
+                                // dynamic-script operation. Promise continuations
+                                // often schedule the next browser step from a
+                                // timer immediately after a script load. A two
+                                // poll early exit strands those steps, including
+                                // challenge token flows.
+                                if now.duration_since(*idle_start)
+                                    >= tokio::time::Duration::from_millis(1_000)
+                                {
+                                    break;
+                                }
+                            } else {
+                                idle_count += 1;
+                                if idle_count >= 2 && now >= deadline {
+                                    break;
+                                }
                             }
                             tokio::task::yield_now().await;
                         } else {
+                            saw_async_work = true;
+                            idle_since = None;
                             idle_count = 0;
                             tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
                         }
@@ -945,6 +1006,7 @@ impl Page {
         body: &str,
     ) -> Result<(), PageError> {
         let url = Url::parse(url_str).map_err(|e| PageError::InvalidUrl(e.to_string()))?;
+        let navigation_referrer = self.referrer_for_request(&url);
 
         self.lifecycle = LifecycleState::Loading;
         self.url = Some(url.clone());
@@ -1016,7 +1078,7 @@ impl Page {
                 .post_form_with_callbacks(&url, body, Some(&self.callbacks))
                 .await
         } else {
-            self.do_fetch(&url).await
+            self.do_fetch_with_referrer(&url, navigation_referrer.as_ref()).await
         }.map_err(|e| {
             self.lifecycle = LifecycleState::Failed;
             PageError::NetworkError(e.to_string())
@@ -1099,15 +1161,13 @@ impl Page {
             css_fetch_urls.push(full_url);
         }
 
-        let client = self.http_client.clone();
-        let page_callbacks = self.callbacks.clone();
+        let page = &*self;
         let css_futures: Vec<_> = css_fetch_urls.iter().map(|full_url| {
-            let client = client.clone();
-            let cbs = page_callbacks.clone();
+            let page = page;
             let url_str = full_url.clone();
             async move {
                 let parsed = Url::parse(&url_str).unwrap_or_else(|_| Url::parse("about:blank").unwrap());
-                match client.fetch_with_callbacks(&parsed, Some(&cbs)).await {
+                match page.do_fetch(&parsed).await {
                     Ok(resp) => Some((url_str, resp)),
                     Err(e) => {
                         tracing::debug!("Failed to fetch stylesheet {}: {}", url_str, e);
@@ -1204,7 +1264,7 @@ impl Page {
             let mut idle_since: Option<tokio::time::Instant> = None;
 
             loop {
-                let active = self.http_client.active_requests();
+                let active = self.active_network_requests();
                 let now = tokio::time::Instant::now();
 
                 if active <= threshold {

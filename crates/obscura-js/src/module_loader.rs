@@ -1,4 +1,6 @@
 use std::pin::Pin;
+#[cfg(feature = "stealth")]
+use std::sync::Arc;
 
 use deno_core::error::ModuleLoaderError;
 use deno_core::ModuleLoadResponse;
@@ -7,6 +9,8 @@ use deno_core::ModuleSource;
 use deno_core::ModuleSourceCode;
 use deno_core::ModuleSpecifier;
 use deno_core::RequestedModuleType;
+#[cfg(feature = "stealth")]
+use obscura_net::StealthHttpClient;
 
 pub struct ObscuraModuleLoader {
     pub base_url: String,
@@ -14,6 +18,8 @@ pub struct ObscuraModuleLoader {
     /// `None` keeps the pre-#139 direct-connection behaviour for callers
     /// that haven't been updated.
     pub proxy_url: Option<String>,
+    #[cfg(feature = "stealth")]
+    pub stealth_client: Option<Arc<StealthHttpClient>>,
 }
 
 impl ObscuraModuleLoader {
@@ -25,6 +31,21 @@ impl ObscuraModuleLoader {
         ObscuraModuleLoader {
             base_url: base_url.to_string(),
             proxy_url,
+            #[cfg(feature = "stealth")]
+            stealth_client: None,
+        }
+    }
+
+    #[cfg(feature = "stealth")]
+    pub fn with_proxy_and_stealth(
+        base_url: &str,
+        proxy_url: Option<String>,
+        stealth_client: Option<Arc<StealthHttpClient>>,
+    ) -> Self {
+        ObscuraModuleLoader {
+            base_url: base_url.to_string(),
+            proxy_url,
+            stealth_client,
         }
     }
 }
@@ -64,8 +85,33 @@ impl ModuleLoader for ObscuraModuleLoader {
         // Capture the loader's proxy here so the async closure below owns a
         // plain Option<String> rather than borrowing &self across an `await`.
         let proxy_url = self.proxy_url.clone();
+        #[cfg(feature = "stealth")]
+        let stealth_client = self.stealth_client.clone();
 
         ModuleLoadResponse::Async(Pin::from(Box::new(async move {
+            #[cfg(feature = "stealth")]
+            if let Some(stealth) = stealth_client {
+                let specifier = ModuleSpecifier::parse(&url)
+                    .map_err(|e| io_err(format!("Invalid module URL {}: {}", url, e)))?;
+                let resp = stealth
+                    .fetch(&specifier)
+                    .await
+                    .map_err(|e| io_err(format!("Failed to fetch module {}: {}", url, e)))?;
+                if !(200..300).contains(&resp.status) {
+                    return Err(io_err(format!(
+                        "Module {} returned HTTP {}",
+                        url, resp.status
+                    )));
+                }
+                let code = obscura_net::decode_non_html(&resp.body, resp.content_type());
+                return Ok(ModuleSource::new(
+                    deno_core::ModuleType::JavaScript,
+                    ModuleSourceCode::String(code.into()),
+                    &specifier,
+                    None,
+                ));
+            }
+
             // Reuse the process-wide cached client (same one op_fetch_url
             // uses). Modern SPAs dynamic-import 20-50 chunks per page; the
             // old code built a fresh reqwest::Client per import, each with
