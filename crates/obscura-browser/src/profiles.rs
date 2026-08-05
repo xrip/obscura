@@ -17,6 +17,8 @@ const COMPOSED_PREFIX: &str = "c145w1";
 pub enum ProfileError {
     #[error("fingerprint catalog error: {0}")]
     Catalog(String),
+    #[error("invalid fingerprint profile ID: {0}")]
+    Selector(String),
     #[error("fingerprint profile serialization error: {0}")]
     Serialization(String),
 }
@@ -59,7 +61,7 @@ pub struct BrandVersion {
     pub version: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct BaseCatalogProfile {
     id: String,
@@ -226,6 +228,33 @@ impl FingerprintCatalog {
 
     pub fn graphics_profile_count(&self) -> usize {
         self.graphics_profiles.len()
+    }
+
+    pub fn index_json(&self) -> Result<String, ProfileError> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct CatalogIndex<'a> {
+            schema_version: u32,
+            catalog_id: &'a str,
+            default_profile_id: String,
+            base_profiles: &'a [BaseCatalogProfile],
+            graphics_profiles: &'a [GraphicsProfile],
+            screen_profiles: &'a [ScreenWindowProfile],
+        }
+
+        let ids = &self.default_composition;
+        serde_json::to_string_pretty(&CatalogIndex {
+            schema_version: self.schema_version,
+            catalog_id: &self.catalog_id,
+            default_profile_id: format!(
+                "{COMPOSED_PREFIX}:{}:{}:{}",
+                ids.base_id, ids.graphics_id, ids.screen_id
+            ),
+            base_profiles: &self.base_profiles,
+            graphics_profiles: &self.graphics_profiles,
+            screen_profiles: &self.screen_profiles,
+        })
+        .map_err(|error| ProfileError::Serialization(error.to_string()))
     }
 }
 
@@ -413,6 +442,13 @@ pub fn resolve_profile() -> Result<Arc<ResolvedFingerprintProfile>, ProfileError
         );
     }
     Ok(Arc::new(resolved))
+}
+
+pub fn resolve_profile_id(id: &str) -> Result<Arc<ResolvedFingerprintProfile>, ProfileError> {
+    let catalog = catalog()?;
+    let (base_id, graphics_id, screen_id) = parse_composed_selector(catalog, id)
+        .ok_or_else(|| ProfileError::Selector(id.to_string()))?;
+    Ok(Arc::new(compose(catalog, base_id, graphics_id, screen_id)?))
 }
 
 fn resolve_with_options(
@@ -697,6 +733,31 @@ mod tests {
         assert_eq!(seeded.id, seeded_again.id);
         let pinned = resolve_with_options(catalog, Some(&seeded.id), false, None).unwrap().0;
         assert_eq!(seeded.id, pinned.id);
+    }
+
+    #[test]
+    fn catalog_index_lists_selectable_rows() {
+        let index: Value = serde_json::from_str(&catalog().unwrap().index_json().unwrap()).unwrap();
+        assert_eq!(index["catalogId"], CATALOG_ID);
+        assert_eq!(index["baseProfiles"].as_array().unwrap().len(), 77);
+        assert_eq!(index["graphicsProfiles"].as_array().unwrap().len(), 298);
+        assert_eq!(index["screenProfiles"].as_array().unwrap().len(), 225);
+        assert!(index["defaultProfileId"].as_str().unwrap().starts_with("c145w1:"));
+        assert!(index.get("components").is_none());
+    }
+
+    #[test]
+    fn exact_profile_lookup_rejects_unknown_ids() {
+        let default_id: String = serde_json::from_str::<Value>(&catalog().unwrap().index_json().unwrap())
+            .unwrap()["defaultProfileId"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert_eq!(resolve_profile_id(&default_id).unwrap().id, default_id);
+        assert!(matches!(
+            resolve_profile_id("c145w1:bad:bad:bad"),
+            Err(ProfileError::Selector(_))
+        ));
     }
 
     #[test]

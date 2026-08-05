@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'none'; object-src 'none'; base-uri 'none'">
+  <title>Obscura Chrome 145 profile workbench</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      font: 16px/1.45 system-ui, sans-serif;
+    }
+    body {
+      max-width: 980px;
+      margin: 0 auto;
+      padding: 32px 20px 64px;
+    }
+    h1, h2 { line-height: 1.15; }
+    .notice, .panel {
+      border: 1px solid #8886;
+      border-radius: 8px;
+      padding: 14px 16px;
+      margin: 16px 0;
+    }
+    .notice { background: #d89b001c; }
+    button {
+      font: inherit;
+      padding: 9px 14px;
+      margin: 4px 8px 4px 0;
+      cursor: pointer;
+    }
+    button:disabled { cursor: not-allowed; opacity: .5; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 7px 8px; border-bottom: 1px solid #8884; text-align: left; vertical-align: top; }
+    th:first-child { width: 28%; }
+    .ok { color: #2a9d4b; }
+    .bad { color: #d44; }
+    .muted { opacity: .75; }
+    code, pre, textarea { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+    textarea {
+      width: 100%;
+      min-height: 220px;
+      box-sizing: border-box;
+      resize: vertical;
+    }
+    select, input {
+      width: 100%;
+      box-sizing: border-box;
+      font: inherit;
+      padding: 7px 8px;
+    }
+    label { display: block; margin: 12px 0; }
+    #error { white-space: pre-wrap; }
+  </style>
+</head>
+<body>
+  <h1>Obscura Chrome 145 profile workbench</h1>
+
+  <div class="notice">
+    This page is part of <code>obscura serve</code>. It reads the embedded
+    catalog from the same local server and makes no external network request.
+    A saved file or download has a detailed browser and graphics fingerprint.
+    Keep the raw files private and do not add them to Git.
+  </div>
+
+  <div class="panel">
+    <h2>Build a profile from the current catalog</h2>
+    <p id="catalog-state" class="muted">Loading the catalog...</p>
+    <label>Base: Chrome, Windows, CPU, memory
+      <select id="base-select" disabled></select>
+    </label>
+    <label>Graphics: GPU, WebGL, WebGPU
+      <select id="graphics-select" disabled></select>
+    </label>
+    <label>Screen and window
+      <select id="screen-select" disabled></select>
+    </label>
+    <label>Composed profile ID
+      <input id="composed-id" type="text" readonly value="Catalog is not loaded.">
+    </label>
+    <button id="copy-id" type="button" disabled>Copy profile ID</button>
+    <button id="select-default" type="button" disabled>Select catalog default</button>
+    <button id="select-capture" type="button" disabled>Select this browser capture</button>
+    <pre id="selected-summary" class="muted"></pre>
+  </div>
+
+  <div class="panel">
+    <strong>Before capture</strong>
+    <ol>
+      <li>Use 64-bit Google Chrome 145 on Windows.</li>
+      <li>Use normal hardware acceleration and the ANGLE D3D11 backend.</li>
+      <li>Set browser zoom to 100% and put the window on the display to record.</li>
+      <li>Close DevTools if its dock changes the inner window size.</li>
+      <li>Open this page through the loopback <code>obscura serve</code> address. Do not use a remote host.</li>
+    </ol>
+  </div>
+
+  <p>
+    <button id="capture" type="button">Capture and check</button>
+    <span id="state" class="muted">No capture yet.</span>
+  </p>
+
+  <h2>Checks</h2>
+  <table>
+    <thead><tr><th>Check</th><th>Result</th></tr></thead>
+    <tbody id="checks"><tr><td colspan="2" class="muted">Press Capture and check.</td></tr></tbody>
+  </table>
+
+  <div id="downloads" class="panel" hidden>
+    <h2>Save or download</h2>
+    <p>Save adds this observation to the source directory set on <code>obscura serve</code>.</p>
+    <button id="save-capture" type="button" disabled>Save capture to source files</button>
+    <p class="muted">The three downloads are a manual backup or import path.</p>
+    <button id="download-profile" type="button" disabled>1. Base/full profile</button>
+    <button id="download-adapters" type="button" disabled>2. Adapter observation</button>
+    <button id="download-windows" type="button" disabled>3. Screen observation</button>
+  </div>
+
+  <h2>Capture summary</h2>
+  <textarea id="summary" readonly spellcheck="false">No capture yet.</textarea>
+  <p id="error" class="bad" role="alert"></p>
+
+  <script src="/obscura/profiles/profile-id.js"></script>
+  <script src="/obscura/profiles/collector.js"></script>
+</body>
+</html>

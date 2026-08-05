@@ -58,6 +58,12 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Command {
+    /// List and inspect the embedded browser fingerprint profiles.
+    Profiles {
+        #[command(subcommand)]
+        command: ProfilesCommand,
+    },
+
     Serve {
         #[arg(short, long, default_value_t = 9222)]
         port: u16,
@@ -94,6 +100,12 @@ enum Command {
 
         #[arg(long)]
         storage_dir: Option<std::path::PathBuf>,
+
+        /// Serve the local Chrome profile workbench and save checked captures
+        /// under this source directory. The save route accepts loopback clients
+        /// only. This option needs --workers 1.
+        #[arg(long, value_name = "DIR")]
+        profile_workbench_dir: Option<std::path::PathBuf>,
 
         /// Suppress all logs (same as on `fetch`). Useful when scraping pages
         /// that flood the console with per-page script warnings (issue #264).
@@ -192,6 +204,18 @@ enum Command {
 
 }
 
+#[derive(Subcommand)]
+enum ProfilesCommand {
+    /// Print the selectable base, graphics, and screen rows as JSON.
+    List,
+    /// Print one exact composed profile as JSON.
+    Show {
+        id: String,
+    },
+    /// Print the profile selected by the current environment as JSON.
+    Current,
+}
+
 
 #[derive(Clone, Debug, clap::ValueEnum, PartialEq, Eq)]
 enum DumpFormat {
@@ -250,6 +274,37 @@ fn is_quiet_command(cmd: &Option<Command>) -> bool {
 
 fn merge_proxy(global_proxy: Option<String>, command_proxy: Option<String>) -> Option<String> {
     command_proxy.or(global_proxy)
+}
+
+fn validate_serve_workers(
+    workers: u16,
+    profile_workbench_dir: &Option<std::path::PathBuf>,
+) -> anyhow::Result<()> {
+    if workers > 1 && profile_workbench_dir.is_some() {
+        anyhow::bail!("--profile-workbench-dir needs --workers 1");
+    }
+    Ok(())
+}
+
+fn resolved_profile_json(
+    profile: &obscura_browser::profiles::ResolvedFingerprintProfile,
+) -> anyhow::Result<String> {
+    let value: serde_json::Value = serde_json::from_str(profile.runtime_json())?;
+    Ok(serde_json::to_string_pretty(&value)?)
+}
+
+fn profiles_output(command: ProfilesCommand) -> anyhow::Result<String> {
+    match command {
+        ProfilesCommand::List => Ok(obscura_browser::profiles::catalog()?.index_json()?),
+        ProfilesCommand::Show { id } => {
+            let profile = obscura_browser::profiles::resolve_profile_id(&id)?;
+            resolved_profile_json(&profile)
+        }
+        ProfilesCommand::Current => {
+            let profile = obscura_browser::profiles::resolve_profile()?;
+            resolved_profile_json(&profile)
+        }
+    }
 }
 
 /// Normalize a raw `--v8-flags` value into the string we'll hand to V8.
@@ -335,13 +390,24 @@ async fn main() -> anyhow::Result<()> {
     let stealth = args.stealth;
 
     match args.command {
-        Some(Command::Serve { port, host, proxy, user_agent, workers, max_connections, allow_file_access, storage_dir, quiet: _ }) => {
+        Some(Command::Profiles { command }) => {
+            println!("{}", profiles_output(command)?);
+        }
+        Some(Command::Serve { port, host, proxy, user_agent, workers, max_connections, allow_file_access, storage_dir, profile_workbench_dir, quiet: _ }) => {
+            validate_serve_workers(workers, &profile_workbench_dir)?;
             // Fall back to OBSCURA_PROXY so a proxy can be supplied without
             // putting credentials on the command line. The multi-worker load
             // balancer passes the proxy to each worker this way (issue #366).
             let proxy = merge_proxy(global_proxy.clone(), proxy)
                 .or_else(|| std::env::var("OBSCURA_PROXY").ok().filter(|s| !s.is_empty()));
             print_banner(port);
+            if let Some(ref dir) = profile_workbench_dir {
+                println!(
+                    "  Profile workbench: http://127.0.0.1:{}/obscura/profiles/\n  Profile source dir: {}\n",
+                    port,
+                    dir.display()
+                );
+            }
             if let Some(ref dir) = storage_dir {
                 tracing::info!("Storage dir: {}", dir.display());
             }
@@ -364,9 +430,9 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!("{} worker processes", workers);
                 run_multi_worker_serve(port, host, workers, proxy, stealth, user_agent).await?;
             } else {
-                obscura_cdp::start_with_serve_options_and_limit(
+                obscura_cdp::start_with_profile_workbench_options_and_limit(
                     port, &host, proxy, stealth, user_agent, allow_file_access, storage_dir,
-                    args.allow_private_network, max_connections,
+                    args.allow_private_network, max_connections, profile_workbench_dir,
                 ).await?;
             }
         }
@@ -1427,11 +1493,56 @@ mod tests {
     use super::{
         effective_v8_flags, extract_assets, extract_readable_text, fetch_original_bytes,
         is_quiet_command, link_kind_from_rel, merge_proxy, normalize_v8_flags,
-        read_urls_from_file, resolve_asset_url, select_log_filter, write_or_print,
-        write_or_print_bytes, Args, Command, DumpFormat, DEFAULT_V8_FLAGS,
+        profiles_output, read_urls_from_file, resolve_asset_url, select_log_filter,
+        validate_serve_workers, write_or_print, write_or_print_bytes, Args, Command, DumpFormat,
+        ProfilesCommand, DEFAULT_V8_FLAGS,
     };
     use clap::Parser;
     use obscura_dom::parse_html;
+
+    #[test]
+    fn parsed_profiles_commands_are_accepted_by_clap() {
+        let list = Args::try_parse_from(["obscura", "profiles", "list"])
+            .expect("clap should accept profiles list");
+        assert!(matches!(
+            list.command,
+            Some(Command::Profiles { command: ProfilesCommand::List })
+        ));
+
+        let show = Args::try_parse_from(["obscura", "profiles", "show", "c145w1:a:b:c"])
+            .expect("clap should accept profiles show");
+        assert!(matches!(
+            show.command,
+            Some(Command::Profiles {
+                command: ProfilesCommand::Show { .. }
+            })
+        ));
+
+        let current = Args::try_parse_from(["obscura", "profiles", "current"])
+            .expect("clap should accept profiles current");
+        assert!(matches!(
+            current.command,
+            Some(Command::Profiles { command: ProfilesCommand::Current })
+        ));
+    }
+
+    #[test]
+    fn profiles_list_and_show_return_json() {
+        let list: serde_json::Value = serde_json::from_str(
+            &profiles_output(ProfilesCommand::List).expect("profiles list output"),
+        )
+        .unwrap();
+        let id = list["defaultProfileId"].as_str().unwrap();
+        let shown: serde_json::Value = serde_json::from_str(
+            &profiles_output(ProfilesCommand::Show { id: id.to_string() })
+                .expect("profiles show output"),
+        )
+        .unwrap();
+        assert_eq!(shown["id"], id);
+        assert!(shown["graphics"]["unmaskedRenderer"].is_string());
+        assert!(shown["graphics"]["webgl2"].is_object());
+        assert!(shown["graphics"]["webgpu"].is_object());
+    }
 
     // Issue #117 — `--dump original` short-circuits the browser stack and
     // streams the raw response body verbatim, including for binary payloads.
@@ -1635,6 +1746,23 @@ mod tests {
         let args = Args::try_parse_from(["obscura", "serve"])
             .expect("clap should accept serve");
         assert!(!is_quiet_command(&args.command));
+    }
+
+    #[test]
+    fn profile_workbench_is_parsed_and_needs_one_worker() {
+        let args = Args::try_parse_from([
+            "obscura",
+            "serve",
+            "--profile-workbench-dir",
+            "webgl",
+        ])
+        .expect("clap should accept the profile workbench directory");
+        let Some(Command::Serve { workers, profile_workbench_dir, .. }) = args.command else {
+            panic!("serve command expected");
+        };
+        assert_eq!(profile_workbench_dir, Some(std::path::PathBuf::from("webgl")));
+        assert!(validate_serve_workers(workers, &profile_workbench_dir).is_ok());
+        assert!(validate_serve_workers(2, &profile_workbench_dir).is_err());
     }
 
     #[test]

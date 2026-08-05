@@ -3,3 +3,7 @@ target/
 /webgl/adapters.json
 /webgl/window.json
 /webgl/profiles/
+/webgl/adapters.json.obscura-new
+/webgl/adapters.json.obscura-backup
+/webgl/window.json.obscura-new
+/webgl/window.json.obscura-backup

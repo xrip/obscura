@@ -227,8 +227,57 @@ The tracked runtime catalog is:
 crates/obscura-browser/data/chrome-145-windows-v1.json
 ```
 
-The CLI does not print the selected profile ID. Exact pins can be read from
-the catalog. Rust code can get the ID from `BrowserContext::profile_id()`.
+The CLI can list the selectable rows, show an exact composed profile, and
+resolve the selector that a new context would use.
+
+List the base, graphics, and screen rows as JSON:
+
+```powershell
+.\target\release\obscura.exe profiles list
+```
+
+The list has `defaultProfileId`, `baseProfiles`, `graphicsProfiles`, and
+`screenProfiles`. It does not copy the large WebGL and WebGPU component data
+into every row.
+
+Show an exact profile, including its resolved WebGL and WebGPU components:
+
+```powershell
+.\target\release\obscura.exe profiles show 'c145w1:d2e85f68f4092704b75e2a9fe7145fd7:f9b781363030180eb52d391c03167488:012a7166bca451ee154cd22665977ee4'
+```
+
+Show the selection made from the current environment:
+
+```powershell
+.\target\release\obscura.exe profiles current
+```
+
+For a short Windows, GPU, and screen view in PowerShell:
+
+```powershell
+$profile = .\target\release\obscura.exe profiles current | ConvertFrom-Json
+[pscustomobject]@{
+  Id = $profile.id
+  Chrome = $profile.browser.version
+  Platform = $profile.navigator.uaPlatform
+  PlatformVersion = $profile.navigator.uaPlatformVersion
+  Architecture = $profile.navigator.architecture
+  Bitness = $profile.navigator.bitness
+  CpuThreads = $profile.navigator.hardwareConcurrency
+  DeviceMemory = $profile.navigator.deviceMemory
+  GpuVendor = $profile.graphics.unmaskedVendor
+  GpuRenderer = $profile.graphics.unmaskedRenderer
+  Screen = "$($profile.screen.width)x$($profile.screen.height)"
+  Dpr = $profile.screen.devicePixelRatio
+} | Format-List
+```
+
+`profiles current` resolves one profile in its own process. With a fixed ID,
+the default, or a decimal seed, it reports the same selection that a new
+browser context gets under the same environment. With rotation, it is one new
+random draw and cannot report the profile already held by another running
+`serve`, `scrape`, or `mcp` process. Rust code can read an existing context ID
+with `BrowserContext::profile_id()`.
 
 ### Read the default ID with PowerShell
 
@@ -376,6 +425,270 @@ $env:OBSCURA_GEOLOCATION = '40.7128,-74.0060'
 The screen part is a device shape, not a location signal. Changing the screen
 part does not make a timezone or geolocation change.
 
+## Local browser profile workbench
+
+The local workbench is at:
+
+```text
+webgl/capture/index.html
+```
+
+It has two jobs on one page:
+
+1. Three select boxes let you join any existing base, graphics, and screen row
+   and copy the final `c145w1:...` profile ID.
+2. The capture tool reads the current real browser, checks it against the
+   catalog target, makes the same content IDs as the Rust generator, and saves
+   one source observation through the local Obscura server.
+
+The workbench has no external script, font, image, CDN, or service. It reads
+only the catalog built into Obscura. A save request goes back to the same local
+Obscura process. It does not send the capture to another server.
+
+### Capture target
+
+A new capture is accepted only for this target:
+
+- 64-bit Google Chrome or Chromium major 145.
+- Windows.
+- `x86` architecture and `64` bitness in User-Agent Client Hints.
+- A reduced Chrome 145 Windows User-Agent.
+- WebGL 1 and WebGL 2.
+- ANGLE with a D3D11 renderer.
+- A working default WebGPU adapter and device.
+- At least 82 valid WebGL 1 parameters and 132 valid WebGL 2 parameters.
+- All 12 shader precision records for each WebGL generation.
+
+The select-box part still works in another browser. Only new capture is held
+to the target checks.
+
+Use a normal browser state for a useful observation:
+
+- Turn hardware acceleration on.
+- Do not force SwiftShader, OpenGL, Vulkan, or another ANGLE backend.
+- Set page zoom to 100%.
+- Put the browser window on the display to record.
+- Use the wanted Windows display scale before opening the page.
+- Set the wanted window size and state before capture.
+- Close docked DevTools if it changes `innerWidth` or `innerHeight`.
+- Use a clean browser profile if extensions or policy may change graphics.
+
+The page checks the reported renderer. `chrome://gpu` is also useful for a
+manual check that hardware acceleration and D3D11 are active.
+
+### Start the workbench
+
+Build Obscura, then start its CDP server with the workbench source directory.
+Run this from the repository root:
+
+```powershell
+cargo build --release
+.\target\release\obscura.exe serve --port 9222 --profile-workbench-dir webgl
+```
+
+Open this address in the real browser:
+
+```text
+http://127.0.0.1:9222/obscura/profiles/
+```
+
+The flag is off by default. Without `--profile-workbench-dir`, this route gives
+a not-found response. The path may be absolute, but `webgl` is the right value
+when `serve` starts from this repository root.
+
+The save route accepts only a client with all of these properties:
+
+- Its network address is loopback.
+- Its `Host` is `localhost`, `127.0.0.1`, or another loopback address on the
+  active `serve` port.
+- Its `Origin` is that same local HTTP address.
+- Its body is JSON.
+
+The read-only page and catalog may still be read if `serve` uses another bind
+address, but save stays loopback-only. Use the normal loopback bind:
+
+```powershell
+.\target\release\obscura.exe serve --host 127.0.0.1 --port 9222 --profile-workbench-dir webgl
+```
+
+The workbench needs one server worker because there must be one writer for the
+two source arrays. Obscura rejects this combination:
+
+```powershell
+.\target\release\obscura.exe serve --workers 2 --profile-workbench-dir webgl
+```
+
+Loopback HTTP is a potentially trustworthy context, so Chrome can expose
+WebGPU. Stop `serve` with `Ctrl+C` after the work is complete.
+
+### Make an ID from existing rows
+
+The page loads the compact catalog built into the running binary and gives
+three select boxes:
+
+- Base: Chrome, Windows platform version, CPU, memory, and languages.
+- Graphics: one whole GPU, WebGL 1, WebGL 2, and WebGPU row.
+- Screen: physical screen, available area, window, position, and DPR.
+
+Changing any select box updates the final value:
+
+```text
+c145w1:<base-id>:<graphics-id>:<screen-id>
+```
+
+Use **Copy profile ID**, then set it before Obscura starts:
+
+```powershell
+$env:OBSCURA_PROFILE = 'c145w1:<base-id>:<graphics-id>:<screen-id>'
+.\target\release\obscura.exe profiles current
+.\target\release\obscura.exe --stealth fetch https://example.com --dump text
+```
+
+**Select catalog default** restores the catalog default composition.
+
+### Capture the current real browser
+
+Press **Capture and check**. The page does this work locally:
+
+1. Reads full User-Agent Client Hints.
+2. Reads navigator CPU, memory, languages, and touch data.
+3. Reads screen, available area, DPR, inner and outer sizes, and position.
+4. Creates separate WebGL 1 and WebGL 2 canvases.
+5. Enables every reported WebGL extension.
+6. Reads numeric context and extension constants.
+7. Tests each numeric value with `getParameter` and records its exact return
+   type. Invalid enum probes are kept with an empty type so the Rust generator
+   can drop them by its normal rule.
+8. Reads context attributes, supported extensions, precision formats,
+   anisotropy, draw-buffer limits, version strings, and the unmasked renderer.
+9. Requests default, low-power, and high-performance WebGPU adapters.
+10. Reads adapter information, features, adapter limits, and the limits of a
+    default device from each available adapter.
+11. Normalizes the data with the same field order and rules as the Rust tool.
+12. Makes the first 16 bytes of each SHA-256 content ID and the final composed
+    profile ID.
+
+When every check passes, the page selects the captured base, graphics, and
+screen IDs in the three boxes. The final `c145w1:...` value is then visible and
+can be copied.
+
+If an ID is already in the tracked catalog, the select option is the existing
+row. If it is new, the option begins with `[new capture]`. A new composed ID is
+the ID that generation will make, but Obscura cannot use it until the capture
+has been imported, the catalog has been generated, and the binary has been
+rebuilt.
+
+### Save the source files
+
+After all checks pass, press **Save capture to source files**. The built-in
+server checks that the profile, graphics, and screen blocks belong to the same
+capture. It then makes these changes under the directory from
+`--profile-workbench-dir`:
+
+- Appends one adapter observation to `adapters.json`.
+- Appends one screen observation to `window.json`.
+- Makes a new non-overwriting file such as
+  `profiles/capture-<digest>-001.json`.
+- Uses `.obscura-new` and `.obscura-backup` files while it replaces the two
+  source arrays.
+- Leaves the tracked compact catalog unchanged. Generation is a separate step.
+
+The page gives the new profile path and the new adapter and window row counts.
+If an old `.obscura-backup` file is present, save stops so that the old data can
+be checked and recovered by hand. It does not remove an old backup silently.
+
+Saving the same observation again is allowed. It adds another observation, so
+the generator gives equal content more weight. Use one save per real
+observation. Do not press save twice by mistake.
+
+For a large existing source set, save needs enough free memory and disk space
+for the old array, the new array, and one short backup. The raw source files
+are local and ignored, but a separate private backup is still wise before a
+large import.
+
+### Manual downloads
+
+The three download buttons are a manual backup and import path:
+
+| Download | Input role | Main content |
+|---|---|---|
+| `obscura-profile.json` | One file under `webgl/profiles/` | Base identity plus matching screen and graphics reference data |
+| `obscura-adapters.json` | One row for `webgl/adapters.json` | Vendor, renderer, WebGL 1, WebGL 2, and all WebGPU adapter choices |
+| `obscura-windows.json` | One row for `webgl/window.json` | One whole screen and window observation |
+
+These three files are one observation and must stay together. Do not join the
+profile from one machine with the adapter or window download from another
+machine while importing a capture.
+
+The capture includes detailed fingerprint data. It does not read cookies,
+passwords, local storage, browsing history, proxy address, public IP,
+geolocation, timezone, audio data, or 2D canvas pixels. Keep the raw files
+local. The source paths are ignored by Git.
+
+### Manually import downloaded files
+
+Node.js 18 or newer can safely check that the three files belong together and
+add them to the ignored source files. Run this from the repository root and
+replace the three download paths:
+
+```powershell
+node webgl/capture/import-capture.js `
+  'C:\Users\YOU\Downloads\obscura-profile.json' `
+  'C:\Users\YOU\Downloads\obscura-adapters.json' `
+  'C:\Users\YOU\Downloads\obscura-windows.json'
+```
+
+The import helper:
+
+- Rejects a file with the wrong capture shape.
+- Rejects three files that do not have equal screen, WebGL, renderer, and
+  WebGPU blocks.
+- Creates `webgl/adapters.json` and `webgl/window.json` if they do not exist.
+- Appends one observation to each existing array.
+- Creates a new non-overwriting file such as
+  `webgl/profiles/capture-<digest>-001.json`.
+- Uses temporary and backup names while replacing the two source arrays.
+- Never changes the tracked compact catalog. Generation is a separate step.
+
+Importing the same observation again is allowed. It adds another observation,
+so the generator gives equal content more weight. Use one import per real
+observation. Do not import a file twice by mistake.
+
+The helper rewrites the two local JSON arrays in a stable pretty form. The
+built-in save button and this helper have the same source-file result.
+
+### Generate, build, and confirm the captured ID
+
+Stop the old `serve`, run the normal generator command from the next section,
+and rebuild Obscura. Start the new binary with the workbench flag again. Then
+refresh the
+workbench. The `[new capture]` mark must be gone and the same three IDs must
+now be normal catalog options.
+
+Build Obscura and check the exact ID printed by the capture page:
+
+```powershell
+cargo build --release
+$env:OBSCURA_PROFILE = 'c145w1:<captured-base-id>:<captured-graphics-id>:<captured-screen-id>'
+.\target\release\obscura.exe profiles current
+```
+
+The returned `id`, Windows fields, renderer, component IDs, screen, WebGL, and
+WebGPU data must match the workbench capture and the generated catalog.
+
+### Observation weights
+
+Weights come from repeated equal observations:
+
+- Every accepted base profile file adds one base observation.
+- Every renderer entry in an adapter row adds one graphics observation.
+- Every window entry in a screen row adds one screen observation.
+- Equal normalized content is grouped and its weights are added.
+
+The fixed default is the highest-weight base row, graphics row, and screen row.
+An import may change the default only when it changes these weight rankings.
+Ties use the lowest content ID.
+
 ## Catalog files
 
 Tracked files:
@@ -388,6 +701,10 @@ Tracked files:
 | `webgl/catalog/chrome-145-windows-v1.sources.json` | Source hashes and byte counts |
 | `webgl/catalog/chrome-145-graphics-api-v1.json` | Chrome 145 graphics API manifest |
 | `webgl/catalog/chrome-145-graphics-api-v1.sources.json` | API source revision and hashes |
+| `webgl/capture/index.html` | Local capture and three-part profile picker |
+| `webgl/capture/collector.js` | Browser, WebGL, WebGPU, screen, and adapter capture |
+| `webgl/capture/profile-id.js` | Generator-compatible normalization and content IDs |
+| `webgl/capture/import-capture.js` | Safe local source import helper |
 
 Local source files:
 
@@ -482,6 +799,42 @@ in process logs.
 First check the page URL. Remote plain HTTP is not a trustworthy context. Then
 check that the selected graphics row has the requested adapter preference and
 features.
+
+### The workbench says that the catalog load failed
+
+Start the HTTP server from the repository root and open
+`http://127.0.0.1:8765/webgl/capture/`. Serving only the capture directory does
+not make the tracked catalog URL available.
+
+### The workbench rejects the browser version
+
+New capture is fixed to Chrome major 145. A later or earlier Chrome build has a
+different public surface and cannot enter this catalog. Existing catalog row
+selection still works.
+
+### The workbench reports no WebGPU adapter
+
+Use the loopback HTTP address, turn hardware acceleration on, restart Chrome,
+and check `chrome://gpu`. Remote plain HTTP and some virtual machines do not
+give the page a WebGPU adapter.
+
+### The workbench reports a non-D3D11 renderer
+
+Remove browser flags that force SwiftShader, Vulkan, OpenGL, or another ANGLE
+backend. Restart Chrome and check the renderer again. Do not import that
+capture into this D3D11 catalog.
+
+### A captured ID is marked as new
+
+The page has made the final stable content ID, but the current embedded catalog
+does not have that row. Save the capture, stop `serve`, generate the catalog,
+rebuild Obscura, start `serve` again, and refresh the page. Until then, using
+the new ID in `OBSCURA_PROFILE` gives the fixed default with a warning.
+
+### Chrome blocks more than one download
+
+Use the three separate download buttons. If Chrome asks for approval, allow
+multiple downloads only for the local `127.0.0.1` page.
 
 ### A custom User-Agent gives a warning
 

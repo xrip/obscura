@@ -12,6 +12,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tracing::{error, info, warn};
 
 use crate::dispatch::{self, CdpContext};
+use crate::profile_workbench::{self, ProfileWorkbench};
 
 // PR #36 comment 4341743194: the deferral queue in `process_with_interception`
 // must be bounded so a stalled navigation cannot OOM the process. When the cap
@@ -169,10 +170,42 @@ pub async fn start_with_serve_options_and_limit(
     allow_private_network: bool,
     max_connections: usize,
 ) -> anyhow::Result<()> {
+    start_with_profile_workbench_options_and_limit(
+        port,
+        host,
+        proxy,
+        stealth,
+        user_agent,
+        allow_file_access,
+        storage_dir,
+        allow_private_network,
+        max_connections,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn start_with_profile_workbench_options_and_limit(
+    port: u16,
+    host: &str,
+    proxy: Option<String>,
+    stealth: bool,
+    user_agent: Option<String>,
+    allow_file_access: bool,
+    storage_dir: Option<std::path::PathBuf>,
+    allow_private_network: bool,
+    max_connections: usize,
+    profile_workbench_dir: Option<std::path::PathBuf>,
+) -> anyhow::Result<()> {
     let ip: std::net::IpAddr = host
         .parse()
         .map_err(|e| anyhow::anyhow!("invalid --host '{}': {}", host, e))?;
     let addr = SocketAddr::new(ip, port);
+    let profile_workbench = profile_workbench_dir
+        .map(ProfileWorkbench::new)
+        .transpose()?
+        .map(Arc::new);
 
     // Issue #62: the HTTP control plane (/json/version, /json) must remain
     // reachable even while V8 JS evaluation blocks the tokio LocalSet thread.
@@ -195,6 +228,13 @@ pub async fn start_with_serve_options_and_limit(
     if allow_file_access {
         info!("file:// navigation enabled (--allow-file-access). Do not expose this port to untrusted networks.");
     }
+    if let Some(workbench) = &profile_workbench {
+        info!(
+            "Profile workbench: http://127.0.0.1:{}/obscura/profiles (source dir: {})",
+            port,
+            workbench.root().display()
+        );
+    }
 
     let (ws_tx, mut ws_rx) = mpsc::channel::<std::net::TcpStream>(MAX_PENDING_WS_HANDOFFS);
 
@@ -206,6 +246,7 @@ pub async fn start_with_serve_options_and_limit(
     // handles HTTP endpoints (/json/version, /json, /json/protocol) with
     // blocking I/O so they never contend with the LocalSet's V8 work.
     let accept_flag = shutdown_flag.clone();
+    let accept_workbench = profile_workbench.clone();
     std::thread::Builder::new()
         .name("obscura-cdp-accept".into())
         .spawn(move || {
@@ -215,7 +256,12 @@ pub async fn start_with_serve_options_and_limit(
                 }
                 match stream {
                     Ok(stream) => {
-                        if let Err(e) = accept_dispatch(stream, port, &ws_tx) {
+                        if let Err(e) = accept_dispatch(
+                            stream,
+                            port,
+                            &ws_tx,
+                            accept_workbench.as_deref(),
+                        ) {
                             if !format!("{}", e).contains("close") {
                                 error!("Accept dispatch error: {}", e);
                             }
@@ -591,9 +637,19 @@ fn accept_dispatch(
     stream: std::net::TcpStream,
     port: u16,
     ws_tx: &mpsc::Sender<std::net::TcpStream>,
+    profile_workbench: Option<&ProfileWorkbench>,
 ) -> anyhow::Result<()> {
     let mut buf = [0u8; WS_PEEK_BUF];
     let n = stream.peek(&mut buf)?;
+
+    if n >= WS_PEEK_BUF {
+        let mut peek_buf = [0u8; HTTP_PEEK_BUF];
+        let count = stream.peek(&mut peek_buf)?;
+        if profile_workbench::is_workbench_request(&peek_buf[..count]) {
+            let peer = stream.peer_addr()?;
+            return profile_workbench::handle(stream, port, peer, profile_workbench);
+        }
+    }
 
     if n >= 4 && &buf == b"GET " {
         let mut peek_buf = [0u8; HTTP_PEEK_BUF];
