@@ -173,6 +173,16 @@ pub async fn handle(
                 return Err("nodeId or objectId required".to_string());
             };
 
+            let node_type = page.with_dom(|dom| {
+                dom.get_node(NodeId::new(node_id as u32))
+                    .map(|node| match &node.data {
+                        NodeData::Element { .. } => 1,
+                        NodeData::Document => 9,
+                        _ => 0,
+                    })
+                    .unwrap_or(0)
+            }).unwrap_or(0);
+
             let js_code = format!(
                 "(function() {{\
                     var nid = {};\
@@ -180,7 +190,7 @@ pub async fn handle(
                     if (globalThis._cache && globalThis._cache.has(nid)) {{\
                         node = globalThis._cache.get(nid);\
                     }} else {{\
-                        var t = +Deno.core.ops.op_dom('node_type', String(nid), '');\
+                        var t = {};\
                         if (t === 1) node = new Element(nid);\
                         else if (t === 9) node = globalThis.document;\
                         else node = new Node(nid);\
@@ -189,6 +199,7 @@ pub async fn handle(
                     return node;\
                 }})()",
                 node_id,
+                node_type,
             );
 
             let info = if let Some(js) = &mut page.js {

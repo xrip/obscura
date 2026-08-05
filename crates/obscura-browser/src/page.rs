@@ -3,7 +3,7 @@ use std::sync::Arc;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use obscura_dom::{parse_html, DomTree};
 use obscura_js::runtime::ObscuraJsRuntime;
-use obscura_net::{CallbackRegistry, ObscuraHttpClient, ObscuraNetError, RequestCallback, Response, ResponseCallback};
+use obscura_net::{CallbackRegistry, ObscuraHttpClient, ObscuraNetError, RequestCallback, ResourceType, Response, ResponseCallback};
 use url::Url;
 
 use crate::context::BrowserContext;
@@ -213,16 +213,13 @@ impl Page {
         let frame_id = id.clone();
         #[cfg(feature = "stealth")]
         let stealth_client = if context.stealth {
-            // The wreq client backing StealthHttpClient does not speak SOCKS5.
-            // Callers must validate the proxy scheme up front and fail loudly
-            // (see obscura-cli) rather than silently rewriting socks5:// to
-            // http://, which only works when the upstream happens to be a
-            // Clash-style mixed-mode proxy and breaks plain SOCKS5 servers
-            // like `ssh -ND` (#160).
-            Some(Arc::new(StealthHttpClient::with_proxy_and_user_agent(
+            Some(Arc::new(StealthHttpClient::with_browser_identity(
                 context.cookie_jar.clone(),
                 context.proxy_url.as_deref(),
                 &context.user_agent,
+                &context.fingerprint_profile.navigator.sec_ch_ua_header(),
+                &context.fingerprint_profile.navigator.sec_ch_ua_platform_header(),
+                context.allow_private_network,
             )))
         } else {
             None
@@ -272,9 +269,14 @@ impl Page {
         false
     }
 
-    async fn do_fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {
+    async fn do_fetch(
+        &self,
+        url: &Url,
+        resource_type: ResourceType,
+    ) -> Result<Response, ObscuraNetError> {
         let referrer = self.referrer_for_request(url);
-        self.do_fetch_with_referrer(url, referrer.as_ref()).await
+        self.do_fetch_with_referrer(url, referrer.as_ref(), resource_type)
+            .await
     }
 
     fn referrer_for_request(&self, url: &Url) -> Option<Url> {
@@ -295,23 +297,32 @@ impl Page {
         &self,
         url: &Url,
         referrer: Option<&Url>,
+        resource_type: ResourceType,
     ) -> Result<Response, ObscuraNetError> {
         #[cfg(feature = "stealth")]
         if let Some(ref stealth) = self.stealth_client {
-            return stealth.fetch_with_referrer(url, referrer).await;
+            return stealth
+                .fetch_with_context(url, referrer, Some(&self.callbacks), resource_type)
+                .await;
         }
+        #[cfg(not(feature = "stealth"))]
+        let _ = (referrer, resource_type);
         self.http_client
             .fetch_with_callbacks(url, Some(&self.callbacks))
             .await
     }
 
     fn active_network_requests(&self) -> u32 {
-        let mut active = self.http_client.active_requests();
         #[cfg(feature = "stealth")]
-        if let Some(ref stealth) = self.stealth_client {
-            active = active.saturating_add(stealth.active_requests());
+        {
+            return self.http_client.active_requests().saturating_add(
+                self.stealth_client.as_ref().map_or(0, |client| client.active_requests()),
+            );
         }
-        active
+        #[cfg(not(feature = "stealth"))]
+        {
+            self.http_client.active_requests()
+        }
     }
 
     fn init_js(&mut self) {
@@ -335,6 +346,7 @@ impl Page {
             &self.url_string(),
             self.context.proxy_url.clone(),
             self.stealth_client.clone(),
+            Some(self.callbacks.clone()),
         );
         #[cfg(not(feature = "stealth"))]
         let mut rt = ObscuraJsRuntime::with_base_url_and_proxy(
@@ -596,7 +608,7 @@ impl Page {
                     };
                     return Some((idx, url, resp));
                 }
-                match page.do_fetch(&parsed).await {
+                match page.do_fetch(&parsed, ResourceType::Script).await {
                     Ok(resp) => Some((idx, url, resp)),
                     Err(e) => {
                         tracing::warn!("Failed to fetch script {}: {}", url, e);
@@ -772,21 +784,9 @@ impl Page {
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(10_000)
                 .max(500);
-            // Bound the post-script settle loop by wall clock, not just by the
-            // 10ms-tick branch. The old code only consulted `deadline` inside
-            // the `Err(_)` arm (when the inner tick timed out), so a steady
-            // stream of inflight XHR/fetch (active_requests() > 0) kept the
-            // loop running indefinitely because it took the `Ok(Ok(()))` arm
-            // and slept 1ms each iteration without ever checking the clock.
-            // On busy sites this could keep the V8 lock held for tens of
-            // seconds, wedging the entire CDP dispatcher (see triage for
-            // issue series around the 40-site compat sweep).
-            // A dynamic external script may still be in flight at 500ms. Keep
-            // pumping only while that queue is pending, up to a separate bounded
-            // budget, so normal pages and unrelated fetches retain the fast path.
-            // A single run_event_loop poll that pins the thread inside V8 makes
-            // the per-poll tokio timeouts below useless, so guard the whole loop
-            // with a watchdog that fires 250ms past the longest deadline.
+            // Give post-load challenge and application work time to start, then
+            // keep pumping until it has been idle for a full grace period. The
+            // wall-clock limit remains the hard backstop for busy pages.
             let settle_wd = js.arm_watchdog(std::time::Duration::from_millis(dynamic_settle_ms + 250));
             let started = tokio::time::Instant::now();
             let deadline = started + tokio::time::Duration::from_millis(500);
@@ -806,21 +806,21 @@ impl Page {
 
                 match result {
                     Ok(Ok(())) => {
-                        let mut active_requests = self.http_client.active_requests();
-                        #[cfg(feature = "stealth")]
-                        if let Some(ref stealth) = self.stealth_client {
-                            active_requests = active_requests.saturating_add(stealth.active_requests());
-                        }
-                        let pending_dynamic = js.has_pending_dynamic_scripts();
-                        if active_requests == 0 && !pending_dynamic {
+                        let active_requests = {
+                            #[cfg(feature = "stealth")]
+                            {
+                                self.http_client.active_requests().saturating_add(
+                                    self.stealth_client.as_ref().map_or(0, |client| client.active_requests()),
+                                )
+                            }
+                            #[cfg(not(feature = "stealth"))]
+                            {
+                                self.http_client.active_requests()
+                            }
+                        };
+                        if active_requests == 0 && !js.has_pending_dynamic_scripts() {
                             if saw_async_work {
                                 let idle_start = idle_since.get_or_insert(now);
-                                // Keep pumping briefly after the last network or
-                                // dynamic-script operation. Promise continuations
-                                // often schedule the next browser step from a
-                                // timer immediately after a script load. A two
-                                // poll early exit strands those steps, including
-                                // challenge token flows.
                                 if now.duration_since(*idle_start)
                                     >= tokio::time::Duration::from_millis(1_000)
                                 {
@@ -1078,7 +1078,11 @@ impl Page {
                 .post_form_with_callbacks(&url, body, Some(&self.callbacks))
                 .await
         } else {
-            self.do_fetch_with_referrer(&url, navigation_referrer.as_ref()).await
+            self.do_fetch_with_referrer(
+                &url,
+                navigation_referrer.as_ref(),
+                ResourceType::Document,
+            ).await
         }.map_err(|e| {
             self.lifecycle = LifecycleState::Failed;
             PageError::NetworkError(e.to_string())
@@ -1167,7 +1171,7 @@ impl Page {
             let url_str = full_url.clone();
             async move {
                 let parsed = Url::parse(&url_str).unwrap_or_else(|_| Url::parse("about:blank").unwrap());
-                match page.do_fetch(&parsed).await {
+                match page.do_fetch(&parsed, ResourceType::Stylesheet).await {
                     Ok(resp) => Some((url_str, resp)),
                     Err(e) => {
                         tracing::debug!("Failed to fetch stylesheet {}: {}", url_str, e);

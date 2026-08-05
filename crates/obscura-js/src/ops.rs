@@ -821,19 +821,6 @@ async fn op_fetch_url(
 ) -> Result<String, deno_error::JsErrorBox> {
     tracing::debug!("op_fetch_url called: {} {} (intercept check pending)", method, url);
 
-    if let Ok(parsed_url) = url::Url::parse(&url) {
-        if let Err(e) = validate_fetch_url(&parsed_url) {
-            return Ok(serde_json::json!({
-                "status": 0,
-                "body": "",
-                "url": url,
-                "headers": {},
-                "blocked": true,
-                "error": e,
-            }).to_string());
-        }
-    }
-
     let (cookie_jar, in_flight, intercept_tx, proxy_url, callbacks, http_client, _document_url) = {
         let state_borrow = state.borrow();
         let gs = state_borrow.borrow::<SharedState>().clone();
@@ -876,6 +863,21 @@ async fn op_fetch_url(
             gs.url.clone(),
         )
     };
+    let allow_private_network = http_client
+        .as_ref()
+        .is_some_and(|client| client.allow_private_network);
+    if let Ok(parsed_url) = url::Url::parse(&url) {
+        if let Err(e) = validate_fetch_url(&parsed_url, allow_private_network) {
+            return Ok(serde_json::json!({
+                "status": 0,
+                "body": "",
+                "url": url,
+                "headers": {},
+                "blocked": true,
+                "error": e,
+            }).to_string());
+        }
+    }
 
     // Slots the interception channel can override via Continue so a consumer
     // can rewrite url/method/headers/body before the request goes out.
@@ -940,7 +942,7 @@ async fn op_fetch_url(
     // bypass validate_fetch_url entirely.
     let url = if let Some(new_url) = override_url {
         if let Ok(parsed) = url::Url::parse(&new_url) {
-            if let Err(reason) = validate_fetch_url(&parsed) {
+            if let Err(reason) = validate_fetch_url(&parsed, allow_private_network) {
                 return Ok(serde_json::json!({
                     "status": 0,
                     "body": "",
@@ -1024,6 +1026,7 @@ async fn op_fetch_url(
                 mode.clone(),
                 _document_url.clone(),
                 callbacks.clone(),
+                allow_private_network,
             )
             .await;
         }
@@ -1163,7 +1166,7 @@ async fn op_fetch_url(
         };
 
         // Re-validate every redirect target against the SSRF policy.
-        if let Err(reason) = validate_fetch_url(&next_url) {
+        if let Err(reason) = validate_fetch_url(&next_url, allow_private_network) {
             return Ok(serde_json::json!({
                 "status": 0,
                 "body": "",
@@ -1318,6 +1321,23 @@ fn fetch_response(url: &str, status: u16, headers: HashMap<String, String>, body
     }
 }
 
+#[cfg(feature = "stealth")]
+fn insert_scripted_fetch_metadata(
+    headers: &mut HashMap<String, String>,
+    mode: &str,
+    is_cross_origin: bool,
+) {
+    let fetch_mode = if mode.is_empty() { "cors" } else { mode };
+    // fetch() and XHR have an empty destination in Chromium, including
+    // no-cors requests. Script element loads use "script" on their own path.
+    headers.insert("sec-fetch-dest".to_string(), "empty".to_string());
+    headers.insert("sec-fetch-mode".to_string(), fetch_mode.to_string());
+    headers.insert(
+        "sec-fetch-site".to_string(),
+        if is_cross_origin { "cross-site" } else { "same-origin" }.to_string(),
+    );
+}
+
 /// Stealth-mode scripted fetch()/XHR: mirrors op_fetch_url's redirect, SSRF,
 /// and CORS semantics but sends every hop through the wreq stealth client so
 /// the request carries the Chrome TLS fingerprint and client hints. Cookie
@@ -1336,6 +1356,7 @@ async fn stealth_fetch_all(
     mode: String,
     document_url: String,
     callbacks: Option<Arc<CallbackRegistry>>,
+    allow_private_network: bool,
 ) -> Result<String, deno_error::JsErrorBox> {
     let mut current_url = url.clone();
     let mut current_method = method;
@@ -1362,15 +1383,7 @@ async fn stealth_fetch_all(
                 .cloned()
                 .unwrap_or_else(|| "*/*".to_string()),
         );
-        req_headers.insert(
-            "sec-fetch-dest".to_string(),
-            if fetch_mode == "no-cors" { "script" } else { "empty" }.to_string(),
-        );
-        req_headers.insert("sec-fetch-mode".to_string(), fetch_mode.to_string());
-        req_headers.insert(
-            "sec-fetch-site".to_string(),
-            if is_cross_origin { "cross-site" } else { "same-origin" }.to_string(),
-        );
+        insert_scripted_fetch_metadata(&mut req_headers, fetch_mode, is_cross_origin);
         // Browsers send Origin on non-GET same-origin fetches too. This is
         // important for token and challenge endpoints that bind the issued
         // token to the page origin.
@@ -1417,7 +1430,7 @@ async fn stealth_fetch_all(
         };
         // Re-validate every redirect target against the SSRF policy, matching
         // op_fetch_url (GHSA-8v6v-g4rh-jmcm).
-        if let Err(reason) = validate_fetch_url(&next_url) {
+        if let Err(reason) = validate_fetch_url(&next_url, allow_private_network) {
             return Ok(serde_json::json!({
                 "status": 0, "body": "", "url": next_url.to_string(), "headers": {},
                 "blocked": true,
@@ -1516,6 +1529,19 @@ fn glob_match(pattern: &str, url: &str) -> bool {
 mod tests {
     use super::glob_match;
 
+    #[cfg(feature = "stealth")]
+    use super::insert_scripted_fetch_metadata;
+
+    #[cfg(feature = "stealth")]
+    #[test]
+    fn no_cors_fetch_keeps_an_empty_destination() {
+        let mut headers = std::collections::HashMap::new();
+        insert_scripted_fetch_metadata(&mut headers, "no-cors", true);
+        assert_eq!(headers.get("sec-fetch-dest").map(String::as_str), Some("empty"));
+        assert_eq!(headers.get("sec-fetch-mode").map(String::as_str), Some("no-cors"));
+        assert_eq!(headers.get("sec-fetch-site").map(String::as_str), Some("cross-site"));
+    }
+
     #[test]
     fn glob_match_handles_cdp_blocked_url_patterns() {
         assert!(glob_match(
@@ -1541,7 +1567,7 @@ mod tests {
     }
 }
 
-fn validate_fetch_url(url: &url::Url) -> Result<(), String> {
+fn validate_fetch_url(url: &url::Url, allow_private_network: bool) -> Result<(), String> {
     let scheme = url.scheme();
     if scheme != "http" && scheme != "https" && scheme != "file" {
         return Err(format!(
@@ -1550,7 +1576,7 @@ fn validate_fetch_url(url: &url::Url) -> Result<(), String> {
         ));
     }
 
-    if scheme == "file" || obscura_net::env_allows_private_network() {
+    if scheme == "file" || allow_private_network || obscura_net::env_allows_private_network() {
         return Ok(());
     }
 

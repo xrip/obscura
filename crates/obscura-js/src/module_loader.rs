@@ -10,7 +10,7 @@ use deno_core::ModuleSourceCode;
 use deno_core::ModuleSpecifier;
 use deno_core::RequestedModuleType;
 #[cfg(feature = "stealth")]
-use obscura_net::StealthHttpClient;
+use obscura_net::{CallbackRegistry, ResourceType, StealthHttpClient};
 
 pub struct ObscuraModuleLoader {
     pub base_url: String,
@@ -20,6 +20,8 @@ pub struct ObscuraModuleLoader {
     pub proxy_url: Option<String>,
     #[cfg(feature = "stealth")]
     pub stealth_client: Option<Arc<StealthHttpClient>>,
+    #[cfg(feature = "stealth")]
+    pub callbacks: Option<Arc<CallbackRegistry>>,
 }
 
 impl ObscuraModuleLoader {
@@ -33,6 +35,8 @@ impl ObscuraModuleLoader {
             proxy_url,
             #[cfg(feature = "stealth")]
             stealth_client: None,
+            #[cfg(feature = "stealth")]
+            callbacks: None,
         }
     }
 
@@ -41,11 +45,13 @@ impl ObscuraModuleLoader {
         base_url: &str,
         proxy_url: Option<String>,
         stealth_client: Option<Arc<StealthHttpClient>>,
+        callbacks: Option<Arc<CallbackRegistry>>,
     ) -> Self {
         ObscuraModuleLoader {
             base_url: base_url.to_string(),
             proxy_url,
             stealth_client,
+            callbacks,
         }
     }
 }
@@ -87,6 +93,12 @@ impl ModuleLoader for ObscuraModuleLoader {
         let proxy_url = self.proxy_url.clone();
         #[cfg(feature = "stealth")]
         let stealth_client = self.stealth_client.clone();
+        #[cfg(feature = "stealth")]
+        let callbacks = self.callbacks.clone();
+        #[cfg(feature = "stealth")]
+        let referrer = _maybe_referrer
+            .cloned()
+            .or_else(|| ModuleSpecifier::parse(&self.base_url).ok());
 
         ModuleLoadResponse::Async(Pin::from(Box::new(async move {
             #[cfg(feature = "stealth")]
@@ -94,7 +106,12 @@ impl ModuleLoader for ObscuraModuleLoader {
                 let specifier = ModuleSpecifier::parse(&url)
                     .map_err(|e| io_err(format!("Invalid module URL {}: {}", url, e)))?;
                 let resp = stealth
-                    .fetch(&specifier)
+                    .fetch_with_context(
+                        &specifier,
+                        referrer.as_ref(),
+                        callbacks.as_deref(),
+                        ResourceType::Script,
+                    )
                     .await
                     .map_err(|e| io_err(format!("Failed to fetch module {}: {}", url, e)))?;
                 if !(200..300).contains(&resp.status) {

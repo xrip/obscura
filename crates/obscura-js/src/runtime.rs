@@ -135,9 +135,15 @@ impl ObscuraJsRuntime {
         base_url: &str,
         proxy_url: Option<String>,
         stealth_client: Option<std::sync::Arc<obscura_net::StealthHttpClient>>,
+        callbacks: Option<std::sync::Arc<obscura_net::CallbackRegistry>>,
     ) -> Self {
         Self::with_module_loader(Rc::new(
-            ObscuraModuleLoader::with_proxy_and_stealth(base_url, proxy_url, stealth_client),
+            ObscuraModuleLoader::with_proxy_and_stealth(
+                base_url,
+                proxy_url,
+                stealth_client,
+                callbacks,
+            ),
         ))
     }
 
@@ -684,15 +690,24 @@ impl ObscuraJsRuntime {
         // Fetch the module source. The old impl registered an empty string
         // and called it loaded, so every Vite / Next module bundle "loaded"
         // in 1ms with zero code and the SPA never mounted (issue #205).
-        let (client, callbacks) = {
+        let (client, callbacks, document_url) = {
             let st = self.state.borrow();
-            (st.http_client.clone(), st.callbacks.clone())
+            (st.http_client.clone(), st.callbacks.clone(), st.url.clone())
         };
         #[cfg(feature = "stealth")]
         let source_code = {
             let stealth_client = self.state.borrow().stealth_client.clone();
             if let Some(stealth) = stealth_client {
-                match stealth.fetch(&specifier).await {
+                let referrer = deno_core::ModuleSpecifier::parse(&document_url).ok();
+                match stealth
+                    .fetch_with_context(
+                        &specifier,
+                        referrer.as_ref(),
+                        callbacks.as_deref(),
+                        obscura_net::ResourceType::Script,
+                    )
+                    .await
+                {
                     Ok(resp) => obscura_net::decode_non_html(&resp.body, resp.content_type()),
                     Err(e) => {
                         tracing::warn!("Module fetch failed ({}): {}", url, e);
@@ -715,6 +730,8 @@ impl ObscuraJsRuntime {
                 }
             }
         };
+        #[cfg(not(feature = "stealth"))]
+        let _ = &document_url;
         #[cfg(not(feature = "stealth"))]
         let source_code = match client {
             Some(c) => match c.fetch_with_callbacks(&specifier, callbacks.as_deref()).await {
@@ -3823,26 +3840,40 @@ mod tests {
 
     #[tokio::test(flavor = "current_thread")]
     async fn test_fetch_url_input_decodes_binary_body_base64() {
-        let mut rt = setup_runtime("<html><body></body></html>");
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 2048];
+            let _ = stream.read(&mut request).await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/wasm\r\nContent-Length: 8\r\nConnection: close\r\n\r\n\0asm\x01\0\0\0",
+                )
+                .await
+                .unwrap();
+        });
+
+        let page_url = format!("http://{address}/index.html");
+        let expected_url = format!("http://{address}/pkg/app_bg.wasm");
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        rt.set_url(&page_url);
+        rt.set_http_client(std::sync::Arc::new(
+            obscura_net::ObscuraHttpClient::with_full_options(
+                std::sync::Arc::new(obscura_net::CookieJar::new()),
+                None,
+                true,
+            ),
+        ));
+        rt.run_page_init();
         let result = rt.call_function_on_for_cdp(
             r#"async () => {
-                const originalFetchOp = Deno.core.ops.op_fetch_url;
-                try {
-                    Deno.core.ops.op_fetch_url = (url) => {
-                        globalThis.__capturedFetchUrl = url;
-                        return JSON.stringify({
-                            status: 200,
-                            headers: { "content-type": "application/wasm" },
-                            bodyBase64: "AGFzbQEAAAA=",
-                            url,
-                        });
-                    };
-                    const response = await fetch(new URL("/pkg/app_bg.wasm", document.URL));
-                    const bytes = Array.from(new Uint8Array(await response.arrayBuffer()));
-                    return { url: globalThis.__capturedFetchUrl, bytes };
-                } finally {
-                    Deno.core.ops.op_fetch_url = originalFetchOp;
-                }
+                const response = await fetch(new URL("/pkg/app_bg.wasm", document.URL));
+                const bytes = Array.from(new Uint8Array(await response.arrayBuffer()));
+                return { url: response.url, bytes };
             }"#,
             None,
             &[],
@@ -3853,10 +3884,11 @@ mod tests {
         assert_eq!(
             result.value.unwrap(),
             serde_json::json!({
-                "url": "http://example.com/pkg/app_bg.wasm",
+                "url": expected_url,
                 "bytes": [0, 97, 115, 109, 1, 0, 0, 0],
             })
         );
+        server.await.unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -4485,6 +4517,93 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result, serde_json::json!(["45Hu", [0xe3, 0x91, 0xee]]));
+    }
+
+    #[test]
+    fn deno_host_bridge_is_not_page_visible() {
+        let mut rt = setup_runtime("<div></div>");
+        let result = rt
+            .evaluate(
+                r#"[
+                    typeof globalThis.Deno,
+                    "Deno" in globalThis,
+                    Object.prototype.hasOwnProperty.call(globalThis, "Deno"),
+                    Object.getOwnPropertyDescriptor(globalThis, "Deno") === undefined,
+                    Object.getOwnPropertyNames(globalThis).includes("Deno"),
+                    typeof globalThis.__obscura_domOp,
+                    typeof globalThis.__obscura_bindingCalled,
+                    Object.prototype.hasOwnProperty.call(globalThis, "__obscura_domOp"),
+                    Object.getOwnPropertyNames(globalThis).includes("__obscura_bindingCalled")
+                ]"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                "undefined", false, false, true, false,
+                "undefined", "function", false, false
+            ])
+        );
+    }
+
+    #[test]
+    fn script_src_has_html_script_element_shape() {
+        let mut rt = setup_runtime("<html><head></head><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                const script = document.createElement("script");
+                script.src = "/asset.js";
+                const elementDescriptor = Object.getOwnPropertyDescriptor(Element.prototype, "src");
+                const scriptDescriptor = Object.getOwnPropertyDescriptor(HTMLScriptElement.prototype, "src");
+                return [
+                    script instanceof HTMLScriptElement,
+                    HTMLScriptElement.prototype !== Element.prototype,
+                    elementDescriptor === undefined,
+                    !!scriptDescriptor,
+                    scriptDescriptor && scriptDescriptor.enumerable,
+                    script.getAttribute("src"),
+                    script.src
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                true,
+                true,
+                true,
+                true,
+                true,
+                "/asset.js",
+                "http://example.com/asset.js"
+            ])
+        );
+    }
+
+    #[test]
+    fn screen_orientation_and_network_come_from_the_profile() {
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(parse_html("<html><body></body></html>"));
+        rt.set_url("https://example.com/");
+        rt.set_fingerprint_profile(
+            r#"{
+                "id":"profile-test",
+                "screen":{"width":1080,"height":1920,"availWidth":1080,"availHeight":1890,"availLeft":0,"availTop":0,"colorDepth":24,"pixelDepth":24,"devicePixelRatio":1,"innerWidth":1080,"innerHeight":1813,"outerWidth":1080,"outerHeight":1890,"screenX":0,"screenY":0},
+                "network":{"downlink":1.45,"rtt":75,"effectiveType":"4g","saveData":false}
+            }"#,
+        );
+        rt.run_page_init();
+        let result = rt
+            .evaluate(
+                "[screen.orientation.type, screen.orientation.angle, navigator.connection.downlink, navigator.connection.rtt, navigator.connection.effectiveType, navigator.connection.saveData]",
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!(["portrait-primary", 0, 1.45, 75, "4g", false])
+        );
     }
 
     #[test]

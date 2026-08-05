@@ -538,7 +538,17 @@ fn parse_http_date(s: &str) -> Result<u64, ()> {
     let day: u64 = parts[1].parse().map_err(|_| ())?;
     let month = months.iter().position(|m| parts[2].to_lowercase().starts_with(m))
         .ok_or(())? as u64 + 1;
-    let year: u64 = parts[3].parse().map_err(|_| ())?;
+    let raw_year: u64 = parts[3].parse().map_err(|_| ())?;
+    // RFC 6265 section 5.1.1 keeps the old cookie-date forms used by many
+    // servers: 70..99 mean 1970..1999 and 00..69 mean 2000..2069.
+    let year = match raw_year {
+        70..=99 => 1900 + raw_year,
+        0..=69 => 2000 + raw_year,
+        _ => raw_year,
+    };
+    if year < 1601 {
+        return Err(());
+    }
 
     let time_parts: Vec<&str> = parts[4].split(':').collect();
     let hour: u64 = time_parts.first().and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -797,6 +807,26 @@ mod tests {
     }
 
     #[test]
+    fn two_digit_cookie_years_follow_rfc_6265() {
+        assert_eq!(
+            parse_http_date("Thu, 05-Aug-27 19:13:19 GMT"),
+            parse_http_date("Thu, 05 Aug 2027 19:13:19 GMT"),
+        );
+        assert_eq!(
+            parse_http_date("Wed, 05-Aug-98 19:13:19 GMT"),
+            parse_http_date("Wed, 05 Aug 1998 19:13:19 GMT"),
+        );
+
+        let jar = CookieJar::new();
+        let url = Url::parse("https://www.example.com/product").unwrap();
+        jar.set_cookie(
+            "__Secure-session=value; Expires=Sun, 05-Aug-68 19:13:19 GMT; Path=/; SameSite=None; Domain=.example.com; HttpOnly; Secure",
+            &url,
+        );
+        assert!(jar.get_cookie_header(&url).contains("__Secure-session=value"));
+    }
+
+    #[test]
     fn test_expired_js_cookie_deletes_existing_cookie() {
         let jar = CookieJar::new();
         let url = Url::parse("https://example.com/").unwrap();
@@ -1032,7 +1062,6 @@ mod tests {
     #[test]
     fn test_cookie_from_file_load_then_send_in_request() {
         // Simulate what happens: load cookies from file → navigate → cookie should be in request
-        use std::io::Write;
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("cookies.json");
         

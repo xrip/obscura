@@ -58,16 +58,8 @@
   }
 })();
 
-// deno_core exposes its host bridge as an enumerable global by default. Keep
-// it available to the runtime, but hide it from ordinary page enumeration.
-try {
-  Object.defineProperty(globalThis, 'Deno', {
-    value: globalThis.Deno,
-    writable: true,
-    configurable: true,
-    enumerable: false,
-  });
-} catch (_) {}
+// Keep the host bridge in this closure. Page code must not see a Deno global.
+const _denoCore = globalThis.Deno.core;
 
 globalThis.__obscura_errors = [];
 
@@ -94,7 +86,13 @@ globalThis.dispatchEvent = function(event) {
   return !event.defaultPrevented;
 };
 
-const _dom = (cmd, a1, a2) => Deno.core.ops.op_dom(cmd, String(a1 ?? ""), String(a2 ?? ""));
+const _dom = (cmd, a1, a2) => _denoCore.ops.op_dom(cmd, String(a1 ?? ""), String(a2 ?? ""));
+Object.defineProperty(globalThis, '__obscura_bindingCalled', {
+  value: (name, payload) => _denoCore.ops.op_binding_called(name, payload),
+  writable: false,
+  enumerable: false,
+  configurable: false,
+});
 
 const _nativeFns = new Set();
 // Exact toString override for members whose native form is not just
@@ -264,7 +262,7 @@ async function __processDynScriptQueue() {
           if (task.url.startsWith('data:')) {
             body = _decodeDataScriptUrl(task.url);
           } else {
-            const raw = await Deno.core.ops.op_fetch_url(task.url, "GET", "{}", "", task.pageOrigin, "no-cors");
+            const raw = await _denoCore.ops.op_fetch_url(task.url, "GET", "{}", "", task.pageOrigin, "no-cors");
             body = JSON.parse(raw).body;
           }
           if (body) {
@@ -325,7 +323,7 @@ async function _loadLinkedStylesheet(c) {
   let pageOrigin = "";
   try { pageOrigin = new URL(fullUrl).origin; } catch(e) {}
   try {
-    await Deno.core.ops.op_fetch_url(fullUrl, "GET", "{}", "", pageOrigin, "no-cors");
+    await _denoCore.ops.op_fetch_url(fullUrl, "GET", "{}", "", pageOrigin, "no-cors");
     try { c.dispatchEvent(new Event('load', { bubbles: true })); } catch(e) {}
   } catch(e) {
     try { c.dispatchEvent(new Event('error', { bubbles: true })); } catch(e) {}
@@ -415,7 +413,7 @@ function _getElementsByClassName(root, classNames) {
   return HTMLCollection._from(matched);
 }
 const _consoleFn = (level, args) => {
-  try { Deno.core.ops.op_console_msg(level, args.map(a => {
+  try { _denoCore.ops.op_console_msg(level, args.map(a => {
     if (a === null) return "null";
     if (a === undefined) return "undefined";
     if (a instanceof Error) {
@@ -463,7 +461,7 @@ const _intervals = new Set();
 const _scheduleAfter = (delay, fn) => {
   const d = Math.max(0, Number(delay) || 0);
   if (d === 0) Promise.resolve().then(fn);
-  else Deno.core.ops.op_sleep(d).then(fn);
+  else _denoCore.ops.op_sleep(d).then(fn);
 };
 
 // Timers accept a string first arg per the HTML spec (e.g. the Aliyun WAF
@@ -490,7 +488,10 @@ const _setTimeout = (fn, delay = 0, ...args) => {
 Object.defineProperty(_setTimeout, "name", { value: "setTimeout", configurable: true });
 globalThis.setTimeout = _markNative(_setTimeout);
 
-const _clearTimeout = (id) => { _clearedTimers.add(id); };
+const _clearTimeout = (id) => {
+  _intervals.delete(id);
+  _clearedTimers.add(id);
+};
 Object.defineProperty(_clearTimeout, "name", { value: "clearTimeout", configurable: true });
 globalThis.clearTimeout = _markNative(_clearTimeout);
 
@@ -509,7 +510,10 @@ globalThis.setInterval = (fn, delay = 0, ...args) => {
   return id;
 };
 
-globalThis.clearInterval = (id) => { _intervals.delete(id); _clearedTimers.add(id); };
+globalThis.clearInterval = (id) => {
+  _intervals.delete(id);
+  _clearedTimers.add(id);
+};
 globalThis.requestAnimationFrame = (fn) => setTimeout(fn, 0);
 globalThis.cancelAnimationFrame = globalThis.clearTimeout;
 globalThis.queueMicrotask = globalThis.queueMicrotask || ((fn) => Promise.resolve().then(fn));
@@ -1231,7 +1235,7 @@ function _applyDocQueryEncoding(u) {
   let decoded;
   try { decoded = decodeURIComponent(u.search.slice(1)); } catch (e) { return u; }
   let reencoded;
-  try { reencoded = Deno.core.ops.op_url_encode_query(decoded, _docEncoding(), _isSpecialScheme(u.protocol)); }
+  try { reencoded = _denoCore.ops.op_url_encode_query(decoded, _docEncoding(), _isSpecialScheme(u.protocol)); }
   catch (e) { return u; }
   const newSearch = '?' + reencoded;
   if (newSearch === u.search) return u;
@@ -1366,19 +1370,6 @@ class Element extends Node {
   // is constant. Overrides Node's dynamic getter to drop one op per nodeType read.
   get nodeType() { return 1; }
   get tagName() { return _domParse("tag_name", _nodeId(this)) || ""; }
-  get src() {
-    const tag = this.localName;
-    if (!['audio', 'embed', 'iframe', 'img', 'input', 'script', 'source', 'track', 'video'].includes(tag)) {
-      return undefined;
-    }
-    return this.getAttribute('src') || '';
-  }
-  set src(v) {
-    const tag = this.localName;
-    if (['audio', 'embed', 'iframe', 'img', 'input', 'script', 'source', 'track', 'video'].includes(tag)) {
-      this.setAttribute('src', v == null ? '' : String(v));
-    }
-  }
   get localName() {
     // tagName is an op call and the tag never changes, so cache the lowercased
     // localName. This keeps the new <a>/<area> href getters (which read
@@ -2140,49 +2131,6 @@ class Element extends Node {
   get hash() { const u = (this.localName === 'a' || this.localName === 'area') ? _elemHrefURL(this) : null; return u ? u.hash : ''; }
   set hash(v) { if (this.localName === 'a' || this.localName === 'area') _setElemHrefPart(this, 'hash', v); }
   get origin() { const u = (this.localName === 'a' || this.localName === 'area') ? _elemHrefURL(this) : null; return u ? u.origin : ''; }
-  get src() {
-    // IDL reflection: HTMLScriptElement/HTMLImageElement/etc. `.src` returns the
-    // resolved absolute URL, not the literal attribute. Loaders that compute their
-    // base via `new URL(document.currentScript.src).origin` break on a relative
-    // value (issue #255). getAttribute("src") still returns the literal.
-    const v = this.getAttribute("src");
-    if (!v) return "";
-    try { return new URL(v, globalThis.location?.href || "about:blank").href; }
-    catch (e) { return v; }
-  }
-  set src(v) {
-    this.setAttribute("src", v);
-    if (this.localName === 'iframe' && v && v !== 'about:blank') {
-      this._loadIframeSrc(v);
-    }
-  }
-  _loadIframeSrc(url) {
-    let fullUrl = url;
-    if (!url.includes('://')) {
-      try { fullUrl = new URL(url, _domParse("document_url") || "about:blank").href; } catch(e) {}
-    }
-    const el = this;
-    fetch(fullUrl, {mode: 'no-cors'}).then(async resp => {
-      if (resp.ok || resp.type === 'opaque') {
-        const html = await resp.text();
-        el._iframeDoc = new _IframeDocument(html, fullUrl, el);
-        el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
-      } else {
-        el._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', fullUrl, el);
-        el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
-      }
-
-      // Dispatch through the element so the onload property/attribute and any
-      // addEventListener('load', ...) listeners all run. Calling el.onload()
-      // directly bypasses listeners registered via addEventListener.
-      el.dispatchEvent(new Event('load'));
-    }).catch(() => {
-      el._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', fullUrl, el);
-      el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
-
-      el.dispatchEvent(new Event('load'));
-    });
-  }
   get contentDocument() {
     if (this.localName !== 'iframe') return undefined;
     if (this._iframeDoc) {
@@ -2305,10 +2253,10 @@ class Element extends Node {
 
     const encoded = pairs.join('&');
     if (method === 'POST') {
-      Deno.core.ops.op_navigate(targetUrl, 'POST', encoded);
+      _denoCore.ops.op_navigate(targetUrl, 'POST', encoded);
     } else {
       const sep = targetUrl.includes('?') ? '&' : '?';
-      Deno.core.ops.op_navigate(targetUrl + (encoded ? sep + encoded : ''), 'GET', '');
+      _denoCore.ops.op_navigate(targetUrl + (encoded ? sep + encoded : ''), 'GET', '');
     }
   }
   reset() {
@@ -3141,11 +3089,11 @@ class Document extends Node {
   get links() { return this.querySelectorAll("a[href], area[href]"); }
   get scripts() { return this.querySelectorAll("script"); }
   get cookie() {
-    return Deno.core.ops.op_get_cookies();
+    return _denoCore.ops.op_get_cookies();
   }
   set cookie(v) {
     if (!v) return;
-    Deno.core.ops.op_set_cookie(v);
+    _denoCore.ops.op_set_cookie(v);
   }
   write(...args) {
     var html = args.join('');
@@ -3231,6 +3179,55 @@ class DocumentType extends Node {
 
 const _cache = new Map();
 
+// URL-valued `src` reflection belongs to the matching HTML interfaces, not to
+// Element. Keeping it off Element.prototype matches Chromium's prototype shape
+// while preserving absolute URL resolution for script and framework loaders.
+function _getElementSrc() {
+  const value = this.getAttribute('src');
+  if (!value) return '';
+  try { return new URL(value, globalThis.location?.href || 'about:blank').href; }
+  catch (_) { return value; }
+}
+function _loadIframeSrc(el, url) {
+  let fullUrl = url;
+  if (!url.includes('://')) {
+    try { fullUrl = new URL(url, _domParse('document_url') || 'about:blank').href; } catch (_) {}
+  }
+  fetch(fullUrl, {mode: 'no-cors'}).then(async response => {
+    const html = response.ok || response.type === 'opaque'
+      ? await response.text()
+      : '<!DOCTYPE html><html><head></head><body></body></html>';
+    el._iframeDoc = new _IframeDocument(html, fullUrl, el);
+    el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
+    el.dispatchEvent(new Event('load'));
+  }).catch(() => {
+    el._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', fullUrl, el);
+    el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
+    el.dispatchEvent(new Event('load'));
+  });
+}
+function _setElementSrc(value) {
+  const src = String(value);
+  this.setAttribute('src', src);
+  if (this.localName === 'iframe' && src && src !== 'about:blank') {
+    _loadIframeSrc(this, src);
+  }
+}
+function _installSrcReflection(C) {
+  Object.defineProperty(C.prototype, 'src', {
+    get: _getElementSrc,
+    set: _setElementSrc,
+    enumerable: true,
+    configurable: true,
+  });
+}
+function _copyElementReflections(C, names) {
+  for (const name of names) {
+    const descriptor = Object.getOwnPropertyDescriptor(Element.prototype, name);
+    if (descriptor) Object.defineProperty(C.prototype, name, descriptor);
+  }
+}
+
 // Media elements need canPlayType for codec detection fingerprinting.
 // Values match Chrome 145 on Linux x86_64 without proprietary codecs.
 class HTMLMediaElement extends Element {
@@ -3257,9 +3254,8 @@ class HTMLMediaElement extends Element {
   set volume(v) {}
   get muted() { return false; }
   set muted(v) {}
-  get src() { return this.getAttribute('src') || ''; }
-  set src(v) { this.setAttribute('src', v); }
 }
+_installSrcReflection(HTMLMediaElement);
 _markNative(HTMLMediaElement.prototype.canPlayType);
 _markNative(HTMLMediaElement.prototype.play);
 _markNative(HTMLMediaElement.prototype.load);
@@ -3276,6 +3272,13 @@ function _elementClassFor(nid) {
   if (tag === "AUDIO") return HTMLAudioElement;
   if (tag === "VIDEO") return HTMLVideoElement;
   if (tag === "CANVAS" && globalThis.HTMLCanvasElement) return globalThis.HTMLCanvasElement;
+  if (tag === "IMG" && globalThis.HTMLImageElement) return globalThis.HTMLImageElement;
+  if (tag === "INPUT" && globalThis.HTMLInputElement) return globalThis.HTMLInputElement;
+  if (tag === "IFRAME" && globalThis.HTMLIFrameElement) return globalThis.HTMLIFrameElement;
+  if (tag === "SCRIPT" && globalThis.HTMLScriptElement) return globalThis.HTMLScriptElement;
+  if (tag === "EMBED" && globalThis.HTMLEmbedElement) return globalThis.HTMLEmbedElement;
+  if (tag === "SOURCE" && globalThis.HTMLSourceElement) return globalThis.HTMLSourceElement;
+  if (tag === "TRACK" && globalThis.HTMLTrackElement) return globalThis.HTMLTrackElement;
   return Element;
 }
 let _constructElement = function(C, nid) { return new C(nid); };
@@ -3322,7 +3325,7 @@ function __currentUrl() {
 }
 globalThis.location = {
   get href() { return __currentUrl(); },
-  set href(url) { var r = _resolveUrl(url); globalThis.__virtualUrl = r; Deno.core.ops.op_navigate(r, 'GET', ''); },
+  set href(url) { var r = _resolveUrl(url); globalThis.__virtualUrl = r; _denoCore.ops.op_navigate(r, 'GET', ''); },
   get origin() { try { return new URL(this.href).origin; } catch { return ""; } },
   get protocol() { try { return new URL(this.href).protocol; } catch { return ""; } },
   get host() { try { return new URL(this.href).host; } catch { return ""; } },
@@ -3332,14 +3335,14 @@ globalThis.location = {
   get hash() { try { return new URL(this.href).hash; } catch { return ""; } },
   get port() { try { return new URL(this.href).port; } catch { return ""; } },
   toString() { return this.href; },
-  assign(url) { var r = _resolveUrl(url); globalThis.__virtualUrl = r; Deno.core.ops.op_navigate(r, 'GET', ''); },
-  reload() { var r = _resolveUrl(this.href); globalThis.__virtualUrl = r; Deno.core.ops.op_navigate(r, 'GET', ''); },
-  replace(url) { var r = _resolveUrl(url); globalThis.__virtualUrl = r; Deno.core.ops.op_navigate(r, 'GET', ''); },
+  assign(url) { var r = _resolveUrl(url); globalThis.__virtualUrl = r; _denoCore.ops.op_navigate(r, 'GET', ''); },
+  reload() { var r = _resolveUrl(this.href); globalThis.__virtualUrl = r; _denoCore.ops.op_navigate(r, 'GET', ''); },
+  replace(url) { var r = _resolveUrl(url); globalThis.__virtualUrl = r; _denoCore.ops.op_navigate(r, 'GET', ''); },
 };
 const _locationObj = globalThis.location;
 Object.defineProperty(globalThis, 'location', {
   get() { return _locationObj; },
-  set(url) { var r = _resolveUrl(String(url)); globalThis.__virtualUrl = r; Deno.core.ops.op_navigate(r, 'GET', ''); },
+  set(url) { var r = _resolveUrl(String(url)); globalThis.__virtualUrl = r; _denoCore.ops.op_navigate(r, 'GET', ''); },
   configurable: false,
   enumerable: true,
 });
@@ -3519,10 +3522,10 @@ _markNative(_networkInfoEventTarget.dispatchEvent);
 
 class NetworkInformation {
   constructor() { _networkInfoListeners.set(this, new Map()); }
-  get downlink() { return 1.5; }
-  get effectiveType() { return '4g'; }
-  get rtt() { return 100; }
-  get saveData() { return false; }
+  get downlink() { return _fingerprintProfile?.network?.downlink; }
+  get effectiveType() { return _fingerprintProfile?.network?.effectiveType; }
+  get rtt() { return _fingerprintProfile?.network?.rtt; }
+  get saveData() { return _fingerprintProfile?.network?.saveData; }
   get onchange() { return null; }
   set onchange(v) {}
 }
@@ -3818,7 +3821,7 @@ globalThis.Notification = class Notification {
 class Screen {
   constructor(token, profile) {
     if (token !== _screenToken) throw new TypeError('Illegal constructor');
-    _screenSlots.set(this, {profile, orientation: new ScreenOrientation(_screenOrientationToken)});
+    _screenSlots.set(this, {profile, orientation: new ScreenOrientation(_screenOrientationToken, profile)});
   }
   get width() { return _screenSlots.get(this).profile.width; }
   get height() { return _screenSlots.get(this).profile.height; }
@@ -3835,10 +3838,11 @@ const _screenSlots = new WeakMap();
 const _screenOrientationToken = {};
 const _screenOrientationSlots = new WeakMap();
 class ScreenOrientation {
-  constructor(token) {
+  constructor(token, profile) {
     if (token !== _screenOrientationToken) throw new TypeError('Illegal constructor');
     _networkInfoListeners.set(this, new Map());
-    _screenOrientationSlots.set(this, {type:'landscape-primary', angle:0, onchange:null});
+    const type = profile.width >= profile.height ? 'landscape-primary' : 'portrait-primary';
+    _screenOrientationSlots.set(this, {type, angle:0, onchange:null});
   }
   get type() { return _screenOrientationSlots.get(this).type; }
   get angle() { return _screenOrientationSlots.get(this).angle; }
@@ -4025,7 +4029,7 @@ globalThis.fetch = async (input, init = {}) => {
   const hdrs = JSON.stringify(_h);
   const fetchMode = init.mode || (input instanceof Request ? input.mode : "cors");
   const pageOrigin = (function() { try { const u = new URL(_domParse("document_url") || "about:blank"); return u.origin; } catch(e) { return ""; } })();
-  const raw = await Deno.core.ops.op_fetch_url(url, method, hdrs, body, pageOrigin, fetchMode);
+  const raw = await _denoCore.ops.op_fetch_url(url, method, hdrs, body, pageOrigin, fetchMode);
   const parsed = JSON.parse(raw);
   if (parsed.blocked) {
     const err = new TypeError('net::ERR_FAILED');
@@ -4329,14 +4333,14 @@ _markNative(XMLHttpRequest.prototype.getAllResponseHeaders);
 // the input is not a valid URL.
 function _urlParseOp(url, base) {
   try {
-    const s = Deno.core.ops.op_url_parse(String(url), (base === undefined || base === null) ? "" : String(base));
+    const s = _denoCore.ops.op_url_parse(String(url), (base === undefined || base === null) ? "" : String(base));
     const c = JSON.parse(s);
     return (c && c.ok) ? c : null;
   } catch (e) { return null; }
 }
 function _urlSetOp(href, part, value) {
   try {
-    const s = Deno.core.ops.op_url_set(String(href), part, String(value));
+    const s = _denoCore.ops.op_url_set(String(href), part, String(value));
     const c = JSON.parse(s);
     return (c && c.ok) ? c : null;
   } catch (e) { return null; }
@@ -4345,7 +4349,7 @@ function _urlSetOp(href, part, value) {
 // failure. Cheaper than _urlParseOp for callers that only need the href.
 function _urlResolveOp(href, base) {
   try {
-    const r = Deno.core.ops.op_url_resolve(String(href), (base === undefined || base === null) ? "" : String(base));
+    const r = _denoCore.ops.op_url_resolve(String(href), (base === undefined || base === null) ? "" : String(base));
     return r ? r : null;
   } catch (e) { return null; }
 }
@@ -4608,7 +4612,7 @@ if (typeof TextDecoder === 'undefined') {
       if (label === undefined) {
         name = 'utf-8';
       } else {
-        name = Deno.core.ops.op_encoding_for_label(String(label));
+        name = _denoCore.ops.op_encoding_for_label(String(label));
         if (!name) throw new RangeError("Failed to construct 'TextDecoder': The encoding label provided ('" + label + "') is invalid.");
       }
       const o = options || {};
@@ -4628,7 +4632,7 @@ if (typeof TextDecoder === 'undefined') {
         return _utf8DecodeBytes(bytes, off);
       }
       // Legacy encodings / fatal mode: encoding_rs via the op.
-      const r = JSON.parse(Deno.core.ops.op_text_decode(this.encoding, bytes, this.fatal, this.ignoreBOM));
+      const r = JSON.parse(_denoCore.ops.op_text_decode(this.encoding, bytes, this.fatal, this.ignoreBOM));
       if (!r.ok) throw new TypeError("Failed to execute 'decode' on 'TextDecoder': The encoded data was not valid.");
       return r.v;
     }
@@ -5872,12 +5876,12 @@ globalThis.Crypto = class Crypto {
     if (arr.byteLength > 65536) {
       throw new DOMException("The requested length exceeds 65536 bytes", "QuotaExceededError");
     }
-    const bytes = Deno.core.ops.op_random_bytes(arr.byteLength);
+    const bytes = _denoCore.ops.op_random_bytes(arr.byteLength);
     new Uint8Array(arr.buffer, arr.byteOffset, arr.byteLength).set(bytes);
     return arr;
   }
   randomUUID() {
-    const b = Deno.core.ops.op_random_bytes(16);
+    const b = _denoCore.ops.op_random_bytes(16);
     b[6] = (b[6] & 0x0f) | 0x40; // version 4
     b[8] = (b[8] & 0x3f) | 0x80; // variant 10xx
     let s = "";
@@ -6008,7 +6012,7 @@ const _storageSlot = (value) => {
 };
 const _storageSnapshot = (slot) => {
   if (slot.local) {
-    try { return JSON.parse(Deno.core.ops.op_local_storage('snapshot', '', '')); }
+    try { return JSON.parse(_denoCore.ops.op_local_storage('snapshot', '', '')); }
     catch (_) { return []; }
   }
   return Object.keys(slot.data).map(key => [key, slot.data[key]]);
@@ -6017,7 +6021,7 @@ Storage.prototype.getItem = function(k) {
   const slot = _storageSlot(this);
   k = String(k);
   if (slot.local) {
-    try { return JSON.parse(Deno.core.ops.op_local_storage('get', k, '')); }
+    try { return JSON.parse(_denoCore.ops.op_local_storage('get', k, '')); }
     catch (_) { return null; }
   }
   return Object.prototype.hasOwnProperty.call(slot.data, k) ? slot.data[k] : null;
@@ -6027,7 +6031,7 @@ Storage.prototype.setItem = function(k, v) {
   k = String(k); v = String(v);
   if (slot.local) {
     let stored = false;
-    try { stored = JSON.parse(Deno.core.ops.op_local_storage('set', k, v)); }
+    try { stored = JSON.parse(_denoCore.ops.op_local_storage('set', k, v)); }
     catch (_) {}
     if (!stored) throw new DOMException('Setting the value exceeded the quota.', 'QuotaExceededError');
     return;
@@ -6037,12 +6041,12 @@ Storage.prototype.setItem = function(k, v) {
 Storage.prototype.removeItem = function(k) {
   const slot = _storageSlot(this);
   k = String(k);
-  if (slot.local) Deno.core.ops.op_local_storage('remove', k, '');
+  if (slot.local) _denoCore.ops.op_local_storage('remove', k, '');
   else delete slot.data[k];
 };
 Storage.prototype.clear = function() {
   const slot = _storageSlot(this);
-  if (slot.local) Deno.core.ops.op_local_storage('clear', '', '');
+  if (slot.local) _denoCore.ops.op_local_storage('clear', '', '');
   else for (const k in slot.data) delete slot.data[k];
 };
 Storage.prototype.key = function(i) {
@@ -6213,8 +6217,8 @@ globalThis.HTMLDivElement = Element;
 globalThis.HTMLSpanElement = Element;
 globalThis.HTMLParagraphElement = Element;
 globalThis.HTMLAnchorElement = Element;
-globalThis.HTMLImageElement = Element;
-globalThis.HTMLInputElement = Element;
+globalThis.HTMLImageElement = class HTMLImageElement extends Element {};
+globalThis.HTMLInputElement = class HTMLInputElement extends Element {};
 globalThis.HTMLButtonElement = Element;
 globalThis.HTMLFormElement = class HTMLFormElement extends Element {
   get elements() { return HTMLCollection._from(this.querySelectorAll("input, select, textarea, button, fieldset, output, object")); }
@@ -6227,10 +6231,23 @@ globalThis.HTMLSelectElement = Element;
 globalThis.HTMLTextAreaElement = Element;
 globalThis.HTMLLabelElement = Element;
 globalThis.HTMLTableElement = Element;
-globalThis.HTMLIFrameElement = Element;
+globalThis.HTMLIFrameElement = class HTMLIFrameElement extends Element {};
 globalThis.HTMLCanvasElement = Element;
 // HTMLVideoElement and HTMLAudioElement are defined above with canPlayType support.
-globalThis.HTMLScriptElement = Element;
+globalThis.HTMLScriptElement = class HTMLScriptElement extends Element {};
+globalThis.HTMLEmbedElement = class HTMLEmbedElement extends Element {};
+globalThis.HTMLSourceElement = class HTMLSourceElement extends Element {};
+globalThis.HTMLTrackElement = class HTMLTrackElement extends Element {};
+for (const C of [HTMLImageElement, HTMLInputElement, HTMLIFrameElement, HTMLScriptElement,
+                 HTMLEmbedElement, HTMLSourceElement, HTMLTrackElement]) {
+  _installSrcReflection(C);
+  _markNative(C);
+}
+_copyElementReflections(HTMLInputElement, [
+  'value', 'valueAsNumber', 'valueAsDate', 'checked', 'disabled', 'type',
+  'name', 'placeholder', 'files', 'form',
+]);
+_copyElementReflections(HTMLIFrameElement, ['contentDocument', 'contentWindow']);
 globalThis.HTMLStyleElement = Element;
 globalThis.HTMLLinkElement = Element;
 globalThis.HTMLMetaElement = Element;
@@ -6314,7 +6331,7 @@ globalThis.HTMLDocument = class HTMLDocument extends Document {
     // navigation behavior, but match the native descriptor shape.
     Object.defineProperty(this, 'location', {
       get() { return globalThis.location; },
-      set(url) { Deno.core.ops.op_navigate(_resolveUrl(String(url)), 'GET', ''); },
+      set(url) { _denoCore.ops.op_navigate(_resolveUrl(String(url)), 'GET', ''); },
       enumerable: true,
       configurable: false,
     });
@@ -8011,7 +8028,7 @@ if (!globalThis.crypto.subtle) {
           name !== "SHA-512/224" && name !== "SHA-512/256") {
         throw new DOMException("Unrecognized algorithm name", "NotSupportedError");
       }
-      return bufferOf(Deno.core.ops.op_subtle_digest(name, toBytes(data)));
+      return bufferOf(_denoCore.ops.op_subtle_digest(name, toBytes(data)));
     },
 
     async importKey(format, keyData, algorithm, extractable, keyUsages) {
@@ -8051,14 +8068,14 @@ if (!globalThis.crypto.subtle) {
       if (alg.name === "HMAC") {
         const hash = normalizeHash(alg.hash);
         const len = alg.length ? Math.ceil(alg.length / 8) : hashBlockSize(hash);
-        const bytes = Deno.core.ops.op_random_bytes(len);
+        const bytes = _denoCore.ops.op_random_bytes(len);
         return makeKey("secret", extractable, { name: "HMAC", hash: { name: hash }, length: len * 8 }, keyUsages, bytes);
       }
       if (alg.name === "AES-CTR" || alg.name === "AES-CBC" || alg.name === "AES-GCM" || alg.name === "AES-KW") {
         if (alg.length !== 128 && alg.length !== 192 && alg.length !== 256) {
           throw new DOMException("AES key length must be 128, 192, or 256 bits", "OperationError");
         }
-        const bytes = Deno.core.ops.op_random_bytes(alg.length / 8);
+        const bytes = _denoCore.ops.op_random_bytes(alg.length / 8);
         return makeKey("secret", extractable, { name: alg.name, length: alg.length }, keyUsages, bytes);
       }
       throw new DOMException("generateKey does not support " + alg.name, "NotSupportedError");
@@ -8069,7 +8086,7 @@ if (!globalThis.crypto.subtle) {
       const bytes = keyBytes(key);
       if (alg.name === "HMAC") {
         const hash = key.algorithm && key.algorithm.hash ? key.algorithm.hash.name : normalizeHash(alg.hash);
-        return bufferOf(runOp(() => Deno.core.ops.op_subtle_hmac(hash, bytes, toBytes(data))));
+        return bufferOf(runOp(() => _denoCore.ops.op_subtle_hmac(hash, bytes, toBytes(data))));
       }
       throw new DOMException("sign does not support " + alg.name, "NotSupportedError");
     },
@@ -8079,7 +8096,7 @@ if (!globalThis.crypto.subtle) {
       const bytes = keyBytes(key);
       if (alg.name === "HMAC") {
         const hash = key.algorithm && key.algorithm.hash ? key.algorithm.hash.name : normalizeHash(alg.hash);
-        const mac = runOp(() => Deno.core.ops.op_subtle_hmac(hash, bytes, toBytes(data)));
+        const mac = runOp(() => _denoCore.ops.op_subtle_hmac(hash, bytes, toBytes(data)));
         const sig = toBytes(signature);
         if (sig.length !== mac.length) return false;
         let diff = 0;
@@ -8100,13 +8117,13 @@ if (!globalThis.crypto.subtle) {
         const hash = normalizeHash(alg.hash);
         const salt = toBytes(alg.salt);
         const iterations = alg.iterations >>> 0;
-        return bufferOf(runOp(() => Deno.core.ops.op_subtle_pbkdf2(hash, bytes, salt, iterations, lenBytes)));
+        return bufferOf(runOp(() => _denoCore.ops.op_subtle_pbkdf2(hash, bytes, salt, iterations, lenBytes)));
       }
       if (alg.name === "HKDF") {
         const hash = normalizeHash(alg.hash);
         const salt = alg.salt != null ? toBytes(alg.salt) : new Uint8Array(0);
         const info = alg.info != null ? toBytes(alg.info) : new Uint8Array(0);
-        return bufferOf(runOp(() => Deno.core.ops.op_subtle_hkdf(hash, bytes, salt, info, lenBytes)));
+        return bufferOf(runOp(() => _denoCore.ops.op_subtle_hkdf(hash, bytes, salt, info, lenBytes)));
       }
       throw new DOMException("deriveBits does not support " + alg.name, "NotSupportedError");
     },
@@ -8156,16 +8173,16 @@ if (!globalThis.crypto.subtle) {
       if (tagLength !== 128) {
         throw new DOMException("Only a 128-bit AES-GCM tag length is supported", "NotSupportedError");
       }
-      return bufferOf(runOp(() => Deno.core.ops.op_subtle_aes_gcm(encrypt, bytes, iv, aad, input)));
+      return bufferOf(runOp(() => _denoCore.ops.op_subtle_aes_gcm(encrypt, bytes, iv, aad, input)));
     }
     if (alg.name === "AES-CBC") {
       const iv = toBytes(alg.iv);
-      return bufferOf(runOp(() => Deno.core.ops.op_subtle_aes_cbc(encrypt, bytes, iv, input)));
+      return bufferOf(runOp(() => _denoCore.ops.op_subtle_aes_cbc(encrypt, bytes, iv, input)));
     }
     if (alg.name === "AES-CTR") {
       const counter = toBytes(alg.counter);
       const length = alg.length >>> 0;
-      return bufferOf(runOp(() => Deno.core.ops.op_subtle_aes_ctr(bytes, counter, length, input)));
+      return bufferOf(runOp(() => _denoCore.ops.op_subtle_aes_ctr(bytes, counter, length, input)));
     }
     throw new DOMException((encrypt ? "encrypt" : "decrypt") + " does not support " + alg.name, "NotSupportedError");
   }
@@ -8662,6 +8679,17 @@ globalThis.__obscura_init = function() {
   for (let i = 0; i < toHide.length; i++) {
     try { Object.defineProperty(globalThis, toHide[i], { enumerable: false }); } catch(e) {}
   }
+  // deno_core needs Deno.core while it restores the startup snapshot. Remove
+  // the host object only after runtime binding setup, before page code runs.
+  try {
+    Object.defineProperty(globalThis, 'Deno', {
+      value: undefined,
+      writable: true,
+      configurable: true,
+      enumerable: false,
+    });
+    delete globalThis.Deno;
+  } catch (_) {}
   delete globalThis.__obscura_init;
 };
 
@@ -8677,10 +8705,6 @@ globalThis.__obscura_init = function() {
 globalThis.__obscura_hide_list = Object.getOwnPropertyNames(globalThis).filter(k =>
   k.startsWith('_') || k.includes('obscura') || k.includes('Obscura')
 );
-// deno_core's bridge is required internally but is not a browser global.
-// Keep the property for the host runtime and hide it from global reflection.
-globalThis.__obscura_hide_list.push('Deno');
-
 /* ===== WPT conformance shims: batch 2 ===== */
 
 // ---- Node namespace lookup methods ----

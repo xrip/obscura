@@ -15,14 +15,11 @@ use url::Url;
 #[cfg(feature = "stealth")]
 use crate::cookies::CookieJar;
 #[cfg(feature = "stealth")]
-use crate::client::{Response, ObscuraNetError};
+use crate::client::{CallbackRegistry, RequestInfo, ResourceType, Response, ObscuraNetError};
 
 #[cfg(feature = "stealth")]
 pub const STEALTH_USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
-#[cfg(feature = "stealth")]
-const STEALTH_SEC_CH_UA: &str = r#""Not:A-Brand";v="99", "Google Chrome";v="145", "Chromium";v="145""#;
-
 // The wreq emulation (Profile::Chrome145, Platform::Windows) sends this exact
 // UA and sec-ch-ua-platform "Windows" on the wire. navigator has to report the
 // same identity, otherwise the TLS/HTTP layer and the JS layer disagree and a
@@ -35,9 +32,50 @@ pub const STEALTH_UA_PLATFORM: &str = "Windows";
 pub const STEALTH_UA_PLATFORM_VERSION: &str = "15.0.0";
 
 #[cfg(feature = "stealth")]
+struct StealthSsrfResolver {
+    allow_private_network: bool,
+}
+
+#[cfg(feature = "stealth")]
+impl StealthSsrfResolver {
+    fn new(allow_private_network: bool) -> Self {
+        Self { allow_private_network }
+    }
+}
+
+#[cfg(feature = "stealth")]
+impl wreq::dns::Resolve for StealthSsrfResolver {
+    fn resolve(&self, name: wreq::dns::Name) -> wreq::dns::Resolving {
+        let allow_private_network =
+            self.allow_private_network || crate::client::env_allows_private_network();
+        let host = name.as_str().to_string();
+        Box::pin(async move {
+            let addresses: Vec<std::net::SocketAddr> =
+                tokio::net::lookup_host((host.as_str(), 0)).await?.collect();
+            if !allow_private_network {
+                if let Some(address) = addresses
+                    .iter()
+                    .find(|address| crate::client::is_forbidden_ip(address.ip()))
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        format!("SSRF blocked: '{host}' resolves to forbidden address {address}"),
+                    )
+                    .into());
+                }
+            }
+            Ok(Box::new(addresses.into_iter()) as wreq::dns::Addrs)
+        })
+    }
+}
+
+#[cfg(feature = "stealth")]
 pub struct StealthHttpClient {
     client: wreq::Client,
     user_agent: String,
+    sec_ch_ua: String,
+    sec_ch_ua_platform: String,
+    allow_private_network: bool,
     pub cookie_jar: Arc<CookieJar>,
     pub extra_headers: RwLock<HashMap<String, String>>,
     pub in_flight: Arc<std::sync::atomic::AtomicU32>,
@@ -58,6 +96,25 @@ impl StealthHttpClient {
         proxy_url: Option<&str>,
         user_agent: &str,
     ) -> Self {
+        let (sec_ch_ua, sec_ch_ua_platform) = crate::client::chrome_client_hints(user_agent);
+        Self::with_browser_identity(
+            cookie_jar,
+            proxy_url,
+            user_agent,
+            &sec_ch_ua,
+            &sec_ch_ua_platform,
+            false,
+        )
+    }
+
+    pub fn with_browser_identity(
+        cookie_jar: Arc<CookieJar>,
+        proxy_url: Option<&str>,
+        user_agent: &str,
+        sec_ch_ua: &str,
+        sec_ch_ua_platform: &str,
+        allow_private_network: bool,
+    ) -> Self {
         let emulation_opts = wreq_util::Emulation::builder()
             .profile(wreq_util::Profile::Chrome145)
             .platform(wreq_util::Platform::Windows)
@@ -66,7 +123,8 @@ impl StealthHttpClient {
         let mut builder = wreq::Client::builder()
             .emulation(emulation_opts)
             .timeout(Duration::from_secs(30))
-            .redirect(wreq::redirect::Policy::none());
+            .redirect(wreq::redirect::Policy::none())
+            .dns_resolver(StealthSsrfResolver::new(allow_private_network));
 
         // Honor SSL_CERT_FILE / SSL_CERT_DIR in the stealth client too.
         //
@@ -112,6 +170,9 @@ impl StealthHttpClient {
         StealthHttpClient {
             client,
             user_agent: user_agent.to_owned(),
+            sec_ch_ua: sec_ch_ua.to_owned(),
+            sec_ch_ua_platform: sec_ch_ua_platform.to_owned(),
+            allow_private_network,
             cookie_jar,
             extra_headers: RwLock::new(HashMap::new()),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -119,7 +180,7 @@ impl StealthHttpClient {
     }
 
     pub async fn fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {
-        self.fetch_with_referrer(url, None).await
+        self.fetch_with_context(url, None, None, ResourceType::Document).await
     }
 
     pub async fn fetch_with_referrer(
@@ -127,38 +188,78 @@ impl StealthHttpClient {
         url: &Url,
         referrer: Option<&Url>,
     ) -> Result<Response, ObscuraNetError> {
+        self.fetch_with_context(url, referrer, None, ResourceType::Document)
+            .await
+    }
+
+    pub async fn fetch_with_context(
+        &self,
+        url: &Url,
+        referrer: Option<&Url>,
+        callbacks: Option<&CallbackRegistry>,
+        resource_type: ResourceType,
+    ) -> Result<Response, ObscuraNetError> {
+        crate::client::validate_url(url, self.allow_private_network)?;
         let mut current_url = url.clone();
-
-        if let Some(host) = current_url.host_str() {
-            if crate::blocklist::is_blocked(host) {
-                tracing::debug!("Blocked tracker: {}", current_url);
-                return Ok(Response {
-                    status: 0,
-                    url: current_url,
-                    headers: HashMap::new(),
-                    body: Vec::new(),
-                    redirected_from: Vec::new(),
-                });
-            }
-        }
-
         let mut redirects = Vec::new();
 
         for _ in 0..20 {
+            crate::client::validate_url(&current_url, self.allow_private_network)?;
+            if let Some(host) = current_url.host_str() {
+                if crate::blocklist::is_blocked(host) {
+                    tracing::debug!("Blocked tracker: {}", current_url);
+                    return Ok(Response {
+                        status: 0,
+                        url: current_url,
+                        headers: HashMap::new(),
+                        body: Vec::new(),
+                        redirected_from: Vec::new(),
+                    });
+                }
+            }
+
+            let referrer = referrer.and_then(|value| referrer_for_target(value, &current_url));
+            let extra_headers = self.extra_headers.read().await.clone();
+            let cookie_header = self.cookie_jar.get_cookie_header(&current_url);
+            let mut callback_headers = extra_headers.clone();
+            callback_headers.insert("user-agent".to_string(), self.user_agent.clone());
+            callback_headers.insert("sec-ch-ua".to_string(), self.sec_ch_ua.clone());
+            callback_headers.insert(
+                "sec-ch-ua-platform".to_string(),
+                self.sec_ch_ua_platform.clone(),
+            );
+            if let Some(referrer) = referrer.as_ref() {
+                callback_headers.insert("referer".to_string(), referrer.to_string());
+            }
+            if !cookie_header.is_empty() {
+                callback_headers.insert("cookie".to_string(), cookie_header.clone());
+            }
+            let request_info = RequestInfo {
+                url: current_url.clone(),
+                method: "GET".to_string(),
+                headers: callback_headers,
+                resource_type: resource_type.clone(),
+            };
+            if let Some(callbacks) = callbacks {
+                callbacks.fire_request(&request_info).await;
+            }
+
             let mut req = self
                 .client
                 .get(current_url.as_str())
-                .header("user-agent", self.user_agent.as_str());
-            if let Some(referrer) = referrer {
+                .header("user-agent", self.user_agent.as_str())
+                .header("sec-ch-ua", self.sec_ch_ua.as_str())
+                .header("sec-ch-ua-mobile", "?0")
+                .header("sec-ch-ua-platform", self.sec_ch_ua_platform.as_str());
+            if let Some(referrer) = referrer.as_ref() {
                 req = req.header("referer", referrer.as_str());
             }
 
-            let cookie_header = self.cookie_jar.get_cookie_header(&current_url);
             if !cookie_header.is_empty() {
                 req = req.header("Cookie", &cookie_header);
             }
 
-            for (k, v) in self.extra_headers.read().await.iter() {
+            for (k, v) in &extra_headers {
                 req = req.header(k.as_str(), v.as_str());
             }
 
@@ -191,6 +292,7 @@ impl StealthHttpClient {
                     let next_url = current_url.join(location_str).map_err(|e| {
                         ObscuraNetError::Network(format!("Invalid redirect URL: {}", e))
                     })?;
+                    crate::client::validate_url(&next_url, self.allow_private_network)?;
                     redirects.push(current_url.clone());
                     current_url = next_url;
                     continue;
@@ -201,13 +303,17 @@ impl StealthHttpClient {
                 ObscuraNetError::Network(format!("Failed to read body: {}", e))
             })?.to_vec();
 
-            return Ok(Response {
+            let response = Response {
                 url: current_url,
                 status: status.as_u16(),
                 headers: response_headers,
                 body,
                 redirected_from: redirects,
-            });
+            };
+            if let Some(callbacks) = callbacks {
+                callbacks.fire_response(&request_info, &response).await;
+            }
+            return Ok(response);
         }
 
         Err(ObscuraNetError::TooManyRedirects(url.to_string()))
@@ -227,6 +333,7 @@ impl StealthHttpClient {
         headers: &HashMap<String, String>,
         body: &str,
     ) -> Result<Response, ObscuraNetError> {
+        crate::client::validate_url(url, self.allow_private_network)?;
         if let Some(host) = url.host_str() {
             if crate::blocklist::is_blocked(host) {
                 tracing::debug!("Blocked tracker: {}", url);
@@ -250,9 +357,9 @@ impl StealthHttpClient {
             // navigation. JS fetch()/XHR has a different Fetch metadata
             // contract, so build that small common browser header set here.
             .default_headers(false)
-            .header("sec-ch-ua", STEALTH_SEC_CH_UA)
+            .header("sec-ch-ua", self.sec_ch_ua.as_str())
             .header("sec-ch-ua-mobile", "?0")
-            .header("sec-ch-ua-platform", "\"Windows\"")
+            .header("sec-ch-ua-platform", self.sec_ch_ua_platform.as_str())
             .header("user-agent", self.user_agent.as_str());
 
         let cookie_header = self.cookie_jar.get_cookie_header(url);
@@ -312,5 +419,97 @@ impl StealthHttpClient {
 
     pub fn is_network_idle(&self) -> bool {
         self.active_requests() == 0
+    }
+}
+
+#[cfg(feature = "stealth")]
+fn referrer_for_target(referrer: &Url, target: &Url) -> Option<Url> {
+    if referrer.scheme() == "https" && target.scheme() == "http" {
+        return None;
+    }
+    if referrer.origin().ascii_serialization() == target.origin().ascii_serialization() {
+        let mut value = referrer.clone();
+        value.set_fragment(None);
+        return Some(value);
+    }
+    Url::parse(&referrer.origin().ascii_serialization()).ok()
+}
+
+#[cfg(all(test, feature = "stealth"))]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[tokio::test]
+    async fn private_targets_are_blocked_before_the_request() {
+        let client = StealthHttpClient::new(Arc::new(CookieJar::new()));
+        let error = client
+            .fetch(&Url::parse("http://127.0.0.1/private").unwrap())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("private/internal IP address"));
+    }
+
+    #[tokio::test]
+    async fn profile_headers_referrer_and_callbacks_share_the_stealth_path() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut chunk).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .unwrap();
+            String::from_utf8(request).unwrap()
+        });
+
+        let sec_ch_ua = r#""Profile Brand";v="145", "Chromium";v="145""#;
+        let client = StealthHttpClient::with_browser_identity(
+            Arc::new(CookieJar::new()),
+            None,
+            "Profile User Agent",
+            sec_ch_ua,
+            r#""Windows""#,
+            true,
+        );
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let response_count = Arc::new(AtomicUsize::new(0));
+        let callbacks = CallbackRegistry::new();
+        let request_count_clone = request_count.clone();
+        callbacks.add_request(Arc::new(move |info| {
+            assert_eq!(info.resource_type, ResourceType::Script);
+            assert_eq!(info.headers.get("sec-ch-ua").map(String::as_str), Some(sec_ch_ua));
+            request_count_clone.fetch_add(1, Ordering::Relaxed);
+        }));
+        let response_count_clone = response_count.clone();
+        callbacks.add_response(Arc::new(move |_, response| {
+            assert_eq!(response.status, 200);
+            response_count_clone.fetch_add(1, Ordering::Relaxed);
+        }));
+
+        let target = Url::parse(&format!("http://{address}/asset.js")).unwrap();
+        let referrer = Url::parse(&format!("http://{address}/page#fragment")).unwrap();
+        let response = client
+            .fetch_with_context(&target, Some(&referrer), Some(&callbacks), ResourceType::Script)
+            .await
+            .unwrap();
+        assert_eq!(response.body, b"ok");
+        assert_eq!(request_count.load(Ordering::Relaxed), 1);
+        assert_eq!(response_count.load(Ordering::Relaxed), 1);
+
+        let request = server.await.unwrap().to_ascii_lowercase();
+        assert!(request.contains("user-agent: profile user agent\r\n"));
+        assert!(request.contains(&format!("sec-ch-ua: {}\r\n", sec_ch_ua.to_ascii_lowercase())));
+        assert!(request.contains(&format!("referer: http://{address}/page\r\n")));
     }
 }

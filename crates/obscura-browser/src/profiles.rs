@@ -156,6 +156,15 @@ pub struct BrowserIdentity {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct NetworkIdentity {
+    pub downlink: f64,
+    pub rtt: u32,
+    pub effective_type: String,
+    pub save_data: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NavigatorIdentity {
     pub platform: String,
     pub ua_platform: String,
@@ -168,6 +177,26 @@ pub struct NavigatorIdentity {
     pub hardware_concurrency: u32,
     pub device_memory: f64,
     pub max_touch_points: u32,
+}
+
+impl NavigatorIdentity {
+    pub fn sec_ch_ua_header(&self) -> String {
+        self.brands
+            .iter()
+            .map(|brand| {
+                format!(
+                    "\"{}\";v=\"{}\"",
+                    escape_client_hint(&brand.brand),
+                    escape_client_hint(&brand.version),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    pub fn sec_ch_ua_platform_header(&self) -> String {
+        format!("\"{}\"", escape_client_hint(&self.ua_platform))
+    }
 }
 
 #[derive(Serialize)]
@@ -193,6 +222,7 @@ struct RuntimeFingerprint<'a> {
     render_seed: &'a str,
     browser: &'a BrowserIdentity,
     navigator: &'a NavigatorIdentity,
+    network: &'a NetworkIdentity,
     screen: &'a ScreenWindowProfile,
     graphics: RuntimeGraphics<'a>,
 }
@@ -202,6 +232,7 @@ pub struct ResolvedFingerprintProfile {
     pub id: String,
     pub browser: BrowserIdentity,
     pub navigator: NavigatorIdentity,
+    pub network: NetworkIdentity,
     pub screen: ScreenWindowProfile,
     pub graphics: GraphicsProfile,
     pub webgl1: Value,
@@ -628,12 +659,14 @@ fn compose_selected(
         device_memory: base.device_memory,
         max_touch_points: base.max_touch_points,
     };
+    let network = network_identity(base_id);
     let runtime = RuntimeFingerprint {
         id: &id,
         catalog_id,
         render_seed: &render_seed,
         browser: &browser,
         navigator: &navigator,
+        network: &network,
         screen,
         graphics: RuntimeGraphics {
             id: &graphics.id,
@@ -654,6 +687,7 @@ fn compose_selected(
         id,
         browser,
         navigator,
+        network,
         screen: screen.clone(),
         graphics: graphics.clone(),
         webgl1,
@@ -662,6 +696,23 @@ fn compose_selected(
         render_seed,
         runtime_json,
     })
+}
+
+fn escape_client_hint(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+fn network_identity(base_id: &str) -> NetworkIdentity {
+    let mut hasher = Sha256::new();
+    hasher.update(b"network-profile-v1");
+    hasher.update(base_id.as_bytes());
+    let digest = hasher.finalize();
+    NetworkIdentity {
+        downlink: f64::from(26 + digest[0] % 9) / 20.0,
+        rtt: 50 + u32::from(digest[1] % 5) * 25,
+        effective_type: "4g".to_string(),
+        save_data: false,
+    }
 }
 
 fn component_value(components: &[CatalogComponent], id: &str) -> Result<Value, ProfileError> {
@@ -723,6 +774,22 @@ mod tests {
         assert_eq!(first.runtime_json, second.runtime_json);
         assert_eq!(first.id, fast.id);
         assert_eq!(first.runtime_json, fast.runtime_json);
+
+        let runtime: Value = serde_json::from_str(first.runtime_json()).unwrap();
+        assert!(runtime["network"]["downlink"].as_f64().unwrap() > 0.0);
+        assert!(runtime["network"]["rtt"].as_u64().unwrap() > 0);
+        assert_eq!(runtime["network"]["effectiveType"], "4g");
+        let ua_header = first.navigator.sec_ch_ua_header();
+        for brand in &first.navigator.brands {
+            assert!(ua_header.contains(&format!(
+                "\"{}\";v=\"{}\"",
+                brand.brand, brand.version
+            )));
+        }
+        assert_eq!(
+            first.navigator.sec_ch_ua_platform_header(),
+            format!("\"{}\"", first.navigator.ua_platform)
+        );
     }
 
     #[test]

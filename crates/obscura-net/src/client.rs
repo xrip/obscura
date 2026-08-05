@@ -316,7 +316,7 @@ impl Resolve for SsrfGuardResolver {
     }
 }
 
-fn validate_url(url: &Url, allow_private_network: bool) -> Result<(), ObscuraNetError> {
+pub(crate) fn validate_url(url: &Url, allow_private_network: bool) -> Result<(), ObscuraNetError> {
     let allow_private_network = allow_private_network || env_allows_private_network();
     let scheme = url.scheme();
     if scheme != "http" && scheme != "https" && scheme != "file" {
@@ -422,7 +422,7 @@ pub struct ObscuraHttpClient {
 /// User-Agent string, using Chromium's per-major-version GREASE algorithm so
 /// the non-stealth HTTP path agrees with navigator.userAgentData instead of
 /// shipping a fixed Linux/Chrome-145 hint that contradicts a Windows profile.
-fn chrome_client_hints(ua: &str) -> (String, String) {
+pub(crate) fn chrome_client_hints(ua: &str) -> (String, String) {
     let major: usize = ua
         .split("Chrome/")
         .nth(1)

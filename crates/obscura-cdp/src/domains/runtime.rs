@@ -320,7 +320,7 @@ pub async fn handle(
                         if (arguments.length !== 1) return;\
                         try {{\
                             const payload = typeof arg === 'string' ? arg : String(arg);\
-                            Deno.core.ops.op_binding_called('{name}', payload);\
+                            globalThis.__obscura_bindingCalled('{name}', payload);\
                         }} catch (e) {{ /* swallow: binding must not throw into page */ }}\
                     }};",
                     name = name,
@@ -526,5 +526,39 @@ mod tests {
             .await
             .expect("Runtime.enable must succeed even with no session");
         assert_eq!(result, json!({}));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn add_binding_reaches_the_host_after_deno_is_hidden() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session = Some(format!("{page_id}-session"));
+        ctx.sessions.insert(session.clone().unwrap(), page_id);
+
+        crate::domains::page::handle(
+            "navigate",
+            &json!({ "url": "data:text/html,<main></main>", "waitUntil": "load" }),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("navigation should succeed");
+
+        handle(
+            "addBinding",
+            &json!({ "name": "hostBinding" }),
+            &mut ctx,
+            &session,
+        )
+        .await
+        .expect("binding installation should succeed");
+
+        let page = ctx.get_session_page_mut(&session).unwrap();
+        assert_eq!(page.evaluate("typeof Deno"), json!("undefined"));
+        page.evaluate("hostBinding(42)");
+        assert_eq!(
+            page.take_pending_binding_calls(),
+            vec![("hostBinding".to_string(), "42".to_string())]
+        );
     }
 }
