@@ -60,6 +60,11 @@
 
 // Keep the host bridge in this closure. Page code must not see a Deno global.
 const _denoCore = globalThis.Deno.core;
+// Handoff for child frame realms. A realm restored from the snapshot has its
+// own empty `Deno.core.ops`, so the host copies this realm's op functions into
+// it. Page script must never see this: `__obscura_init` deletes it, exactly as
+// it does for the raw fingerprint profile.
+globalThis.__obscura_core_handoff = _denoCore;
 
 globalThis.__obscura_errors = [];
 

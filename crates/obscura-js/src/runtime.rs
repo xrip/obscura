@@ -26,6 +26,16 @@ static SNAPSHOT: &[u8] = include_bytes!(env!("OBSCURA_SNAPSHOT_PATH"));
 /// parallel, each isolate on its own thread with no shared lock.
 static ISOLATE_CREATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// Renders a caught V8 exception as a message for realm evaluation errors.
+fn exception_text(
+    scope: &mut deno_core::v8::TryCatch<'_, deno_core::v8::HandleScope<'_>>,
+) -> String {
+    match scope.exception() {
+        Some(exception) => exception.to_rust_string_lossy(scope),
+        None => "unknown error".to_string(),
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RemoteObjectInfo {
     pub js_type: String,
@@ -46,6 +56,11 @@ pub struct ObscuraJsRuntime {
     /// construction. Lets a watchdog be armed from `&self` (the CDP dispatcher
     /// only holds `&Page` on the hot path) and is stable for the isolate's life.
     isolate_handle: IsolateHandle,
+    /// The bound op table, taken from bootstrap at construction and removed from
+    /// the global in the same step. Child frame realms are handed this object so
+    /// their shims can call ops; nothing else can reach it, including page
+    /// script.
+    ops_handoff: Option<deno_core::v8::Global<deno_core::v8::Value>>,
 }
 
 /// Handle to an armed V8 execution watchdog (see [`ObscuraJsRuntime::arm_watchdog`]).
@@ -198,14 +213,184 @@ impl ObscuraJsRuntime {
             (runtime, isolate_handle)
         };
 
-        ObscuraJsRuntime {
+        let mut instance = ObscuraJsRuntime {
             runtime,
             state,
             module_loader: module_loader_for_runtime,
             object_store: HashMap::new(),
             object_counter: 0,
             isolate_handle,
+            ops_handoff: None,
+        };
+        // Take the op table before any page script can run, and drop the global
+        // that exposed it in the same step.
+        instance.ops_handoff = instance.take_ops_handoff();
+        instance
+    }
+
+    /// Creates an additional realm in this isolate: a second `v8::Context`.
+    ///
+    /// The startup snapshot already contains the whole bootstrap (see
+    /// `build.rs`), so a context restored from it arrives with every DOM class
+    /// and shim installed. Building a realm is therefore a context restore, not
+    /// a re-parse of ~9,700 lines.
+    ///
+    /// The new context has no ops: deno_core binds those into the main context
+    /// only. Use [`Self::share_ops_with_realm`] to give it the same `Deno.core`
+    /// object, which is legal because native function objects are shareable
+    /// between contexts of one isolate.
+    pub(crate) fn create_realm_context(&mut self) -> Option<deno_core::v8::Global<deno_core::v8::Context>> {
+        let isolate = self.runtime.v8_isolate();
+        let scope = &mut deno_core::v8::HandleScope::new(isolate);
+        let context = deno_core::v8::Context::from_snapshot(
+            scope,
+            1,
+            deno_core::v8::ContextOptions::default(),
+        )
+        .or_else(|| {
+            deno_core::v8::Context::from_snapshot(
+                scope,
+                0,
+                deno_core::v8::ContextOptions::default(),
+            )
+        })?;
+        Some(deno_core::v8::Global::new(scope, context))
+    }
+
+    /// Takes the ops object bootstrap handed out, and removes the handoff from
+    /// the global so page script can never reach `Deno.core.ops`.
+    ///
+    /// deno_core hides `globalThis.Deno` after setup and bootstrap keeps its
+    /// reference in a private const, so this handoff is the only way for the
+    /// host to reach the bound op functions and pass them to a child realm.
+    fn take_ops_handoff(&mut self) -> Option<deno_core::v8::Global<deno_core::v8::Value>> {
+        use deno_core::v8;
+
+        let main = self.runtime.main_context();
+        let isolate = self.runtime.v8_isolate();
+        let scope = &mut v8::HandleScope::new(isolate);
+        let context = v8::Local::new(scope, main);
+        let scope = &mut v8::ContextScope::new(scope, context);
+
+        let handoff_key = v8::String::new(scope, "__obscura_core_handoff")?;
+        let ops_key = v8::String::new(scope, "ops")?;
+        let global = context.global(scope);
+
+        let core = global.get(scope, handoff_key.into())?;
+        let core = core.to_object(scope)?;
+        let ops = core.get(scope, ops_key.into())?;
+        if !ops.is_object() {
+            return None;
         }
+        let ops = v8::Global::new(scope, ops);
+        global.delete(scope, handoff_key.into());
+        Some(ops)
+    }
+
+    /// Points a child realm's `Deno.core.ops` at the main realm's ops object.
+    ///
+    /// A realm restored from the snapshot has its own `Deno.core` with an empty
+    /// ops table, and its bootstrap captured that exact object, so replacing the
+    /// `ops` property on it is enough to give every shim in that realm a working
+    /// op surface. The functions are shared, not copied: same isolate.
+    pub(crate) fn share_ops_with_realm(
+        &mut self,
+        realm: &deno_core::v8::Global<deno_core::v8::Context>,
+    ) -> bool {
+        use deno_core::v8;
+
+        let Some(ops) = self.ops_handoff.clone() else {
+            return false;
+        };
+        let isolate = self.runtime.v8_isolate();
+        let scope = &mut v8::HandleScope::new(isolate);
+        let context = v8::Local::new(scope, realm);
+        let scope = &mut v8::ContextScope::new(scope, context);
+
+        let Some(handoff_key) = v8::String::new(scope, "__obscura_core_handoff") else {
+            return false;
+        };
+        let Some(ops_key) = v8::String::new(scope, "ops") else {
+            return false;
+        };
+        let global = context.global(scope);
+        let Some(core) = global.get(scope, handoff_key.into()) else {
+            return false;
+        };
+        let Some(core) = core.to_object(scope) else {
+            return false;
+        };
+        // `Deno.core.ops` is non-writable and non-configurable, so the table
+        // cannot be swapped wholesale: V8 reports success and changes nothing.
+        // Copy the bound op functions into the realm's existing table instead.
+        let Some(target) = core
+            .get(scope, ops_key.into())
+            .and_then(|value| value.to_object(scope))
+        else {
+            return false;
+        };
+        let source = v8::Local::new(scope, ops);
+        let Some(source) = source.to_object(scope) else {
+            return false;
+        };
+        let Some(names) = source.get_own_property_names(scope, Default::default()) else {
+            return false;
+        };
+        let mut copied = 0;
+        for index in 0..names.length() {
+            let Some(key) = names.get_index(scope, index) else {
+                continue;
+            };
+            let Some(value) = source.get(scope, key) else {
+                continue;
+            };
+            if target.set(scope, key, value).unwrap_or(false) {
+                copied += 1;
+            }
+        }
+        // The child realm must not expose the handoff to frame script either.
+        global.delete(scope, handoff_key.into());
+        copied > 0
+    }
+
+    /// Runs `source` inside `realm` and returns its value as a string, for the
+    /// realm feasibility checks. Errors come back as `Err(message)`.
+    pub(crate) fn eval_in_realm(
+        &mut self,
+        realm: &deno_core::v8::Global<deno_core::v8::Context>,
+        source: &str,
+    ) -> Result<String, String> {
+        use deno_core::v8;
+
+        let isolate = self.runtime.v8_isolate();
+        let scope = &mut v8::HandleScope::new(isolate);
+        let context = v8::Local::new(scope, realm);
+        let scope = &mut v8::ContextScope::new(scope, context);
+        let scope = &mut v8::TryCatch::new(scope);
+
+        let code = v8::String::new(scope, source).ok_or("source too large")?;
+        let script = match v8::Script::compile(scope, code, None) {
+            Some(script) => script,
+            None => return Err(exception_text(scope)),
+        };
+        match script.run(scope) {
+            Some(value) => {
+                let text = value.to_rust_string_lossy(scope);
+                Ok(text)
+            }
+            None => Err(exception_text(scope)),
+        }
+    }
+
+    /// Swaps the state every op reads. Only one realm runs at a time, so the
+    /// frame's DOM, URL and origin can be made current for the duration of that
+    /// realm's work and then restored, without touching any op signature.
+    pub(crate) fn swap_op_state(&mut self, replacement: Rc<RefCell<ObscuraState>>) -> Rc<RefCell<ObscuraState>> {
+        let op_state = self.runtime.op_state();
+        let mut op_state = op_state.borrow_mut();
+        let previous = op_state.borrow::<Rc<RefCell<ObscuraState>>>().clone();
+        op_state.put(replacement);
+        previous
     }
 
     /// Hand this runtime's isolate to the current thread.
@@ -4133,6 +4318,109 @@ mod tests {
             let title1b = rt1b.evaluate("document.querySelector('h1').textContent").unwrap();
             assert_eq!(title1b, serde_json::json!("Page1"));
         }
+    }
+
+    /// Feasibility of the second-`v8::Context` frame realm, which is the shape a
+    /// same-origin frame needs: one isolate, so objects can legally cross
+    /// between parent and frame the way they do in Chrome.
+    ///
+    /// Checks the three things that decide whether it is workable at all:
+    /// the snapshot carries the bootstrap into a restored context, ops can be
+    /// shared into it, and the realm's globals are genuinely separate.
+    #[test]
+    fn second_context_realm_gets_bootstrap_and_ops() {
+        let mut rt = setup_runtime("<html><body><h1>Parent</h1></body></html>");
+
+        let realm = rt.create_realm_context().expect("snapshot context");
+
+        // 1. The snapshot restored the whole bootstrap into the new context, so
+        //    a realm costs a context restore instead of re-running ~9,700 lines.
+        assert_eq!(
+            rt.eval_in_realm(&realm, "typeof globalThis.__obscura_init").unwrap(),
+            "function"
+        );
+        assert_eq!(
+            rt.eval_in_realm(&realm, "typeof globalThis.Element").unwrap(),
+            "function"
+        );
+
+        // 2. The realm's snapshot ops table holds deno_core builtins but none of
+        //    Obscura's ops, until the main realm's table is shared into it.
+        assert_eq!(
+            rt.eval_in_realm(&realm, "typeof Deno.core.ops.op_dom").unwrap(),
+            "undefined"
+        );
+        assert!(rt.share_ops_with_realm(&realm));
+        assert_eq!(
+            rt.eval_in_realm(&realm, "typeof Deno.core.ops.op_dom").unwrap(),
+            "function"
+        );
+
+        // The handoff must not be reachable from script in either realm, or it
+        // would hand page code the whole op surface.
+        assert_eq!(
+            rt.evaluate("typeof globalThis.__obscura_core_handoff").unwrap(),
+            serde_json::json!("undefined")
+        );
+        assert_eq!(
+            rt.eval_in_realm(&realm, "typeof globalThis.__obscura_core_handoff")
+                .unwrap(),
+            "undefined"
+        );
+        assert_eq!(
+            rt.eval_in_realm(&realm, "typeof Deno.core.ops.op_dom").unwrap(),
+            "function"
+        );
+
+        // 3. Globals are per-realm, which is what makes it a real realm.
+        rt.eval_in_realm(&realm, "globalThis.marker = 'realm';").unwrap();
+        assert_eq!(rt.eval_in_realm(&realm, "globalThis.marker").unwrap(), "realm");
+        assert_eq!(
+            rt.evaluate("typeof globalThis.marker").unwrap(),
+            serde_json::json!("undefined")
+        );
+        // Separate realm means separate intrinsics, exactly like a real frame.
+        assert_eq!(
+            rt.eval_in_realm(&realm, "globalThis.Array === Deno.core.ops.op_dom.constructor")
+                .unwrap(),
+            "false"
+        );
+
+        // The parent is unharmed by all of this.
+        assert_eq!(
+            rt.evaluate("document.querySelector('h1').textContent").unwrap(),
+            serde_json::json!("Parent")
+        );
+    }
+
+    /// The frame realm needs its own DOM. Ops read one isolate-wide state, so a
+    /// realm is made current by swapping that state around its work rather than
+    /// by changing all 66 op signatures.
+    #[test]
+    fn swapping_op_state_gives_a_realm_its_own_dom() {
+        let mut rt = setup_runtime("<html><body><h1>Parent</h1></body></html>");
+        let realm = rt.create_realm_context().expect("snapshot context");
+        assert!(rt.share_ops_with_realm(&realm));
+
+        // A separate document for the frame realm.
+        let frame_state = Rc::new(RefCell::new(ObscuraState::new()));
+        frame_state.borrow_mut().dom = Some(parse_html(
+            "<html><body><h1>Frame</h1></body></html>",
+        ));
+
+        let parent_state = rt.swap_op_state(frame_state);
+        rt.eval_in_realm(&realm, "globalThis.__obscura_init();").unwrap();
+        let frame_title = rt
+            .eval_in_realm(&realm, "document.querySelector('h1').textContent")
+            .unwrap();
+        rt.swap_op_state(parent_state);
+
+        assert_eq!(frame_title, "Frame");
+        // The parent realm still sees its own document afterwards.
+        assert_eq!(
+            rt.evaluate("document.querySelector('h1').textContent").unwrap(),
+            serde_json::json!("Parent")
+        );
     }
 
     #[test]
