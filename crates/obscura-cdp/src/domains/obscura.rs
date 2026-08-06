@@ -49,9 +49,16 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .find_map(|row| row["id"].as_str().filter(|id| *id != parts[2]))
+            .find_map(|row| {
+                let supports_145 = row["observationsByBrowserVersion"]
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .any(|version| version.starts_with("145."));
+                supports_145.then(|| row["id"].as_str()).flatten().filter(|id| *id != parts[2])
+            })
             .unwrap();
-        let alternate = format!("c145w1:{}:{}:{}", parts[1], graphics_id, parts[3]);
+        let alternate = format!("{}:{}:{}:{}", parts[0], parts[1], graphics_id, parts[3]);
         (default_id, alternate)
     }
 

@@ -7,12 +7,6 @@
 })(globalThis, () => {
   const FLOAT64 = Symbol('float64');
   const SORTED_KEYS = Symbol('sortedKeys');
-  const WGSL_LANGUAGE_FEATURES = [
-    'packed_4x8_integer_dot_product',
-    'pointer_composite_access',
-    'readonly_and_readwrite_storage_textures',
-    'unrestricted_pointer_parameters',
-  ];
 
   const float64 = value => ({ [FLOAT64]: Number(value) });
 
@@ -54,6 +48,7 @@
   };
 
   const uniqueSortedStrings = values => Array.from(new Set(Array.from(values || [], String))).sort();
+  const uniqueStrings = values => Array.from(new Set(Array.from(values || [], String)));
 
   function numericObjectToArray(value) {
     if (!value || Array.isArray(value) || typeof value !== 'object') return value;
@@ -210,7 +205,7 @@
     );
     return {
       info,
-      features: uniqueSortedStrings(raw.features),
+      features: uniqueStrings(raw.features),
       limits: normalizeNumericMap(raw.limits),
       defaultDeviceLimits: normalizeNumericMap(raw.deviceLimits),
     };
@@ -249,10 +244,11 @@
       webgl1Id,
       webgl2Id,
       webgpuId,
-      preferredCanvasFormat: 'bgra8unorm',
-      wgslLanguageFeatures: WGSL_LANGUAGE_FEATURES.slice(),
+      preferredCanvasFormat: String(hardware.gpu.preferredCanvasFormat),
+      wgslLanguageFeatures: uniqueStrings(hardware.gpu.wgslLanguageFeatures),
     };
     const graphicsId = await contentId(graphics);
+    const browserMajor = base.browserVersion.split('.')[0];
     return {
       baseId,
       graphicsId,
@@ -260,7 +256,7 @@
       webgl1Id,
       webgl2Id,
       webgpuId,
-      composedId: `c145w1:${baseId}:${graphicsId}:${screenId}`,
+      composedId: `c${browserMajor}w1:${baseId}:${graphicsId}:${screenId}`,
     };
   }
 

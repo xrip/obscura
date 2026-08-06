@@ -1,20 +1,21 @@
 # Obscura handoff
 
-Date: 2026-08-05
+Date: 2026-08-06
 
 ## Project and current goal
 
 Obscura is a Rust headless browser for web scraping and AI agents. It runs
 JavaScript in V8, owns a DOM, and serves Chrome DevTools Protocol endpoints for
-Playwright and Puppeteer. The active branch adds a Chrome 145 Windows identity
-catalog, synthetic WebGL and WebGPU surfaces, per-CDP-connection profile
-selection, a local profile workbench, and Playwright cookie/localStorage state.
+Playwright and Puppeteer. The active branch adds a versioned Chrome Windows
+identity catalog, synthetic WebGL and WebGPU surfaces, per-CDP-connection
+profile selection, a local profile workbench, and Playwright cookie/localStorage
+state.
 
-The current development goal is to make the Chrome 145 identity and stealth
-network path work as one consistent browser on real sites. The last test used
-Wildberries and Ozon. Both still blocked Obscura. The next developer should
-diagnose the network and navigation differences before adding more fingerprint
-surface code.
+The current profile work makes every valid captured Chrome major selectable.
+The fixed API shape stays Chrome 145, and unsupported transport majors use the
+nearest pinned `wreq` profile. Both differences give warnings instead of
+blocking a profile. The earlier real-site tests used Wildberries and Ozon; both
+still blocked Obscura and need separate network diagnostics.
 
 ## Git state
 
@@ -37,13 +38,18 @@ Important commits, oldest first:
 
 ## Implemented work
 
-### Chrome 145 profile catalog and graphics facade
+### Versioned Chrome profile catalog and graphics facade
 
 - The embedded catalog is
-  `crates/obscura-browser/data/chrome-145-windows-v1.json`.
+  `crates/obscura-browser/data/chrome-windows-v1.json`.
 - `crates/obscura-browser/src/profiles.rs` loads and resolves catalog profiles.
 - A composed ID has the form
-  `c145w1:<base-id>:<graphics-id>:<screen-id>`.
+  `c<chrome-major>w1:<base-id>:<graphics-id>:<screen-id>`.
+- Captured Chrome majors 143, 144, 145, 147, 148, and 150 are selectable.
+  Chrome 145 remains the fixed default and graphics API shape. Other majors
+  warn about this difference but still run.
+- Stealth mode uses an exact pinned `wreq` transport where available. It uses
+  the nearest one and warns otherwise; Chrome 150 currently uses Chrome 148.
 - One `BrowserContext` owns one frozen resolved identity. Pages, navigation,
   iframe shims, workers, WebGL, and WebGPU use that identity.
 - `crates/obscura-js/js/graphics.js` holds the graphics implementation.
@@ -73,8 +79,8 @@ function handling.
 
 - Open `http://127.0.0.1:9222/obscura/profiles/`.
 - Full instructions are in `PROFILES.md`.
-- Raw input files under `webgl/profiles/`, `webgl/adapters.json`, and
-  `webgl/window.json` are local and ignored. The compact catalog, schema,
+- Raw input files under `webgl/profiles/` and `webgl/window.json` are local and
+  ignored. The compact catalog, schema,
   report, and source digests are tracked.
 
 ### Per-root-CDP profile selection
@@ -139,11 +145,15 @@ Three.js, or PixiJS packages to Git.
 
 ## Last real-site test
 
-The last manual test used this valid catalog profile:
+The last manual test used this profile from the old catalog:
 
 ```text
 c145w1:673aa76b117fad13f52aa7cbf7d534c3:e3d3a2bc9ffee855f993c3e1c6588a7e:02d2105e93d6c86e29d80eb82952159d
 ```
+
+The graphics ID changed when captured WebGPU feature order became part of the
+content. This old composed ID is no longer valid. Repeat the real-site test
+with an ID from the current catalog before using it as a release gate.
 
 Observed identity:
 

@@ -68,10 +68,14 @@ OBSCURA_GEOLOCATION="40.7128,-74.0060" obscura serve
 
 ### `OBSCURA_PROFILE`
 
-Select a Chrome 145 Windows profile. `0` selects the fixed default. Any other
-decimal value is a stable seed for catalog version 1. A full
-`c145w1:<base-id>:<graphics-id>:<screen-id>` value selects the exact three
-parts. A bad value gives one warning and uses the fixed default.
+Select a Chrome Windows profile. `0` selects the fixed Chrome 145 default. Any
+other decimal value is a stable seed for catalog version 1. A full
+`c<major>w1:<base-id>:<graphics-id>:<screen-id>` value selects the exact three
+compatible parts. A bad value gives one warning and uses the fixed default.
+
+All valid captured majors are selectable. A non-145 major warns that the
+JavaScript graphics API shape is still Chrome 145. In stealth mode, a major
+without an exact pinned `wreq` transport uses the nearest one and warns.
 
 ```bash
 OBSCURA_PROFILE=42 obscura serve

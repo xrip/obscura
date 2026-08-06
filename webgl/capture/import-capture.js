@@ -12,13 +12,9 @@ function sameJson(left, right) {
   return JSON.stringify(left) === JSON.stringify(right);
 }
 
-function checkCapture(profile, adapters, windows) {
+function checkCapture(profile, windows) {
   if (!profile || profile.profileVersion !== 'obscura-capture-v1' || !profile.fingerprints) {
     throw new Error('the profile file is not an Obscura browser capture');
-  }
-  if (!Array.isArray(adapters) || adapters.length !== 1 || adapters[0].total !== 1
-      || !Array.isArray(adapters[0].renderers) || adapters[0].renderers.length !== 1) {
-    throw new Error('the adapters file must contain one observation');
   }
   if (!Array.isArray(windows) || windows.length !== 1 || windows[0].total !== 1
       || !Array.isArray(windows[0].window) || windows[0].window.length !== 1) {
@@ -29,12 +25,10 @@ function checkCapture(profile, adapters, windows) {
   const graphics = fingerprints.hardware && fingerprints.hardware.gpu;
   const browser = fingerprints.browser;
   if (!graphics || !browser) throw new Error('the profile has no browser or graphics block');
-  if (adapters[0].vendor !== graphics.unmaskedVendor
-      || adapters[0].renderers[0] !== graphics.unmaskedRenderer
-      || !sameJson(adapters[0].context.adapter, graphics.adapter)
-      || !sameJson(adapters[0].context.webglContext, browser.webglContext)
-      || !sameJson(adapters[0].context.webgl2Context, browser.webgl2Context)) {
-    throw new Error('the profile and adapter files are not from the same capture');
+  if (!graphics.unmaskedVendor || !graphics.unmaskedRenderer || !graphics.adapter
+      || !graphics.preferredCanvasFormat || !Array.isArray(graphics.wgslLanguageFeatures)
+      || !browser.webglContext || !browser.webgl2Context) {
+    throw new Error('the profile has incomplete graphics data');
   }
   if (!sameJson(windows[0].screen, fingerprints.hardware.screen)
       || !sameJson(windows[0].window[0], browser.window)) {
@@ -52,7 +46,7 @@ function nextProfilePath(directory, profileBytes) {
   throw new Error('no free capture profile file name');
 }
 
-function replacePair(files) {
+function replaceFiles(files) {
   const changed = [];
   try {
     for (const file of files) {
@@ -83,38 +77,28 @@ function replacePair(files) {
 }
 
 function main(argv) {
-  if (argv.length !== 3) {
-    throw new Error('usage: node webgl/capture/import-capture.js <obscura-profile.json> <obscura-adapters.json> <obscura-windows.json>');
+  if (argv.length !== 2) {
+    throw new Error('usage: node webgl/capture/import-capture.js <obscura-profile.json> <obscura-windows.json>');
   }
-  const [profileInput, adaptersInput, windowsInput] = argv.map(file => path.resolve(file));
+  const [profileInput, windowsInput] = argv.map(file => path.resolve(file));
   const root = process.cwd();
   const profileDirectory = path.join(root, 'webgl', 'profiles');
-  const adaptersTarget = path.join(root, 'webgl', 'adapters.json');
   const windowsTarget = path.join(root, 'webgl', 'window.json');
 
   const profile = readJson(profileInput);
-  const captureAdapters = readJson(adaptersInput);
   const captureWindows = readJson(windowsInput);
-  checkCapture(profile, captureAdapters, captureWindows);
+  checkCapture(profile, captureWindows);
 
-  const adapters = fs.existsSync(adaptersTarget) ? readJson(adaptersTarget) : [];
   const windows = fs.existsSync(windowsTarget) ? readJson(windowsTarget) : [];
-  if (!Array.isArray(adapters) || !Array.isArray(windows)) {
-    throw new Error('the local adapters.json or window.json source is not an array');
+  if (!Array.isArray(windows)) {
+    throw new Error('the local window.json source is not an array');
   }
-  adapters.push(...captureAdapters);
   windows.push(...captureWindows);
 
   fs.mkdirSync(profileDirectory, { recursive: true });
   const profileBytes = `${JSON.stringify(profile, null, 2)}\n`;
   const profileTarget = nextProfilePath(profileDirectory, profileBytes);
   const files = [
-    {
-      target: adaptersTarget,
-      next: `${adaptersTarget}.obscura-new`,
-      backup: `${adaptersTarget}.obscura-backup`,
-      value: adapters,
-    },
     {
       target: windowsTarget,
       next: `${windowsTarget}.obscura-new`,
@@ -126,7 +110,7 @@ function main(argv) {
   for (const file of files) fs.writeFileSync(file.next, `${JSON.stringify(file.value, null, 2)}\n`);
   fs.writeFileSync(profileTarget, profileBytes, { flag: 'wx' });
   try {
-    replacePair(files);
+    replaceFiles(files);
   } catch (error) {
     if (fs.existsSync(profileTarget)) fs.rmSync(profileTarget);
     throw error;
@@ -134,7 +118,6 @@ function main(argv) {
 
   process.stdout.write(`${JSON.stringify({
     profile: path.relative(root, profileTarget),
-    adapterRows: adapters.length,
     windowRows: windows.length,
   }, null, 2)}\n`);
 }

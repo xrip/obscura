@@ -7,9 +7,9 @@
   const downloads = document.getElementById('downloads');
   const summary = document.getElementById('summary');
   const errorBox = document.getElementById('error');
+  const warningBox = document.getElementById('warning');
   const saveButton = document.getElementById('save-capture');
   const profileButton = document.getElementById('download-profile');
-  const adaptersButton = document.getElementById('download-adapters');
   const windowsButton = document.getElementById('download-windows');
   const catalogState = document.getElementById('catalog-state');
   const baseSelect = document.getElementById('base-select');
@@ -26,6 +26,12 @@
 
   const CATALOG_URL = '/obscura/profiles/catalog';
   const CAPTURE_URL = '/obscura/profiles/capture';
+  const DEFAULT_GRAPHICS_API_BROWSER_MAJOR = 145;
+  const DEFAULT_TRANSPORT_BROWSER_MAJORS = [
+    100, 101, 104, 105, 106, 107, 108, 109, 110, 114, 116, 117, 118, 119,
+    120, 123, 124, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136,
+    137, 138, 139, 140, 141, 142, 143, 144, 145, 146, 147, 148,
+  ];
 
   const own = (object, key) => Object.prototype.hasOwnProperty.call(object, key);
 
@@ -292,17 +298,41 @@
     return { name, ok: Boolean(ok), detail: String(detail) };
   }
 
+  function browserWarnings(browserVersion) {
+    const browserMajor = Number(String(browserVersion).split('.')[0]);
+    if (!Number.isInteger(browserMajor)) return [];
+    const catalogApiMajor = Number(catalog && catalog.graphicsApiBrowserMajor);
+    const apiMajor = Number.isInteger(catalogApiMajor) && catalogApiMajor > 0
+      ? catalogApiMajor
+      : DEFAULT_GRAPHICS_API_BROWSER_MAJOR;
+    const catalogTransportMajors = catalog && Array.isArray(catalog.transportBrowserMajors)
+      ? catalog.transportBrowserMajors.map(Number).filter(Number.isInteger)
+      : DEFAULT_TRANSPORT_BROWSER_MAJORS;
+    const warnings = [];
+    if (browserMajor !== apiMajor) {
+      warnings.push(`Chrome ${browserMajor} is accepted, but the current JS graphics API shape is Chrome ${apiMajor}. Cross-surface inconsistencies are possible.`);
+    }
+    if (!catalogTransportMajors.includes(browserMajor) && catalogTransportMajors.length) {
+      const transportMajor = catalogTransportMajors.reduce((best, value) => (
+        Math.abs(value - browserMajor) < Math.abs(best - browserMajor) ? value : best
+      ));
+      warnings.push(`No exact wreq transport exists for Chrome ${browserMajor}. Obscura will use the nearest transport, Chrome ${transportMajor}, and will give a runtime warning.`);
+    }
+    return warnings;
+  }
+
   function buildChecks(data) {
     const base = data.profile.fingerprints;
     const ua = base.browser.userAgentData;
     const nav = base.browser.navigator;
     const gpu = base.hardware.gpu;
     const defaultAdapter = gpu.adapter.default;
+    const chromeMajor = ua.uaFullVersion.split('.')[0];
     return [
-      check('Chrome major', ua.uaFullVersion.split('.')[0] === '145', ua.uaFullVersion),
+      check('Chrome version', /^\d+\.\d+\.\d+\.\d+$/.test(ua.uaFullVersion), ua.uaFullVersion),
       check('Windows platform', ua.platform === 'Windows', `${ua.platform} ${ua.platformVersion}`),
       check('x86-64 architecture', ua.architecture === 'x86' && ua.bitness === '64', `${ua.architecture}-${ua.bitness}`),
-      check('Reduced Chrome 145 UA', nav.userAgent.includes('(Windows NT 10.0; Win64; x64)') && nav.userAgent.includes('Chrome/145.0.0.0'), nav.userAgent),
+      check('Reduced Chrome UA', nav.userAgent.includes('(Windows NT 10.0; Win64; x64)') && nav.userAgent.includes(`Chrome/${chromeMajor}.0.0.0`), nav.userAgent),
       check('WebGL debug renderer', Boolean(gpu.unmaskedVendor && gpu.unmaskedRenderer), `${gpu.unmaskedVendor} / ${gpu.unmaskedRenderer}`),
       check('ANGLE D3D11 renderer', /Direct3D11|D3D11/.test(gpu.unmaskedRenderer), gpu.unmaskedRenderer),
       check('WebGL 1 parameters', data.webgl1.validParameterCount >= 82, `${data.webgl1.validParameterCount} valid`),
@@ -322,6 +352,8 @@
     const webgl1 = collectWebGl('webgl');
     const webgl2 = collectWebGl('webgl2');
     const webgpu = await collectWebGpu();
+    const preferredCanvasFormat = String(navigator.gpu.getPreferredCanvasFormat());
+    const wgslLanguageFeatures = Array.from(navigator.gpu.wgslLanguageFeatures || [], String);
     const navigatorData = {
       userAgent: String(navigator.userAgent),
       languages: Array.from(navigator.languages || [], String),
@@ -348,24 +380,15 @@
           gpu: {
             unmaskedVendor: webgl2.unmaskedVendor || webgl1.unmaskedVendor,
             unmaskedRenderer: webgl2.unmaskedRenderer || webgl1.unmaskedRenderer,
+            preferredCanvasFormat,
+            wgslLanguageFeatures,
             adapter: webgpu,
           },
         },
       },
     };
-    const graphics = profile.fingerprints.hardware.gpu;
-    const adapters = [{
-      total: 1,
-      vendor: graphics.unmaskedVendor,
-      renderers: [graphics.unmaskedRenderer],
-      context: {
-        adapter: webgpu,
-        webglContext: webgl1.data,
-        webgl2Context: webgl2.data,
-      },
-    }];
     const windows = [{ total: 1, window: [windowData], screen: screenData }];
-    const data = { profile, adapters, windows, webgl1, webgl2 };
+    const data = { profile, windows, webgl1, webgl2 };
     data.ids = await ObscuraProfileIds.idsFromProfile(profile);
     data.checks = buildChecks(data);
     return data;
@@ -402,7 +425,11 @@
   }
 
   function graphicsLabel(row) {
-    return `${row.unmaskedRenderer} | ${row.id}`;
+    const majors = Array.from(new Set(
+      Object.keys(row.observationsByBrowserVersion || {}).map(version => version.split('.')[0]),
+    ));
+    const versions = majors.length ? `Chrome ${majors.join(',')} | ` : '';
+    return `${versions}${row.unmaskedRenderer} | ${row.id}`;
   }
 
   function screenLabel(row) {
@@ -413,11 +440,52 @@
     return catalog && catalog[name].find(row => row.id === id);
   }
 
+  function selectedBaseVersion(baseId) {
+    const base = findRow('baseProfiles', baseId);
+    if (base) return base.browserVersion;
+    if (result && result.ids.baseId === baseId) {
+      return result.profile.fingerprints.browser.version;
+    }
+    return '';
+  }
+
+  function graphicsSupportsMajor(row, major) {
+    return Boolean(row && Object.keys(row.observationsByBrowserVersion || {})
+      .some(version => version.split('.')[0] === major));
+  }
+
+  function selectedGraphicsRow(graphicsId) {
+    const row = findRow('graphicsProfiles', graphicsId);
+    if (row) return row;
+    if (result && result.ids.graphicsId === graphicsId) {
+      const version = result.profile.fingerprints.browser.version;
+      return { observationsByBrowserVersion: { [version]: 1 } };
+    }
+    return null;
+  }
+
   function updateComposedId() {
     const baseId = selectedValue(baseSelect);
-    const graphicsId = selectedValue(graphicsSelect);
+    const browserVersion = selectedBaseVersion(baseId);
+    const browserMajor = browserVersion.split('.')[0];
+    let graphicsId = selectedValue(graphicsSelect);
+    if (!graphicsSupportsMajor(selectedGraphicsRow(graphicsId), browserMajor)) {
+      const compatible = catalog && catalog.graphicsProfiles.find(row => (
+        graphicsSupportsMajor(row, browserMajor)
+      ));
+      if (compatible) {
+        chooseValue(graphicsSelect, compatible.id);
+        graphicsId = compatible.id;
+      }
+    }
     const screenId = selectedValue(screenSelect);
-    const id = `c145w1:${baseId}:${graphicsId}:${screenId}`;
+    if (!/^\d+$/.test(browserMajor)
+        || !graphicsSupportsMajor(selectedGraphicsRow(graphicsId), browserMajor)) {
+      composedId.value = 'No graphics row is available for the selected Chrome major.';
+      copyIdButton.disabled = true;
+      return;
+    }
+    const id = `c${browserMajor}w1:${baseId}:${graphicsId}:${screenId}`;
     composedId.value = id;
     copyIdButton.disabled = !catalog;
     const base = findRow('baseProfiles', baseId);
@@ -437,6 +505,7 @@
       graphics: graphics ? {
         vendor: graphics.unmaskedVendor,
         renderer: graphics.unmaskedRenderer,
+        observationsByBrowserVersion: graphics.observationsByBrowserVersion,
         webgl1Id: graphics.webgl1Id,
         webgl2Id: graphics.webgl2Id,
         webgpuId: graphics.webgpuId,
@@ -452,7 +521,7 @@
   function defaultIds() {
     if (catalog.defaultComposition) return catalog.defaultComposition;
     const parts = String(catalog.defaultProfileId || '').split(':');
-    if (parts.length !== 4 || parts[0] !== 'c145w1') throw new Error('catalog default profile ID is invalid');
+    if (parts.length !== 4 || !/^c\d+w1$/.test(parts[0])) throw new Error('catalog default profile ID is invalid');
     return { baseId: parts[1], graphicsId: parts[2], screenId: parts[3] };
   }
 
@@ -538,7 +607,6 @@
     downloads.hidden = false;
     saveButton.disabled = !enabled;
     profileButton.disabled = !enabled;
-    adaptersButton.disabled = !enabled;
     windowsButton.disabled = !enabled;
   }
 
@@ -546,6 +614,8 @@
     captureButton.disabled = true;
     state.textContent = 'Capturing WebGL and WebGPU data...';
     errorBox.textContent = '';
+    warningBox.textContent = '';
+    warningBox.hidden = true;
     summary.value = 'Capture in progress...';
     result = null;
     setDownloadState(false);
@@ -571,14 +641,19 @@
       }, null, 2);
       if (failed.length) {
         state.textContent = `${failed.length} check(s) failed.`;
-        errorBox.textContent = 'Downloads are off because this capture does not match the Chrome 145 Windows ANGLE/D3D11 catalog target.';
+        errorBox.textContent = 'Downloads are off because this capture is not a consistent Chrome Windows ANGLE/D3D11 profile.';
         return;
       }
       result = data;
       setDownloadState(true);
       selectCaptureButton.disabled = !catalog;
       if (catalog) selectCapture();
-      state.textContent = 'Capture is valid. Save it or use the three download buttons.';
+      const warnings = browserWarnings(profile.browser.version);
+      if (warnings.length) {
+        warningBox.textContent = `Warning: ${warnings.join(' ')}`;
+        warningBox.hidden = false;
+      }
+      state.textContent = 'Capture is valid. Save it or use the two download buttons.';
     } catch (error) {
       checksBody.innerHTML = '<tr><td colspan="2" class="bad">Capture stopped.</td></tr>';
       state.textContent = 'Capture failed.';
@@ -590,7 +665,6 @@
   });
 
   profileButton.addEventListener('click', () => result && downloadJson('obscura-profile.json', result.profile));
-  adaptersButton.addEventListener('click', () => result && downloadJson('obscura-adapters.json', result.adapters));
   windowsButton.addEventListener('click', () => result && downloadJson('obscura-windows.json', result.windows));
   saveButton.addEventListener('click', async () => {
     if (!result) return;
@@ -603,13 +677,12 @@
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           profile: result.profile,
-          adapters: result.adapters,
           windows: result.windows,
         }),
       });
       const answer = await response.json();
       if (!response.ok || !answer.ok) throw new Error(answer.error || `save returned HTTP ${response.status}`);
-      state.textContent = `Saved ${answer.saved.profile}; adapter rows ${answer.saved.adapterRows}, window rows ${answer.saved.windowRows}.`;
+      state.textContent = `Saved ${answer.saved.profile}; window rows ${answer.saved.windowRows}.`;
     } catch (error) {
       state.textContent = 'Save failed.';
       errorBox.textContent = error && error.stack ? error.stack : String(error);

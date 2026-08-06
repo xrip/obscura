@@ -111,11 +111,15 @@ await access(obscuraBin).catch(() => {
 
 const { chromium } = await loadPlaywright();
 const catalog = JSON.parse(await readFile(
-  join(root, 'crates', 'obscura-browser', 'data', 'chrome-145-windows-v1.json'),
+  join(root, 'crates', 'obscura-browser', 'data', 'chrome-windows-v1.json'),
   'utf8',
 ));
+const defaultBase = catalog.baseProfiles.find(
+  row => row.id === catalog.defaultComposition.baseId,
+);
+const browserMajor = defaultBase.browserVersion.split('.')[0];
 const profileId = [
-  'c145w1',
+  `c${browserMajor}w1`,
   catalog.defaultComposition.baseId,
   catalog.defaultComposition.graphicsId,
   catalog.defaultComposition.screenId,

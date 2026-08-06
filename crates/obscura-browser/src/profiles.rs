@@ -8,10 +8,10 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-const CATALOG_GZIP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/chrome-145-windows-v1.json.gz"));
-const DEFAULT_CATALOG_JSON: &str = include_str!(concat!(env!("OUT_DIR"), "/chrome-145-windows-v1.default.json"));
-const CATALOG_ID: &str = "chrome-145-windows-v1";
-const COMPOSED_PREFIX: &str = "c145w1";
+const CATALOG_GZIP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/chrome-windows-v1.json.gz"));
+const DEFAULT_CATALOG_JSON: &str = include_str!(concat!(env!("OUT_DIR"), "/chrome-windows-v1.default.json"));
+const CATALOG_ID: &str = "chrome-windows-v1";
+pub const GRAPHICS_API_BROWSER_MAJOR: u32 = 145;
 
 #[derive(Debug, Clone, Error)]
 pub enum ProfileError {
@@ -40,8 +40,10 @@ pub struct FingerprintCatalog {
 #[serde(rename_all = "camelCase")]
 struct CatalogTarget {
     browser: String,
-    browser_major: u32,
-    browser_revision: String,
+    default_browser_major: u32,
+    graphics_api_browser_major: u32,
+    graphics_api_revision: String,
+    transport_browser_majors: Vec<u32>,
     os: String,
     graphics_backend: String,
 }
@@ -115,6 +117,7 @@ pub struct GraphicsProfile {
     pub webgpu_id: String,
     pub preferred_canvas_format: String,
     pub wgsl_language_features: Vec<String>,
+    pub observations_by_browser_version: BTreeMap<String, u64>,
     pub weight: u64,
 }
 
@@ -126,10 +129,35 @@ struct CatalogComponent {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct CatalogComponents {
     webgl1: Vec<CatalogComponent>,
     webgl2: Vec<CatalogComponent>,
-    webgpu: Vec<CatalogComponent>,
+    webgpu: Vec<CatalogWebGpuComponent>,
+    webgpu_adapters: Vec<CatalogWebGpuAdapterComponent>,
+    webgpu_limits: Vec<CatalogWebGpuLimitsComponent>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CatalogWebGpuComponent {
+    id: String,
+    adapters: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CatalogWebGpuAdapterComponent {
+    id: String,
+    info: Value,
+    features: Vec<String>,
+    limits_id: String,
+    default_device_limits_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct CatalogWebGpuLimitsComponent {
+    id: String,
+    values: BTreeMap<String, Value>,
 }
 
 #[derive(Deserialize)]
@@ -144,12 +172,17 @@ struct DefaultCatalog {
     graphics_profile: GraphicsProfile,
     webgl1: CatalogComponent,
     webgl2: CatalogComponent,
-    webgpu: CatalogComponent,
+    webgpu: CatalogWebGpuComponent,
+    #[serde(rename = "webgpuAdapters")]
+    webgpu_adapters: Vec<CatalogWebGpuAdapterComponent>,
+    #[serde(rename = "webgpuLimits")]
+    webgpu_limits: Vec<CatalogWebGpuLimitsComponent>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BrowserIdentity {
+    pub major: u32,
     pub version: String,
     pub user_agent: String,
 }
@@ -248,6 +281,41 @@ impl ResolvedFingerprintProfile {
     }
 }
 
+fn browser_major(version: &str) -> Result<u32, ProfileError> {
+    let parts: Vec<&str> = version.split('.').collect();
+    if parts.len() != 4
+        || parts
+            .iter()
+            .any(|part| part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return Err(ProfileError::Catalog(format!(
+            "browser version {version} is not four numeric parts"
+        )));
+    }
+    parts[0]
+        .parse()
+        .map_err(|_| ProfileError::Catalog(format!("browser major is invalid in {version}")))
+}
+
+fn composed_id(major: u32, base_id: &str, graphics_id: &str, screen_id: &str) -> String {
+    format!("c{major}w1:{base_id}:{graphics_id}:{screen_id}")
+}
+
+fn graphics_major_weight(profile: &GraphicsProfile, major: u32) -> u64 {
+    profile
+        .observations_by_browser_version
+        .iter()
+        .filter(|(version, _)| {
+            version
+                .split('.')
+                .next()
+                .and_then(|value| value.parse::<u32>().ok())
+                == Some(major)
+        })
+        .map(|(_, weight)| *weight)
+        .sum()
+}
+
 impl FingerprintCatalog {
     pub fn base_profile_count(&self) -> usize {
         self.base_profiles.len()
@@ -267,6 +335,9 @@ impl FingerprintCatalog {
         struct CatalogIndex<'a> {
             schema_version: u32,
             catalog_id: &'a str,
+            default_browser_major: u32,
+            graphics_api_browser_major: u32,
+            transport_browser_majors: &'a [u32],
             default_profile_id: String,
             base_profiles: &'a [BaseCatalogProfile],
             graphics_profiles: &'a [GraphicsProfile],
@@ -274,12 +345,22 @@ impl FingerprintCatalog {
         }
 
         let ids = &self.default_composition;
+        let base = self
+            .base_profiles
+            .iter()
+            .find(|row| row.id == ids.base_id)
+            .ok_or_else(|| ProfileError::Catalog("default base ID is missing".to_string()))?;
         serde_json::to_string_pretty(&CatalogIndex {
             schema_version: self.schema_version,
             catalog_id: &self.catalog_id,
-            default_profile_id: format!(
-                "{COMPOSED_PREFIX}:{}:{}:{}",
-                ids.base_id, ids.graphics_id, ids.screen_id
+            default_browser_major: self.target.default_browser_major,
+            graphics_api_browser_major: self.target.graphics_api_browser_major,
+            transport_browser_majors: &self.target.transport_browser_majors,
+            default_profile_id: composed_id(
+                browser_major(&base.browser_version)?,
+                &ids.base_id,
+                &ids.graphics_id,
+                &ids.screen_id,
             ),
             base_profiles: &self.base_profiles,
             graphics_profiles: &self.graphics_profiles,
@@ -326,6 +407,14 @@ fn validate_catalog(catalog: &FingerprintCatalog) -> Result<(), ProfileError> {
     let webgl1 = unique_ids(catalog.components.webgl1.iter().map(|row| row.id.as_str()), "webgl1")?;
     let webgl2 = unique_ids(catalog.components.webgl2.iter().map(|row| row.id.as_str()), "webgl2")?;
     let webgpu = unique_ids(catalog.components.webgpu.iter().map(|row| row.id.as_str()), "webgpu")?;
+    let webgpu_adapters = unique_ids(
+        catalog.components.webgpu_adapters.iter().map(|row| row.id.as_str()),
+        "webgpu adapters",
+    )?;
+    let webgpu_limits = unique_ids(
+        catalog.components.webgpu_limits.iter().map(|row| row.id.as_str()),
+        "webgpu limits",
+    )?;
     if !bases.contains(catalog.default_composition.base_id.as_str())
         || !screens.contains(catalog.default_composition.screen_id.as_str())
         || !graphics.contains(catalog.default_composition.graphics_id.as_str())
@@ -334,6 +423,20 @@ fn validate_catalog(catalog: &FingerprintCatalog) -> Result<(), ProfileError> {
     }
     for row in &catalog.graphics_profiles {
         if row.weight == 0
+            || row.observations_by_browser_version.is_empty()
+            || row.observations_by_browser_version.iter().any(|(version, weight)| {
+                let parts: Vec<&str> = version.split('.').collect();
+                *weight == 0
+                    || parts.len() != 4
+                    || parts.iter().any(|part| {
+                        part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+            })
+            || row
+                .observations_by_browser_version
+                .values()
+                .try_fold(0u64, |total, weight| total.checked_add(*weight))
+                != Some(row.weight)
             || !webgl1.contains(row.webgl1_id.as_str())
             || !webgl2.contains(row.webgl2_id.as_str())
             || !webgpu.contains(row.webgpu_id.as_str())
@@ -344,10 +447,53 @@ fn validate_catalog(catalog: &FingerprintCatalog) -> Result<(), ProfileError> {
             )));
         }
     }
+    if catalog.components.webgpu.iter().any(|row| {
+        !row.adapters.contains_key("default")
+            || row.adapters.keys().any(|name| {
+                !matches!(name.as_str(), "default" | "lowPower" | "highPerformance")
+            })
+            || row
+                .adapters
+                .values()
+                .any(|id| !webgpu_adapters.contains(id.as_str()))
+    }) || catalog.components.webgpu_adapters.iter().any(|row| {
+        !webgpu_limits.contains(row.limits_id.as_str())
+            || !webgpu_limits.contains(row.default_device_limits_id.as_str())
+    }) {
+        return Err(ProfileError::Catalog(
+            "a WebGPU component has an unknown nested component".to_string(),
+        ));
+    }
     if catalog.base_profiles.iter().any(|row| row.weight == 0)
         || catalog.screen_profiles.iter().any(|row| row.weight == 0)
     {
         return Err(ProfileError::Catalog("a profile has zero weight".to_string()));
+    }
+    let default_base = catalog
+        .base_profiles
+        .iter()
+        .find(|row| row.id == catalog.default_composition.base_id)
+        .ok_or_else(|| ProfileError::Catalog("default base ID is missing".to_string()))?;
+    let default_graphics = catalog
+        .graphics_profiles
+        .iter()
+        .find(|row| row.id == catalog.default_composition.graphics_id)
+        .ok_or_else(|| ProfileError::Catalog("default graphics ID is missing".to_string()))?;
+    let default_major = browser_major(&default_base.browser_version)?;
+    if default_major != catalog.target.default_browser_major
+        || graphics_major_weight(default_graphics, default_major) == 0
+        || catalog.base_profiles.iter().any(|base| {
+            browser_major(&base.browser_version).ok().is_none_or(|major| {
+                !catalog
+                    .graphics_profiles
+                    .iter()
+                    .any(|graphics| graphics_major_weight(graphics, major) > 0)
+            })
+        })
+    {
+        return Err(ProfileError::Catalog(
+            "a browser major has no compatible graphics profile".to_string(),
+        ));
     }
     Ok(())
 }
@@ -373,12 +519,15 @@ fn validate_catalog_header(
         ));
     }
     if target.browser != "Chrome"
-        || target.browser_major != 145
-        || target.browser_revision != "145.0.7632.75"
+        || target.default_browser_major != 145
+        || target.graphics_api_browser_major != GRAPHICS_API_BROWSER_MAJOR
+        || target.graphics_api_revision != "145.0.7632.75"
+        || target.transport_browser_majors.is_empty()
+        || !target.transport_browser_majors.contains(&145)
         || target.os != "Windows"
         || target.graphics_backend != "ANGLE/D3D11"
     {
-        return Err(ProfileError::Catalog("target is not Chrome 145 Windows ANGLE/D3D11".to_string()));
+        return Err(ProfileError::Catalog("target is not the supported Chrome Windows ANGLE/D3D11 catalog".to_string()));
     }
     Ok(())
 }
@@ -432,7 +581,11 @@ fn load_default_profile() -> Result<Arc<ResolvedFingerprintProfile>, ProfileErro
     }
     let webgl1 = component_value_owned(selected.webgl1)?;
     let webgl2 = component_value_owned(selected.webgl2)?;
-    let webgpu = component_value_owned(selected.webgpu)?;
+    let webgpu = expand_webgpu_component(
+        &selected.webgpu,
+        &selected.webgpu_adapters,
+        &selected.webgpu_limits,
+    )?;
     Ok(Arc::new(compose_selected(
         &selected.catalog_id,
         base,
@@ -496,11 +649,8 @@ fn resolve_with_options(
     let (ids, fallback) = if let Some(selector) = selector.map(str::trim) {
         if selector == "0" {
             (default, false)
-        } else if selector.starts_with("c145w1:") {
-            match parse_composed_selector(catalog, selector) {
-                Some(ids) => (ids, false),
-                None => (default, true),
-            }
+        } else if let Some(ids) = parse_composed_selector(catalog, selector) {
+            (ids, false)
         } else if let Ok(seed) = selector.parse::<u64>() {
             if seed == 0 {
                 (default, false)
@@ -515,14 +665,7 @@ fn resolve_with_options(
             let base_draw = u64::from_le_bytes(bytes[0..8].try_into().unwrap());
             let graphics_draw = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
             let screen_draw = u64::from_le_bytes(bytes[16..24].try_into().unwrap());
-            (
-                (
-                    weighted_pick(&catalog.base_profiles, base_draw, |row| row.weight, |row| row.id.as_str()),
-                    weighted_pick(&catalog.graphics_profiles, graphics_draw, |row| row.weight, |row| row.id.as_str()),
-                    weighted_pick(&catalog.screen_profiles, screen_draw, |row| row.weight, |row| row.id.as_str()),
-                ),
-                false,
-            )
+            (drawn_ids(catalog, base_draw, graphics_draw, screen_draw), false)
         } else {
             (default, false)
         }
@@ -537,24 +680,21 @@ fn parse_composed_selector<'a>(
     selector: &str,
 ) -> Option<(&'a str, &'a str, &'a str)> {
     let mut parts = selector.split(':');
-    if parts.next()? != COMPOSED_PREFIX {
-        return None;
-    }
+    let prefix = parts.next()?;
     let base = parts.next()?;
     let graphics = parts.next()?;
     let screen = parts.next()?;
-    if parts.next().is_some()
-        || !catalog.base_profiles.iter().any(|row| row.id == base)
-        || !catalog.graphics_profiles.iter().any(|row| row.id == graphics)
-        || !catalog.screen_profiles.iter().any(|row| row.id == screen)
-    {
+    if parts.next().is_some() {
         return None;
     }
-    Some((
-        catalog.base_profiles.iter().find(|row| row.id == base)?.id.as_str(),
-        catalog.graphics_profiles.iter().find(|row| row.id == graphics)?.id.as_str(),
-        catalog.screen_profiles.iter().find(|row| row.id == screen)?.id.as_str(),
-    ))
+    let base = catalog.base_profiles.iter().find(|row| row.id == base)?;
+    let graphics = catalog.graphics_profiles.iter().find(|row| row.id == graphics)?;
+    let screen = catalog.screen_profiles.iter().find(|row| row.id == screen)?;
+    let major = browser_major(&base.browser_version).ok()?;
+    if prefix != format!("c{major}w1") || graphics_major_weight(graphics, major) == 0 {
+        return None;
+    }
+    Some((base.id.as_str(), graphics.id.as_str(), screen.id.as_str()))
 }
 
 fn seeded_ids(catalog: &FingerprintCatalog, seed: u64) -> (&str, &str, &str) {
@@ -566,10 +706,41 @@ fn seeded_ids(catalog: &FingerprintCatalog, seed: u64) -> (&str, &str, &str) {
         let digest = hasher.finalize();
         u64::from_le_bytes(digest[..8].try_into().unwrap())
     };
+    drawn_ids(catalog, draw("base"), draw("graphics"), draw("screen"))
+}
+
+fn drawn_ids(
+    catalog: &FingerprintCatalog,
+    base_draw: u64,
+    graphics_draw: u64,
+    screen_draw: u64,
+) -> (&str, &str, &str) {
+    let base_id = weighted_pick(
+        &catalog.base_profiles,
+        base_draw,
+        |row| row.weight,
+        |row| row.id.as_str(),
+    );
+    let base = catalog
+        .base_profiles
+        .iter()
+        .find(|row| row.id == base_id)
+        .expect("weighted base ID is present");
+    let major = browser_major(&base.browser_version).expect("validated browser major");
     (
-        weighted_pick(&catalog.base_profiles, draw("base"), |row| row.weight, |row| row.id.as_str()),
-        weighted_pick(&catalog.graphics_profiles, draw("graphics"), |row| row.weight, |row| row.id.as_str()),
-        weighted_pick(&catalog.screen_profiles, draw("screen"), |row| row.weight, |row| row.id.as_str()),
+        base_id,
+        weighted_pick(
+            &catalog.graphics_profiles,
+            graphics_draw,
+            |row| graphics_major_weight(row, major),
+            |row| row.id.as_str(),
+        ),
+        weighted_pick(
+            &catalog.screen_profiles,
+            screen_draw,
+            |row| row.weight,
+            |row| row.id.as_str(),
+        ),
     )
 }
 
@@ -613,7 +784,7 @@ fn compose(
         .ok_or_else(|| ProfileError::Catalog("selected screen ID is missing".to_string()))?;
     let webgl1 = component_value(&catalog.components.webgl1, &graphics.webgl1_id)?;
     let webgl2 = component_value(&catalog.components.webgl2, &graphics.webgl2_id)?;
-    let webgpu = component_value(&catalog.components.webgpu, &graphics.webgpu_id)?;
+    let webgpu = webgpu_component_value(&catalog.components, &graphics.webgpu_id)?;
     compose_selected(
         &catalog.catalog_id,
         base,
@@ -637,12 +808,19 @@ fn compose_selected(
     let base_id = &base.id;
     let graphics_id = &graphics.id;
     let screen_id = &screen.id;
-    let id = format!("{COMPOSED_PREFIX}:{base_id}:{graphics_id}:{screen_id}");
+    let major = browser_major(&base.browser_version)?;
+    if graphics_major_weight(graphics, major) == 0 {
+        return Err(ProfileError::Catalog(format!(
+            "graphics profile {graphics_id} was not observed in Chrome {major}"
+        )));
+    }
+    let id = composed_id(major, base_id, graphics_id, screen_id);
     let mut seed_hasher = Sha256::new();
     seed_hasher.update(b"graphics-render-v1");
     seed_hasher.update(id.as_bytes());
     let render_seed = hex(&seed_hasher.finalize());
     let browser = BrowserIdentity {
+        major,
         version: base.browser_version.clone(),
         user_agent: base.user_agent.clone(),
     };
@@ -723,6 +901,59 @@ fn component_value(components: &[CatalogComponent], id: &str) -> Result<Value, P
     component_value_owned(component.clone())
 }
 
+fn webgpu_component_value(
+    components: &CatalogComponents,
+    id: &str,
+) -> Result<Value, ProfileError> {
+    let component = components
+        .webgpu
+        .iter()
+        .find(|component| component.id == id)
+        .ok_or_else(|| ProfileError::Catalog(format!("component {id} is missing")))?;
+    expand_webgpu_component(
+        component,
+        &components.webgpu_adapters,
+        &components.webgpu_limits,
+    )
+}
+
+fn expand_webgpu_component(
+    component: &CatalogWebGpuComponent,
+    adapters: &[CatalogWebGpuAdapterComponent],
+    limits: &[CatalogWebGpuLimitsComponent],
+) -> Result<Value, ProfileError> {
+    let mut expanded = serde_json::Map::new();
+    for (name, adapter_id) in &component.adapters {
+        let adapter = adapters
+            .iter()
+            .find(|row| row.id == *adapter_id)
+            .ok_or_else(|| ProfileError::Catalog(format!("WebGPU adapter {adapter_id} is missing")))?;
+        let adapter_limits = limits
+            .iter()
+            .find(|row| row.id == adapter.limits_id)
+            .ok_or_else(|| ProfileError::Catalog(format!("WebGPU limits {} are missing", adapter.limits_id)))?;
+        let device_limits = limits
+            .iter()
+            .find(|row| row.id == adapter.default_device_limits_id)
+            .ok_or_else(|| {
+                ProfileError::Catalog(format!(
+                    "WebGPU limits {} are missing",
+                    adapter.default_device_limits_id
+                ))
+            })?;
+        expanded.insert(
+            name.clone(),
+            serde_json::json!({
+                "info": adapter.info,
+                "features": adapter.features,
+                "limits": adapter_limits.values,
+                "defaultDeviceLimits": device_limits.values,
+            }),
+        );
+    }
+    Ok(serde_json::json!({ "adapters": expanded }))
+}
+
 fn component_value_owned(component: CatalogComponent) -> Result<Value, ProfileError> {
     serde_json::to_value(component.data)
         .map_err(|error| ProfileError::Serialization(error.to_string()))
@@ -758,9 +989,18 @@ mod tests {
         let catalog = catalog().unwrap();
         assert_eq!(catalog.catalog_id, CATALOG_ID);
         assert!(CATALOG_GZIP.len() < 2 * 1024 * 1024);
-        assert_eq!(catalog.base_profile_count(), 77);
-        assert_eq!(catalog.screen_profile_count(), 225);
-        assert_eq!(catalog.graphics_profile_count(), 298);
+        assert_eq!(catalog.base_profile_count(), 367);
+        assert_eq!(catalog.screen_profile_count(), 226);
+        assert_eq!(catalog.graphics_profile_count(), 427);
+        let index: Value = serde_json::from_str(&catalog.index_json().unwrap()).unwrap();
+        assert_eq!(index["defaultBrowserMajor"], 145);
+        assert_eq!(index["graphicsApiBrowserMajor"], 145);
+        let majors: std::collections::BTreeSet<u32> = catalog
+            .base_profiles
+            .iter()
+            .map(|row| browser_major(&row.browser_version).unwrap())
+            .collect();
+        assert_eq!(majors, [143, 144, 145, 147, 148, 150].into_iter().collect());
     }
 
     #[test]
@@ -806,9 +1046,9 @@ mod tests {
     fn catalog_index_lists_selectable_rows() {
         let index: Value = serde_json::from_str(&catalog().unwrap().index_json().unwrap()).unwrap();
         assert_eq!(index["catalogId"], CATALOG_ID);
-        assert_eq!(index["baseProfiles"].as_array().unwrap().len(), 77);
-        assert_eq!(index["graphicsProfiles"].as_array().unwrap().len(), 298);
-        assert_eq!(index["screenProfiles"].as_array().unwrap().len(), 225);
+        assert_eq!(index["baseProfiles"].as_array().unwrap().len(), 367);
+        assert_eq!(index["graphicsProfiles"].as_array().unwrap().len(), 427);
+        assert_eq!(index["screenProfiles"].as_array().unwrap().len(), 226);
         assert!(index["defaultProfileId"].as_str().unwrap().starts_with("c145w1:"));
         assert!(index.get("components").is_none());
     }
@@ -825,6 +1065,28 @@ mod tests {
             resolve_profile_id("c145w1:bad:bad:bad"),
             Err(ProfileError::Selector(_))
         ));
+    }
+
+    #[test]
+    fn every_captured_browser_major_is_selectable() {
+        let catalog = catalog().unwrap();
+        let screen_id = catalog.default_composition.screen_id.as_str();
+        for major in [143, 144, 145, 147, 148, 150] {
+            let base = catalog
+                .base_profiles
+                .iter()
+                .find(|row| browser_major(&row.browser_version).unwrap() == major)
+                .unwrap();
+            let graphics = catalog
+                .graphics_profiles
+                .iter()
+                .find(|row| graphics_major_weight(row, major) > 0)
+                .unwrap();
+            let id = composed_id(major, &base.id, &graphics.id, screen_id);
+            let selected = resolve_profile_id(&id).unwrap();
+            assert_eq!(selected.browser.major, major);
+            assert_eq!(selected.id, id);
+        }
     }
 
     #[test]

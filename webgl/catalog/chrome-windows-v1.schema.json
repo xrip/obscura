@@ -16,7 +16,7 @@
           "type": "array"
         },
         "browserVersion": {
-          "pattern": "^145\\.",
+          "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$",
           "type": "string"
         },
         "deviceMemory": {
@@ -117,12 +117,28 @@
           },
           "minItems": 1,
           "type": "array"
+        },
+        "webgpuAdapters": {
+          "items": {
+            "$ref": "#/$defs/webgpuAdapter"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "webgpuLimits": {
+          "items": {
+            "$ref": "#/$defs/webgpuLimits"
+          },
+          "minItems": 1,
+          "type": "array"
         }
       },
       "required": [
         "webgl1",
         "webgl2",
-        "webgpu"
+        "webgpu",
+        "webgpuAdapters",
+        "webgpuLimits"
       ],
       "type": "object"
     },
@@ -157,6 +173,16 @@
         },
         "maskedVendor": {
           "type": "string"
+        },
+        "observationsByBrowserVersion": {
+          "additionalProperties": {
+            "$ref": "#/$defs/weight"
+          },
+          "minProperties": 1,
+          "propertyNames": {
+            "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$"
+          },
+          "type": "object"
         },
         "preferredCanvasFormat": {
           "enum": [
@@ -201,6 +227,7 @@
         "webgpuId",
         "preferredCanvasFormat",
         "wgslLanguageFeatures",
+        "observationsByBrowserVersion",
         "weight"
       ],
       "type": "object"
@@ -321,14 +348,6 @@
     "sourceDigests": {
       "additionalProperties": false,
       "properties": {
-        "adaptersBytes": {
-          "minimum": 1,
-          "type": "integer"
-        },
-        "adaptersSha256": {
-          "pattern": "^[0-9a-f]{64}$",
-          "type": "string"
-        },
         "profilesBytes": {
           "minimum": 1,
           "type": "integer"
@@ -351,8 +370,6 @@
         }
       },
       "required": [
-        "adaptersSha256",
-        "adaptersBytes",
         "windowsSha256",
         "windowsBytes",
         "profilesSha256",
@@ -367,10 +384,13 @@
         "browser": {
           "const": "Chrome"
         },
-        "browserMajor": {
+        "defaultBrowserMajor": {
           "const": 145
         },
-        "browserRevision": {
+        "graphicsApiBrowserMajor": {
+          "const": 145
+        },
+        "graphicsApiRevision": {
           "const": "145.0.7632.75"
         },
         "graphicsBackend": {
@@ -378,12 +398,23 @@
         },
         "os": {
           "const": "Windows"
+        },
+        "transportBrowserMajors": {
+          "items": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "minItems": 1,
+          "type": "array",
+          "uniqueItems": true
         }
       },
       "required": [
         "browser",
-        "browserMajor",
-        "browserRevision",
+        "defaultBrowserMajor",
+        "graphicsApiBrowserMajor",
+        "graphicsApiRevision",
+        "transportBrowserMajors",
         "os",
         "graphicsBackend"
       ],
@@ -422,8 +453,24 @@
       "type": "object"
     },
     "webgpu": {
+      "additionalProperties": false,
       "properties": {
         "adapters": {
+          "additionalProperties": false,
+          "properties": {
+            "default": {
+              "$ref": "#/$defs/id"
+            },
+            "highPerformance": {
+              "$ref": "#/$defs/id"
+            },
+            "lowPower": {
+              "$ref": "#/$defs/id"
+            }
+          },
+          "required": [
+            "default"
+          ],
           "type": "object"
         },
         "id": {
@@ -436,12 +483,60 @@
       ],
       "type": "object"
     },
+    "webgpuAdapter": {
+      "additionalProperties": false,
+      "properties": {
+        "defaultDeviceLimitsId": {
+          "$ref": "#/$defs/id"
+        },
+        "features": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "info": {
+          "type": "object"
+        },
+        "limitsId": {
+          "$ref": "#/$defs/id"
+        }
+      },
+      "required": [
+        "id",
+        "info",
+        "features",
+        "limitsId",
+        "defaultDeviceLimitsId"
+      ],
+      "type": "object"
+    },
+    "webgpuLimits": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "values": {
+          "type": "object"
+        }
+      },
+      "required": [
+        "id",
+        "values"
+      ],
+      "type": "object"
+    },
     "weight": {
       "minimum": 1,
       "type": "integer"
     }
   },
-  "$id": "https://obscura.dev/schema/chrome-145-windows-v1.schema.json",
+  "$id": "https://obscura.dev/schema/chrome-windows-v1.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "properties": {
@@ -453,7 +548,7 @@
       "type": "array"
     },
     "catalogId": {
-      "const": "chrome-145-windows-v1"
+      "const": "chrome-windows-v1"
     },
     "components": {
       "$ref": "#/$defs/components"
@@ -496,6 +591,6 @@
     "graphicsProfiles",
     "components"
   ],
-  "title": "Obscura Chrome 145 Windows fingerprint catalog",
+  "title": "Obscura Chrome Windows fingerprint catalog",
   "type": "object"
 }

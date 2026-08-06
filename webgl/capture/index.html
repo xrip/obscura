@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'unsafe-inline'; connect-src 'self'; img-src 'none'; object-src 'none'; base-uri 'none'">
-  <title>Obscura Chrome 145 profile workbench</title>
+  <title>Obscura Chrome profile workbench</title>
   <style>
     :root {
       color-scheme: light dark;
@@ -35,6 +35,7 @@
     th:first-child { width: 28%; }
     .ok { color: #2a9d4b; }
     .bad { color: #d44; }
+    .warning { background: #d89b001c; }
     .muted { opacity: .75; }
     code, pre, textarea { font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
     textarea {
@@ -54,7 +55,7 @@
   </style>
 </head>
 <body>
-  <h1>Obscura Chrome 145 profile workbench</h1>
+  <h1>Obscura Chrome profile workbench</h1>
 
   <div class="notice">
     This page is part of <code>obscura serve</code>. It reads the embedded
@@ -87,7 +88,7 @@
   <div class="panel">
     <strong>Before capture</strong>
     <ol>
-      <li>Use 64-bit Google Chrome 145 on Windows.</li>
+      <li>Use 64-bit Google Chrome on Windows.</li>
       <li>Use normal hardware acceleration and the ANGLE D3D11 backend.</li>
       <li>Set browser zoom to 100% and put the window on the display to record.</li>
       <li>Close DevTools if its dock changes the inner window size.</li>
@@ -99,6 +100,7 @@
     <button id="capture" type="button">Capture and check</button>
     <span id="state" class="muted">No capture yet.</span>
   </p>
+  <p id="warning" class="notice warning" role="status" hidden></p>
 
   <h2>Checks</h2>
   <table>
@@ -110,10 +112,9 @@
     <h2>Save or download</h2>
     <p>Save adds this observation to the source directory set on <code>obscura serve</code>.</p>
     <button id="save-capture" type="button" disabled>Save capture to source files</button>
-    <p class="muted">The three downloads are a manual backup or import path.</p>
+    <p class="muted">The two downloads are a manual backup or import path.</p>
     <button id="download-profile" type="button" disabled>1. Base/full profile</button>
-    <button id="download-adapters" type="button" disabled>2. Adapter observation</button>
-    <button id="download-windows" type="button" disabled>3. Screen observation</button>
+    <button id="download-windows" type="button" disabled>2. Screen observation</button>
   </div>
 
   <h2>Capture summary</h2>

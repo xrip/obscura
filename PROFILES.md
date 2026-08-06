@@ -1,15 +1,26 @@
-# Chrome 145 fingerprint profiles
+# Chrome Windows fingerprint profiles
 
 Obscura has one profile system for browser, screen, WebGL, and WebGPU data.
-The target is fixed:
+The current catalog target is:
 
-- Chrome 145, revision `145.0.7632.75`.
+- Captured Chrome browser identities from every valid source profile.
 - Windows.
 - ANGLE with D3D11.
+- A Chrome 145 JavaScript graphics API shape, revision `145.0.7632.75`.
 
 The profile system is on in normal and stealth mode. `--stealth` does not pick
 a profile. It changes the network client and other stealth behavior. The same
-Chrome 145 profile data is used in both modes.
+selected Chrome profile data is used in both modes.
+
+Stealth mode selects the matching pinned `wreq` Chrome transport when it is
+available. If the selected browser major has no exact `wreq` transport,
+Obscura uses the nearest available Chrome transport and gives a warning. A
+profile with a browser major other than 145 also gives a warning because some
+JavaScript API shapes still follow Chrome 145. The profile remains usable.
+
+The current catalog has selectable Chrome 143, 144, 145, 147, 148, and 150
+rows. Chrome 143 through 148 have exact pinned `wreq` transports. Chrome 150
+uses the nearest available transport, Chrome 148, when stealth mode is on.
 
 ## What a profile contains
 
@@ -24,12 +35,13 @@ A profile has three selected parts.
 The profile ID has this form:
 
 ```text
-c145w1:<base-id>:<graphics-id>:<screen-id>
+c<chrome-major>w1:<base-id>:<graphics-id>:<screen-id>
 ```
 
-Every part ID is 32 lower-case hex characters. The current catalog permits any
-base part, graphics part, and screen part to be used together. A graphics row
-always keeps its WebGL 1, WebGL 2, and WebGPU data together.
+Every part ID is 32 lower-case hex characters. The prefix major must equal the
+base-row Chrome major. The graphics row must have an observation for that same
+major. Any screen row may be used. A graphics row always keeps its WebGL 1,
+WebGL 2, and WebGPU data together.
 
 The profile also gives WebGL a stable render seed. The same profile and the
 same WebGL command record give the same synthetic pixels after a restart.
@@ -72,7 +84,7 @@ Obscura uses `OBSCURA_PROFILE` and `OBSCURA_ROTATE_PROFILE`.
 | No setting | Fixed catalog default |
 | `OBSCURA_PROFILE=0` | Fixed catalog default |
 | `OBSCURA_PROFILE=<positive decimal>` | Stable weighted selection for catalog version 1 |
-| `OBSCURA_PROFILE=c145w1:...` | Exact base, graphics, and screen IDs |
+| `OBSCURA_PROFILE=c<major>w1:...` | Exact compatible base, graphics, and screen IDs |
 | `OBSCURA_ROTATE_PROFILE=1` | New weighted random selection for each new context |
 
 ### Fixed default
@@ -83,7 +95,7 @@ this mode for tests and work that must have the same result on every run.
 The current default is:
 
 ```text
-c145w1:d2e85f68f4092704b75e2a9fe7145fd7:f9b781363030180eb52d391c03167488:012a7166bca451ee154cd22665977ee4
+c145w1:d2e85f68f4092704b75e2a9fe7145fd7:8546ea21d519f56b82c1099e4893e49b:be830914f3fb0f9eb2577321d1d4a9fa
 ```
 
 `OBSCURA_PROFILE=0` is an explicit form of the same rule.
@@ -91,7 +103,8 @@ c145w1:d2e85f68f4092704b75e2a9fe7145fd7:f9b781363030180eb52d391c03167488:012a716
 ### Stable decimal seed
 
 Any decimal value from `1` through the maximum `u64` value makes a stable
-weighted selection. Base, graphics, and screen draws are separate.
+weighted selection. Obscura selects a base first, then a graphics row observed
+in that base major, then a screen row.
 
 ```text
 OBSCURA_PROFILE=42
@@ -109,11 +122,12 @@ store a long composed ID.
 An exact ID pins all three parts:
 
 ```text
-OBSCURA_PROFILE=c145w1:<base-id>:<graphics-id>:<screen-id>
+OBSCURA_PROFILE=c<chrome-major>w1:<base-id>:<graphics-id>:<screen-id>
 ```
 
-All three IDs must exist in the embedded catalog. Use this form for a test
-case, a saved scraping job, or a known graphics setup.
+All three IDs must exist in the embedded catalog. The prefix and graphics row
+must match the base Chrome major. Use this form for a test case, a saved
+scraping job, or a known graphics setup.
 
 ### Weighted rotation
 
@@ -168,7 +182,7 @@ $env:OBSCURA_PROFILE = '42'
 Pin an exact profile:
 
 ```powershell
-$env:OBSCURA_PROFILE = 'c145w1:d2e85f68f4092704b75e2a9fe7145fd7:f9b781363030180eb52d391c03167488:012a7166bca451ee154cd22665977ee4'
+$env:OBSCURA_PROFILE = 'c145w1:d2e85f68f4092704b75e2a9fe7145fd7:8546ea21d519f56b82c1099e4893e49b:be830914f3fb0f9eb2577321d1d4a9fa'
 .\target\release\obscura.exe --stealth fetch https://example.com --dump text
 ```
 
@@ -208,7 +222,7 @@ env -u OBSCURA_PROFILE OBSCURA_ROTATE_PROFILE=1 \
 Pin an exact profile:
 
 ```bash
-OBSCURA_PROFILE='c145w1:d2e85f68f4092704b75e2a9fe7145fd7:f9b781363030180eb52d391c03167488:012a7166bca451ee154cd22665977ee4' \
+OBSCURA_PROFILE='c145w1:d2e85f68f4092704b75e2a9fe7145fd7:8546ea21d519f56b82c1099e4893e49b:be830914f3fb0f9eb2577321d1d4a9fa' \
   ./target/release/obscura fetch https://example.com --dump text
 ```
 
@@ -239,7 +253,7 @@ const browser = await puppeteer.connect({
   browserWSEndpoint: 'ws://127.0.0.1:9222/devtools/browser',
 });
 
-const profileId = 'c145w1:d2e85f68f4092704b75e2a9fe7145fd7:f9b781363030180eb52d391c03167488:012a7166bca451ee154cd22665977ee4';
+const profileId = 'c145w1:d2e85f68f4092704b75e2a9fe7145fd7:8546ea21d519f56b82c1099e4893e49b:be830914f3fb0f9eb2577321d1d4a9fa';
 const root = await browser.target().createCDPSession();
 const selected = await root.send('Obscura.setProfile', { profileId });
 console.log(selected.profileId);
@@ -270,9 +284,9 @@ await root.detach();
 await browser.disconnect();
 ```
 
-`profileId` must be one exact `c145w1:...` ID from the embedded catalog. The
-result gives the canonical selected ID. An unknown ID gives an error and keeps
-the old connection profile.
+`profileId` must be one exact versioned `c<major>w1:...` ID from the embedded
+catalog. The result gives the canonical selected ID. An unknown ID gives an
+error and keeps the old connection profile.
 
 The call is connection-scoped:
 
@@ -321,7 +335,7 @@ import { existsSync } from 'node:fs';
 import { chromium } from 'playwright';
 
 const statePath = './account-state.json';
-const profileId = 'c145w1:d2e85f68f4092704b75e2a9fe7145fd7:f9b781363030180eb52d391c03167488:012a7166bca451ee154cd22665977ee4';
+const profileId = 'c145w1:d2e85f68f4092704b75e2a9fe7145fd7:8546ea21d519f56b82c1099e4893e49b:be830914f3fb0f9eb2577321d1d4a9fa';
 
 const browser = await chromium.connectOverCDP(
   'http://127.0.0.1:9222',
@@ -380,7 +394,7 @@ kept in the repository.
 The tracked runtime catalog is:
 
 ```text
-crates/obscura-browser/data/chrome-145-windows-v1.json
+crates/obscura-browser/data/chrome-windows-v1.json
 ```
 
 The CLI can list the selectable rows, show an exact composed profile, and
@@ -399,7 +413,7 @@ into every row.
 Show an exact profile, including its resolved WebGL and WebGPU components:
 
 ```powershell
-.\target\release\obscura.exe profiles show 'c145w1:d2e85f68f4092704b75e2a9fe7145fd7:f9b781363030180eb52d391c03167488:012a7166bca451ee154cd22665977ee4'
+.\target\release\obscura.exe profiles show 'c145w1:d2e85f68f4092704b75e2a9fe7145fd7:8546ea21d519f56b82c1099e4893e49b:be830914f3fb0f9eb2577321d1d4a9fa'
 ```
 
 Show the selection made from the current environment:
@@ -438,12 +452,14 @@ with `BrowserContext::profile_id()`.
 ### Read the default ID with PowerShell
 
 ```powershell
-$catalogPath = 'crates/obscura-browser/data/chrome-145-windows-v1.json'
+$catalogPath = 'crates/obscura-browser/data/chrome-windows-v1.json'
 $catalog = Get-Content -LiteralPath $catalogPath -Raw | ConvertFrom-Json
 $baseId = $catalog.defaultComposition.baseId
 $graphicsId = $catalog.defaultComposition.graphicsId
 $screenId = $catalog.defaultComposition.screenId
-$profileId = "c145w1:${baseId}:${graphicsId}:${screenId}"
+$base = $catalog.baseProfiles | Where-Object id -eq $baseId
+$major = $base.browserVersion.Split('.')[0]
+$profileId = "c${major}w1:${baseId}:${graphicsId}:${screenId}"
 $profileId
 ```
 
@@ -468,21 +484,28 @@ $catalog.screenProfiles |
   Select-Object id, width, height, devicePixelRatio, innerWidth, innerHeight, weight
 ```
 
-Make a composed ID from any valid three rows:
+Make a composed ID from a base, a graphics row seen in its major, and any
+screen row:
 
 ```powershell
-$baseId = $catalog.baseProfiles[0].id
-$graphicsId = $catalog.graphicsProfiles[0].id
+$base = $catalog.baseProfiles[0]
+$major = $base.browserVersion.Split('.')[0]
+$graphics = $catalog.graphicsProfiles | Where-Object {
+  $_.observationsByBrowserVersion.psobject.Properties.Name |
+    Where-Object { $_.Split('.')[0] -eq $major }
+} | Select-Object -First 1
+$baseId = $base.id
+$graphicsId = $graphics.id
 $screenId = $catalog.screenProfiles[0].id
-$profileId = "c145w1:${baseId}:${graphicsId}:${screenId}"
+$profileId = "c${major}w1:${baseId}:${graphicsId}:${screenId}"
 $profileId
 ```
 
 ### Read the default ID with `jq`
 
 ```bash
-jq -r '"c145w1:\(.defaultComposition.baseId):\(.defaultComposition.graphicsId):\(.defaultComposition.screenId)"' \
-  crates/obscura-browser/data/chrome-145-windows-v1.json
+jq -r '. as $catalog | .defaultComposition as $d | (.baseProfiles[] | select(.id == $d.baseId) | .browserVersion | split(".")[0]) as $major | "c\($major)w1:\($d.baseId):\($d.graphicsId):\($d.screenId)"' \
+  crates/obscura-browser/data/chrome-windows-v1.json
 ```
 
 Do not make a graphics row by joining WebGL and WebGPU component IDs from
@@ -552,7 +575,7 @@ rotated context: a separate call is a separate random selection. Read
 User-Agent on the network and at `navigator.userAgent`. They do not replace
 the other catalog data.
 
-If the value is not the exact User-Agent from the selected Chrome 145 Windows
+If the value is not the exact User-Agent from the selected Chrome Windows
 base row, Obscura gives one warning. The caller then owns consistency between
 the custom value and these surfaces:
 
@@ -592,10 +615,11 @@ webgl/capture/index.html
 It has two jobs on one page:
 
 1. Three select boxes let you join any existing base, graphics, and screen row
-   and copy the final `c145w1:...` profile ID.
+   and copy the final versioned profile ID.
 2. The capture tool reads the current real browser, checks it against the
-   catalog target, makes the same content IDs as the Rust generator, and saves
-   one source observation through the local Obscura server.
+   Windows ANGLE/D3D11 source rules, makes the same content IDs as the Rust
+   generator, and saves one source observation through the local Obscura
+   server.
 
 The workbench has no external script, font, image, CDN, or service. It reads
 only the catalog built into Obscura. A save request goes back to the same local
@@ -603,20 +627,23 @@ Obscura process. It does not send the capture to another server.
 
 ### Capture target
 
-A new capture is accepted only for this target:
+A new graphics capture is accepted only for this target:
 
-- 64-bit Google Chrome or Chromium major 145.
+- 64-bit Google Chrome or Chromium with a numeric full version.
 - Windows.
 - `x86` architecture and `64` bitness in User-Agent Client Hints.
-- A reduced Chrome 145 Windows User-Agent.
+- A reduced Windows User-Agent with the same Chrome major.
 - WebGL 1 and WebGL 2.
 - ANGLE with a D3D11 renderer.
 - A working default WebGPU adapter and device.
 - At least 82 valid WebGL 1 parameters and 132 valid WebGL 2 parameters.
 - All 12 shader precision records for each WebGL generation.
 
-The select-box part still works in another browser. Only new capture is held
-to the target checks.
+Every valid capture can become a base row, a graphics-version observation, and
+a versioned composed ID. If the browser major differs from the Chrome 145 API
+shape, the workbench shows a non-blocking consistency warning. If there is no
+exact pinned `wreq` transport, it also shows the nearest transport major that
+stealth mode will use. The capture can still be saved and selected.
 
 Use a normal browser state for a useful observation:
 
@@ -668,7 +695,7 @@ address, but save stays loopback-only. Use the normal loopback bind:
 ```
 
 The workbench needs one server worker because there must be one writer for the
-two source arrays. Obscura rejects this combination:
+raw profile files and screen array. Obscura rejects this combination:
 
 ```powershell
 .\target\release\obscura.exe serve --workers 2 --profile-workbench-dir webgl
@@ -686,16 +713,19 @@ three select boxes:
 - Graphics: one whole GPU, WebGL 1, WebGL 2, and WebGPU row.
 - Screen: physical screen, available area, window, position, and DPR.
 
+Each graphics label shows the Chrome majors recorded for that exact row. The
+selected-row summary gives its exact version observation counts.
+
 Changing any select box updates the final value:
 
 ```text
-c145w1:<base-id>:<graphics-id>:<screen-id>
+c<chrome-major>w1:<base-id>:<graphics-id>:<screen-id>
 ```
 
 Use **Copy profile ID**, then set it before Obscura starts:
 
 ```powershell
-$env:OBSCURA_PROFILE = 'c145w1:<base-id>:<graphics-id>:<screen-id>'
+$env:OBSCURA_PROFILE = 'c<chrome-major>w1:<base-id>:<graphics-id>:<screen-id>'
 .\target\release\obscura.exe profiles current
 .\target\release\obscura.exe --stealth fetch https://example.com --dump text
 ```
@@ -725,8 +755,8 @@ Press **Capture and check**. The page does this work locally:
     profile ID.
 
 When every check passes, the page selects the captured base, graphics, and
-screen IDs in the three boxes. The final `c145w1:...` value is then visible and
-can be copied.
+screen IDs in the three boxes. The final versioned ID is visible and can be
+copied. This is true even when the browser needs an API or transport warning.
 
 If an ID is already in the tracked catalog, the select option is the existing
 row. If it is new, the option begins with `[new capture]`. A new composed ID is
@@ -741,15 +771,14 @@ server checks that the profile, graphics, and screen blocks belong to the same
 capture. It then makes these changes under the directory from
 `--profile-workbench-dir`:
 
-- Appends one adapter observation to `adapters.json`.
 - Appends one screen observation to `window.json`.
 - Makes a new non-overwriting file such as
   `profiles/capture-<digest>-001.json`.
-- Uses `.obscura-new` and `.obscura-backup` files while it replaces the two
-  source arrays.
+- Uses `.obscura-new` and `.obscura-backup` files while it replaces the screen
+  source array.
 - Leaves the tracked compact catalog unchanged. Generation is a separate step.
 
-The page gives the new profile path and the new adapter and window row counts.
+The page gives the new profile path and the new window row count.
 If an old `.obscura-backup` file is present, save stops so that the old data can
 be checked and recovered by hand. It does not remove an old backup silently.
 
@@ -764,17 +793,16 @@ large import.
 
 ### Manual downloads
 
-The three download buttons are a manual backup and import path:
+The two download buttons are a manual backup and import path:
 
 | Download | Input role | Main content |
 |---|---|---|
-| `obscura-profile.json` | One file under `webgl/profiles/` | Base identity plus matching screen and graphics reference data |
-| `obscura-adapters.json` | One row for `webgl/adapters.json` | Vendor, renderer, WebGL 1, WebGL 2, and all WebGPU adapter choices |
+| `obscura-profile.json` | One file under `webgl/profiles/` | Base identity plus matching screen, WebGL, and WebGPU data |
 | `obscura-windows.json` | One row for `webgl/window.json` | One whole screen and window observation |
 
-These three files are one observation and must stay together. Do not join the
-profile from one machine with the adapter or window download from another
-machine while importing a capture.
+These two files are one observation and must stay together. Do not join the
+profile from one machine with the window download from another machine while
+importing a capture.
 
 The capture includes detailed fingerprint data. It does not read cookies,
 passwords, local storage, browsing history, proxy address, public IP,
@@ -783,34 +811,32 @@ local. The source paths are ignored by Git.
 
 ### Manually import downloaded files
 
-Node.js 18 or newer can safely check that the three files belong together and
+Node.js 18 or newer can safely check that the two files belong together and
 add them to the ignored source files. Run this from the repository root and
-replace the three download paths:
+replace the two download paths:
 
 ```powershell
 node webgl/capture/import-capture.js `
   'C:\Users\YOU\Downloads\obscura-profile.json' `
-  'C:\Users\YOU\Downloads\obscura-adapters.json' `
   'C:\Users\YOU\Downloads\obscura-windows.json'
 ```
 
 The import helper:
 
 - Rejects a file with the wrong capture shape.
-- Rejects three files that do not have equal screen, WebGL, renderer, and
-  WebGPU blocks.
-- Creates `webgl/adapters.json` and `webgl/window.json` if they do not exist.
-- Appends one observation to each existing array.
+- Rejects two files that do not have equal screen and window blocks.
+- Creates `webgl/window.json` if it does not exist.
+- Appends one observation to the screen array.
 - Creates a new non-overwriting file such as
   `webgl/profiles/capture-<digest>-001.json`.
-- Uses temporary and backup names while replacing the two source arrays.
+- Uses temporary and backup names while replacing the screen source array.
 - Never changes the tracked compact catalog. Generation is a separate step.
 
 Importing the same observation again is allowed. It adds another observation,
 so the generator gives equal content more weight. Use one import per real
 observation. Do not import a file twice by mistake.
 
-The helper rewrites the two local JSON arrays in a stable pretty form. The
+The helper rewrites the local screen JSON array in a stable pretty form. The
 built-in save button and this helper have the same source-file result.
 
 ### Generate, build, and confirm the captured ID
@@ -825,7 +851,7 @@ Build Obscura and check the exact ID printed by the capture page:
 
 ```powershell
 cargo build --release
-$env:OBSCURA_PROFILE = 'c145w1:<captured-base-id>:<captured-graphics-id>:<captured-screen-id>'
+$env:OBSCURA_PROFILE = 'c<captured-major>w1:<captured-base-id>:<captured-graphics-id>:<captured-screen-id>'
 .\target\release\obscura.exe profiles current
 ```
 
@@ -837,11 +863,17 @@ WebGPU data must match the workbench capture and the generated catalog.
 Weights come from repeated equal observations:
 
 - Every accepted base profile file adds one base observation.
-- Every renderer entry in an adapter row adds one graphics observation.
+- Every accepted full profile file adds one graphics observation.
 - Every window entry in a screen row adds one screen observation.
 - Equal normalized content is grouped and its weights are added.
 
-The fixed default is the highest-weight base row, graphics row, and screen row.
+The graphics row also has `observationsByBrowserVersion`. Its keys are exact
+Chrome versions and its values are observation counts. If the same normalized
+row was seen in more than one Chrome version, all version counts are recorded
+on that one row instead of copying the graphics data.
+
+The fixed default remains Chrome 145. It uses the highest-weight Chrome 145
+base and compatible graphics row, plus the highest-weight screen row.
 An import may change the default only when it changes these weight rankings.
 Ties use the lowest content ID.
 
@@ -851,10 +883,10 @@ Tracked files:
 
 | File | Purpose |
 |---|---|
-| `crates/obscura-browser/data/chrome-145-windows-v1.json` | Compact runtime catalog |
-| `webgl/catalog/chrome-145-windows-v1.schema.json` | JSON schema |
-| `webgl/catalog/chrome-145-windows-v1.report.json` | Counts, size, rejects, and checks |
-| `webgl/catalog/chrome-145-windows-v1.sources.json` | Source hashes and byte counts |
+| `crates/obscura-browser/data/chrome-windows-v1.json` | Compact runtime catalog |
+| `webgl/catalog/chrome-windows-v1.schema.json` | JSON schema |
+| `webgl/catalog/chrome-windows-v1.report.json` | Counts, size, rejects, and checks |
+| `webgl/catalog/chrome-windows-v1.sources.json` | Source hashes and byte counts |
 | `webgl/catalog/chrome-145-graphics-api-v1.json` | Chrome 145 graphics API manifest |
 | `webgl/catalog/chrome-145-graphics-api-v1.sources.json` | API source revision and hashes |
 | `webgl/capture/index.html` | Local capture and three-part profile picker |
@@ -865,7 +897,6 @@ Tracked files:
 Local source files:
 
 ```text
-webgl/adapters.json
 webgl/window.json
 webgl/profiles/
 ```
@@ -884,12 +915,18 @@ Put the local source files in the paths shown above. Then run this command from
 the repository root:
 
 ```powershell
-cargo run --manifest-path tools/fingerprint-catalog/Cargo.toml -- generate --profiles webgl/profiles --adapters webgl/adapters.json --windows webgl/window.json --out crates/obscura-browser/data/chrome-145-windows-v1.json --schema webgl/catalog/chrome-145-windows-v1.schema.json --report webgl/catalog/chrome-145-windows-v1.report.json --sources webgl/catalog/chrome-145-windows-v1.sources.json
+cargo run --manifest-path tools/fingerprint-catalog/Cargo.toml -- generate --profiles webgl/profiles --windows webgl/window.json --out crates/obscura-browser/data/chrome-windows-v1.json --schema webgl/catalog/chrome-windows-v1.schema.json --report webgl/catalog/chrome-windows-v1.report.json --sources webgl/catalog/chrome-windows-v1.sources.json
 ```
 
 The tool:
 
-- Accepts only Chrome 145 Windows base rows.
+- Accepts every internally consistent Chrome Windows base row with a numeric
+  four-part browser version.
+- Reads graphics observations from every Windows profile under
+  `webgl/profiles/`, including version subdirectories.
+- Records exact browser-version counts on equal graphics rows.
+- Keeps every valid base and graphics row selectable. A graphics row may be
+  joined only to a base with the same captured Chrome major.
 - Keeps only the approved base fields.
 - Keeps graphics rows and screen-window pairs whole.
 - Adds equal-row observation weights.
@@ -910,8 +947,8 @@ cargo nextest run --manifest-path tools/fingerprint-catalog/Cargo.toml
 After generation, inspect the report and source digest:
 
 ```powershell
-Get-Content webgl/catalog/chrome-145-windows-v1.report.json
-Get-Content webgl/catalog/chrome-145-windows-v1.sources.json
+Get-Content webgl/catalog/chrome-windows-v1.report.json
+Get-Content webgl/catalog/chrome-windows-v1.sources.json
 ```
 
 Then make a release build. The browser build script checks the catalog size,
@@ -989,7 +1026,7 @@ the new ID in `OBSCURA_PROFILE` gives the fixed default with a warning.
 
 ### Chrome blocks more than one download
 
-Use the three separate download buttons. If Chrome asks for approval, allow
+Use the two separate download buttons. If Chrome asks for approval, allow
 multiple downloads only for the local `127.0.0.1` page.
 
 ### A custom User-Agent gives a warning
@@ -999,7 +1036,7 @@ or accept that the caller must keep all browser surfaces consistent.
 
 ### A catalog build fails
 
-Read the full error. Common causes are a missing core base field, a non-Chrome
-145 row, a missing graphics component, an ID collision, bad JSON, a schema
+Read the full error. Common causes are a missing core base field, inconsistent
+browser versions, a missing graphics component, an ID collision, bad JSON, a schema
 error, or a catalog over 2 MiB. The generator report records rejected rows and
 their reasons when generation can finish.

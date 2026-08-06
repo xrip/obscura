@@ -1,5 +1,6 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use obscura_js::ops::OriginStorage;
 use obscura_net::{CookieJar, ObscuraHttpClient, RobotsCache};
@@ -33,6 +34,28 @@ pub struct BrowserContext {
     /// models: file:// is a local file-system read, while private-network is
     /// the broader SSRF gate from issue #4.
     pub allow_private_network: bool,
+}
+
+fn warn_profile_consistency(profile: &crate::profiles::ResolvedFingerprintProfile) {
+    let browser_major = profile.browser.major;
+    if browser_major == crate::profiles::GRAPHICS_API_BROWSER_MAJOR {
+        return;
+    }
+    static WARNED_MAJORS: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
+    let Ok(mut warned) = WARNED_MAJORS
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+    else {
+        return;
+    };
+    if warned.insert(browser_major) {
+        tracing::warn!(
+            profile_id = profile.id,
+            browser_major,
+            graphics_api_browser_major = crate::profiles::GRAPHICS_API_BROWSER_MAJOR,
+            "selected Chrome profile uses a different browser major than the JS graphics API shape; cross-surface inconsistencies are possible"
+        );
+    }
 }
 
 static WARNED_CUSTOM_USER_AGENT: OnceLock<()> = OnceLock::new();
@@ -113,13 +136,15 @@ impl BrowserContext {
         }
         let profile = crate::profiles::resolve_profile()
             .unwrap_or_else(|error| panic!("failed to load the browser fingerprint profile: {error}"));
+        warn_profile_consistency(&profile);
         if user_agent
             .as_deref()
             .is_some_and(|value| value != profile.browser.user_agent)
             && WARNED_CUSTOM_USER_AGENT.set(()).is_ok()
         {
             tracing::warn!(
-                "custom user agent does not match the Chrome 145 Windows catalog; the caller owns cross-surface consistency"
+                browser_major = profile.browser.major,
+                "custom user agent does not match the selected Chrome Windows profile; the caller owns cross-surface consistency"
             );
         }
         let resolved_ua = user_agent.unwrap_or_else(|| profile.browser.user_agent.clone());
@@ -235,6 +260,7 @@ impl BrowserContext {
         storage_dir: Option<PathBuf>,
         profile: Arc<crate::profiles::ResolvedFingerprintProfile>,
     ) -> Self {
+        warn_profile_consistency(&profile);
         let user_agent = if self.user_agent == self.fingerprint_profile.browser.user_agent {
             profile.browser.user_agent.clone()
         } else {
@@ -315,9 +341,16 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .find_map(|row| row["id"].as_str().filter(|id| *id != parts[2]))
+            .find_map(|row| {
+                let supports_145 = row["observationsByBrowserVersion"]
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .any(|version| version.starts_with("145."));
+                supports_145.then(|| row["id"].as_str()).flatten().filter(|id| *id != parts[2])
+            })
             .unwrap();
-        format!("c145w1:{}:{}:{}", parts[1], graphics_id, parts[3])
+        format!("{}:{}:{}:{}", parts[0], parts[1], graphics_id, parts[3])
     }
 
     #[tokio::test(flavor = "current_thread")]

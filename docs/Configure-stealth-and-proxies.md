@@ -64,24 +64,30 @@ obscura fetch https://example.com --user-agent "Mozilla/5.0 (...) ..."
 obscura serve --user-agent "Mozilla/5.0 (...) ..."
 ```
 
-The default UA is the UA from the selected Chrome 145 Windows profile. A custom
-UA changes the HTTP header and `navigator.userAgent` only. If it is not an exact
-Chrome 145 Windows UA, Obscura gives one warning. The caller then owns the match
-between the custom UA and all other profile data.
+The default UA is the UA from the selected Chrome Windows profile. A custom UA
+changes the HTTP header and `navigator.userAgent` only. If it is not the exact
+UA from the selected base row, Obscura gives one warning. The caller then owns
+the match between the custom UA and all other profile data.
 
 ## Browser profile, timezone, and geolocation
 
-The engine has a Chrome 145 Windows catalog. One profile joins the browser,
-navigator, screen, window, WebGL, and WebGPU data for a `BrowserContext`. All
-pages, navigation, iframe shims, and worker shims in that context use the same
-profile. Graphics data always stays with its captured ANGLE/D3D11 adapter row.
+The engine has a versioned Chrome Windows catalog. One profile joins the
+browser, navigator, screen, window, WebGL, and WebGPU data for a
+`BrowserContext`. All pages, navigation, iframe shims, and worker shims in that
+context use the same profile. Graphics data always stays with its captured
+ANGLE/D3D11 adapter row.
+
+The fixed default and JavaScript graphics API shape are Chrome 145. Other
+captured majors are selectable with a consistency warning. Stealth mode uses
+an exact pinned `wreq` transport where possible, or the nearest one with a
+second warning.
 
 A single stable profile is used by default. One IP cycling through different identities is itself a signal, so rotation is opt-in:
 
 ```bash
 OBSCURA_PROFILE=0 obscura serve          # fixed catalog default
 OBSCURA_PROFILE=42 obscura serve         # stable catalog seed
-OBSCURA_PROFILE=c145w1:BASE:GRAPHICS:SCREEN obscura serve  # exact ID
+OBSCURA_PROFILE=c150w1:BASE:GRAPHICS:SCREEN obscura serve  # exact versioned ID
 OBSCURA_ROTATE_PROFILE=1 obscura serve   # weighted random parts per context
 ```
 

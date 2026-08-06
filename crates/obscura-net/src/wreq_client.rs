@@ -1,9 +1,9 @@
 #[cfg(feature = "stealth")]
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 #[cfg(feature = "stealth")]
 use std::error::Error;
 #[cfg(feature = "stealth")]
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 #[cfg(feature = "stealth")]
 use std::time::Duration;
 
@@ -30,6 +30,74 @@ pub const STEALTH_NAVIGATOR_PLATFORM: &str = "Win32";
 pub const STEALTH_UA_PLATFORM: &str = "Windows";
 #[cfg(feature = "stealth")]
 pub const STEALTH_UA_PLATFORM_VERSION: &str = "15.0.0";
+
+#[cfg(feature = "stealth")]
+const CHROME_TRANSPORT_PROFILES: &[(u32, wreq_util::Profile)] = &[
+    (100, wreq_util::Profile::Chrome100),
+    (101, wreq_util::Profile::Chrome101),
+    (104, wreq_util::Profile::Chrome104),
+    (105, wreq_util::Profile::Chrome105),
+    (106, wreq_util::Profile::Chrome106),
+    (107, wreq_util::Profile::Chrome107),
+    (108, wreq_util::Profile::Chrome108),
+    (109, wreq_util::Profile::Chrome109),
+    (110, wreq_util::Profile::Chrome110),
+    (114, wreq_util::Profile::Chrome114),
+    (116, wreq_util::Profile::Chrome116),
+    (117, wreq_util::Profile::Chrome117),
+    (118, wreq_util::Profile::Chrome118),
+    (119, wreq_util::Profile::Chrome119),
+    (120, wreq_util::Profile::Chrome120),
+    (123, wreq_util::Profile::Chrome123),
+    (124, wreq_util::Profile::Chrome124),
+    (126, wreq_util::Profile::Chrome126),
+    (127, wreq_util::Profile::Chrome127),
+    (128, wreq_util::Profile::Chrome128),
+    (129, wreq_util::Profile::Chrome129),
+    (130, wreq_util::Profile::Chrome130),
+    (131, wreq_util::Profile::Chrome131),
+    (132, wreq_util::Profile::Chrome132),
+    (133, wreq_util::Profile::Chrome133),
+    (134, wreq_util::Profile::Chrome134),
+    (135, wreq_util::Profile::Chrome135),
+    (136, wreq_util::Profile::Chrome136),
+    (137, wreq_util::Profile::Chrome137),
+    (138, wreq_util::Profile::Chrome138),
+    (139, wreq_util::Profile::Chrome139),
+    (140, wreq_util::Profile::Chrome140),
+    (141, wreq_util::Profile::Chrome141),
+    (142, wreq_util::Profile::Chrome142),
+    (143, wreq_util::Profile::Chrome143),
+    (144, wreq_util::Profile::Chrome144),
+    (145, wreq_util::Profile::Chrome145),
+    (146, wreq_util::Profile::Chrome146),
+    (147, wreq_util::Profile::Chrome147),
+    (148, wreq_util::Profile::Chrome148),
+];
+
+#[cfg(feature = "stealth")]
+fn chrome_transport_profile(browser_major: u32) -> (u32, wreq_util::Profile) {
+    CHROME_TRANSPORT_PROFILES
+        .iter()
+        .copied()
+        .min_by_key(|(major, _)| major.abs_diff(browser_major))
+        .expect("wreq Chrome transport profile table is not empty")
+}
+
+#[cfg(feature = "stealth")]
+fn warn_transport_mismatch_once(browser_major: u32, transport_major: u32) {
+    static WARNED: OnceLock<Mutex<HashSet<u32>>> = OnceLock::new();
+    let Ok(mut warned) = WARNED.get_or_init(|| Mutex::new(HashSet::new())).lock() else {
+        return;
+    };
+    if warned.insert(browser_major) {
+        tracing::warn!(
+            browser_major,
+            transport_major,
+            "selected Chrome profile has no exact wreq transport; using the nearest transport profile"
+        );
+    }
+}
 
 #[cfg(feature = "stealth")]
 struct StealthSsrfResolver {
@@ -76,6 +144,7 @@ pub struct StealthHttpClient {
     sec_ch_ua: String,
     sec_ch_ua_platform: String,
     allow_private_network: bool,
+    transport_browser_major: u32,
     pub cookie_jar: Arc<CookieJar>,
     pub extra_headers: RwLock<HashMap<String, String>>,
     pub in_flight: Arc<std::sync::atomic::AtomicU32>,
@@ -103,6 +172,7 @@ impl StealthHttpClient {
             user_agent,
             &sec_ch_ua,
             &sec_ch_ua_platform,
+            145,
             false,
         )
     }
@@ -113,10 +183,15 @@ impl StealthHttpClient {
         user_agent: &str,
         sec_ch_ua: &str,
         sec_ch_ua_platform: &str,
+        browser_major: u32,
         allow_private_network: bool,
     ) -> Self {
+        let (transport_browser_major, transport_profile) = chrome_transport_profile(browser_major);
+        if transport_browser_major != browser_major {
+            warn_transport_mismatch_once(browser_major, transport_browser_major);
+        }
         let emulation_opts = wreq_util::Emulation::builder()
-            .profile(wreq_util::Profile::Chrome145)
+            .profile(transport_profile)
             .platform(wreq_util::Platform::Windows)
             .build();
 
@@ -174,6 +249,7 @@ impl StealthHttpClient {
             sec_ch_ua: sec_ch_ua.to_owned(),
             sec_ch_ua_platform: sec_ch_ua_platform.to_owned(),
             allow_private_network,
+            transport_browser_major,
             cookie_jar,
             extra_headers: RwLock::new(HashMap::new()),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -418,6 +494,10 @@ impl StealthHttpClient {
         self.in_flight.load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    pub fn transport_browser_major(&self) -> u32 {
+        self.transport_browser_major
+    }
+
     pub fn is_network_idle(&self) -> bool {
         self.active_requests() == 0
     }
@@ -428,6 +508,7 @@ fn referrer_for_target(referrer: &Url, target: &Url) -> Option<Url> {
     if referrer.scheme() == "https" && target.scheme() == "http" {
         return None;
     }
+
     if referrer.origin().ascii_serialization() == target.origin().ascii_serialization() {
         let mut value = referrer.clone();
         value.set_fragment(None);
@@ -441,6 +522,14 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn browser_major_uses_exact_or_nearest_transport() {
+        assert_eq!(chrome_transport_profile(143).0, 143);
+        assert_eq!(chrome_transport_profile(148).0, 148);
+        assert_eq!(chrome_transport_profile(150).0, 148);
+        assert_eq!(chrome_transport_profile(103).0, 104);
+    }
 
     #[tokio::test]
     async fn private_targets_are_blocked_before_the_request() {
@@ -481,6 +570,7 @@ mod tests {
             "Profile User Agent",
             sec_ch_ua,
             r#""Windows""#,
+            145,
             true,
         );
         let request_count = Arc::new(AtomicUsize::new(0));

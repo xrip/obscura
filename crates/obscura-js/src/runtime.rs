@@ -1558,7 +1558,7 @@ mod tests {
         rt.set_title("Graphics Test");
         rt.set_fingerprint_profile(r#"{
             "id":"c145w1:test-base:test-graphics:test-screen",
-            "catalogId":"chrome-145-windows-v1",
+            "catalogId":"chrome-windows-v1",
             "renderSeed":"00112233445566778899aabbccddeeff",
             "browser":{"version":"145.0.7632.75","userAgent":"Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/145.0.0.0"},
             "navigator":{"platform":"Win32","uaPlatform":"Windows","uaPlatformVersion":"19.0.0","architecture":"x86","bitness":"64","brands":[{"brand":"Chromium","version":"145"}],"fullVersionList":[{"brand":"Chromium","version":"145.0.7632.75"}],"languages":["en-US","en"],"hardwareConcurrency":8,"deviceMemory":8,"maxTouchPoints":0},
@@ -1577,7 +1577,7 @@ mod tests {
         static RUNTIME_JSON: std::sync::OnceLock<String> = std::sync::OnceLock::new();
         let runtime_json = RUNTIME_JSON.get_or_init(|| {
             let catalog: serde_json::Value = serde_json::from_str(include_str!(
-                "../../obscura-browser/data/chrome-145-windows-v1.json"
+                "../../obscura-browser/data/chrome-windows-v1.json"
             )).unwrap();
             let composition = &catalog["defaultComposition"];
             let find = |table: &serde_json::Value, id: &str| {
@@ -1591,8 +1591,35 @@ mod tests {
                 value.as_object_mut().unwrap().remove("id");
                 value
             };
+            let webgpu_root = find(
+                &catalog["components"]["webgpu"],
+                graphics["webgpuId"].as_str().unwrap(),
+            );
+            let mut webgpu_adapters = serde_json::Map::new();
+            for (name, adapter_id) in webgpu_root["adapters"].as_object().unwrap() {
+                let adapter = find(
+                    &catalog["components"]["webgpuAdapters"],
+                    adapter_id.as_str().unwrap(),
+                );
+                let limits = find(
+                    &catalog["components"]["webgpuLimits"],
+                    adapter["limitsId"].as_str().unwrap(),
+                );
+                let device_limits = find(
+                    &catalog["components"]["webgpuLimits"],
+                    adapter["defaultDeviceLimitsId"].as_str().unwrap(),
+                );
+                webgpu_adapters.insert(name.clone(), serde_json::json!({
+                    "info": adapter["info"],
+                    "features": adapter["features"],
+                    "limits": limits["values"],
+                    "defaultDeviceLimits": device_limits["values"],
+                }));
+            }
+            let browser_major = base["browserVersion"].as_str().unwrap().split('.').next().unwrap();
             let id = format!(
-                "c145w1:{}:{}:{}",
+                "c{}w1:{}:{}:{}",
+                browser_major,
                 composition["baseId"].as_str().unwrap(),
                 composition["graphicsId"].as_str().unwrap(),
                 composition["screenId"].as_str().unwrap()
@@ -1616,7 +1643,7 @@ mod tests {
                     "preferredCanvasFormat":graphics["preferredCanvasFormat"],"wgslLanguageFeatures":graphics["wgslLanguageFeatures"],
                     "webgl1":component("webgl1",graphics["webgl1Id"].as_str().unwrap()),
                     "webgl2":component("webgl2",graphics["webgl2Id"].as_str().unwrap()),
-                    "webgpu":component("webgpu",graphics["webgpuId"].as_str().unwrap())
+                    "webgpu":{"adapters":webgpu_adapters}
                 }
             })).unwrap()
         });

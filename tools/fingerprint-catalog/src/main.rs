@@ -8,21 +8,22 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-const CATALOG_ID: &str = "chrome-145-windows-v1";
+const CATALOG_ID: &str = "chrome-windows-v1";
 const MAX_CATALOG_BYTES: usize = 2 * 1024 * 1024;
 const MASKED_VENDOR: &str = "WebKit";
 const MASKED_RENDERER: &str = "WebKit WebGL";
-const PREFERRED_CANVAS_FORMAT: &str = "bgra8unorm";
-const WGSL_LANGUAGE_FEATURES: &[&str] = &[
-    "packed_4x8_integer_dot_product",
-    "pointer_composite_access",
-    "readonly_and_readwrite_storage_textures",
-    "unrestricted_pointer_parameters",
+const DEFAULT_BROWSER_MAJOR: &str = "145";
+const GRAPHICS_API_BROWSER_MAJOR: u32 = 145;
+const GRAPHICS_API_REVISION: &str = "145.0.7632.75";
+const WREQ_BROWSER_MAJORS: &[u32] = &[
+    100, 101, 104, 105, 106, 107, 108, 109, 110, 114, 116, 117, 118, 119, 120,
+    123, 124, 126, 127, 128, 129, 130, 131, 132, 133, 134, 135, 136, 137, 138,
+    139, 140, 141, 142, 143, 144, 145, 146, 147, 148,
 ];
 
 #[derive(Parser)]
 #[command(name = "fingerprint-catalog")]
-#[command(about = "Build the Obscura Chrome 145 Windows fingerprint catalog")]
+#[command(about = "Build the Obscura Chrome Windows fingerprint catalog")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -38,8 +39,6 @@ struct GenerateArgs {
     #[arg(long)]
     profiles: PathBuf,
     #[arg(long)]
-    adapters: PathBuf,
-    #[arg(long)]
     windows: PathBuf,
     #[arg(long)]
     out: PathBuf,
@@ -54,8 +53,6 @@ struct GenerateArgs {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 struct SourceDigests {
-    adapters_sha256: String,
-    adapters_bytes: u64,
     windows_sha256: String,
     windows_bytes: u64,
     profiles_sha256: String,
@@ -67,8 +64,10 @@ struct SourceDigests {
 #[serde(rename_all = "camelCase")]
 struct Target {
     browser: String,
-    browser_major: u32,
-    browser_revision: String,
+    default_browser_major: u32,
+    graphics_api_browser_major: u32,
+    graphics_api_revision: String,
+    transport_browser_majors: Vec<u32>,
     os: String,
     graphics_backend: String,
 }
@@ -207,7 +206,7 @@ struct AdapterInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
-struct WebGpuAdapter {
+struct WebGpuAdapterContent {
     info: AdapterInfo,
     features: Vec<String>,
     limits: BTreeMap<String, Value>,
@@ -217,15 +216,31 @@ struct WebGpuAdapter {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 struct WebGpuContent {
-    adapters: BTreeMap<String, WebGpuAdapter>,
+    adapters: BTreeMap<String, WebGpuAdapterContent>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct WebGpuComponent {
     id: String,
-    #[serde(flatten)]
-    content: WebGpuContent,
+    adapters: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WebGpuAdapterComponent {
+    id: String,
+    info: AdapterInfo,
+    features: Vec<String>,
+    limits_id: String,
+    default_device_limits_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WebGpuLimitsComponent {
+    id: String,
+    values: BTreeMap<String, Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -248,14 +263,24 @@ struct GraphicsProfile {
     id: String,
     #[serde(flatten)]
     content: GraphicsContent,
+    observations_by_browser_version: BTreeMap<String, u64>,
     weight: u64,
 }
 
+#[derive(Debug)]
+struct GraphicsAggregate {
+    content: GraphicsContent,
+    observations_by_browser_version: BTreeMap<String, u64>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct Components {
     webgl1: Vec<WebGlComponent>,
     webgl2: Vec<WebGlComponent>,
     webgpu: Vec<WebGpuComponent>,
+    webgpu_adapters: Vec<WebGpuAdapterComponent>,
+    webgpu_limits: Vec<WebGpuLimitsComponent>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -406,6 +431,20 @@ fn string_list(value: &Value, path: &[&str]) -> Result<Vec<String>> {
     Ok(out)
 }
 
+fn string_list_allow_empty(value: &Value, path: &[&str]) -> Result<Vec<String>> {
+    let list = value_at(value, path)?
+        .as_array()
+        .ok_or_else(|| anyhow!("{} is not an array", path.join(".")))?;
+    list.iter()
+        .map(|item| {
+            item.as_str()
+                .filter(|item| !item.is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| anyhow!("{} has an invalid string", path.join(".")))
+        })
+        .collect()
+}
+
 fn brand_list(value: &Value, path: &[&str]) -> Result<Vec<BrandVersion>> {
     let list = value_at(value, path)?
         .as_array()
@@ -423,11 +462,58 @@ fn brand_list(value: &Value, path: &[&str]) -> Result<Vec<BrandVersion>> {
     Ok(out)
 }
 
+fn chrome_major(version: &str) -> Result<&str> {
+    let parts: Vec<&str> = version.split('.').collect();
+    if parts.len() != 4
+        || parts
+            .iter()
+            .any(|part| part.is_empty() || !part.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        bail!("browser version is not four numeric parts");
+    }
+    let major = parts[0];
+    Ok(major)
+}
+
+fn parse_windows_browser_version(value: &Value) -> Result<String> {
+    let browser_version = string_at(value, &["fingerprints", "browser", "version"])?;
+    let major = chrome_major(&browser_version)?;
+    let os_type = string_at(value, &["fingerprints", "system", "osType"])?;
+    if os_type != "win" {
+        bail!("operating system is not Windows");
+    }
+    let ua_data = value_at(value, &["fingerprints", "browser", "userAgentData"])?;
+    if string_at(ua_data, &["platform"])? != "Windows" {
+        bail!("UA data platform is not Windows");
+    }
+    if string_at(ua_data, &["uaFullVersion"])? != browser_version {
+        bail!("browser and UA data full versions differ");
+    }
+    let user_agent = string_at(value, &["fingerprints", "browser", "userAgent"])?;
+    let navigator_user_agent =
+        string_at(value, &["fingerprints", "browser", "navigator", "userAgent"])?;
+    if user_agent != navigator_user_agent {
+        bail!("browser and navigator user agents differ");
+    }
+    let reduced_version = format!("Chrome/{major}.0.0.0");
+    if !user_agent.contains("(Windows NT 10.0; Win64; x64)")
+        || !user_agent.contains(&reduced_version)
+    {
+        bail!("user agent does not match the browser major and Windows x64");
+    }
+    let full_version_list = brand_list(ua_data, &["fullVersionList"])?;
+    if !full_version_list.iter().any(|item| {
+        (item.brand == "Google Chrome" || item.brand == "Chromium")
+            && item.version == browser_version
+    }) {
+        bail!("UA data full version list does not match the browser version");
+    }
+    Ok(browser_version)
+}
+
 fn parse_base_profile(value: &Value) -> Result<BaseContent> {
     let browser_version = string_at(value, &["fingerprints", "browser", "version"])?;
-    if browser_version.split('.').next() != Some("145") {
-        bail!("browser major is not 145");
-    }
+    let browser_major = chrome_major(&browser_version)?;
 
     let user_agent = string_at(value, &["fingerprints", "browser", "userAgent"])?;
     let navigator_user_agent =
@@ -436,9 +522,9 @@ fn parse_base_profile(value: &Value) -> Result<BaseContent> {
         bail!("browser and navigator user agents differ");
     }
     if !user_agent.contains("(Windows NT 10.0; Win64; x64)")
-        || !user_agent.contains("Chrome/145.0.0.0")
+        || !user_agent.contains(&format!("Chrome/{browser_major}.0.0.0"))
     {
-        bail!("user agent is not reduced Chrome 145 Windows x64");
+        bail!("user agent is not reduced Chrome Windows x64 for the browser major");
     }
 
     let os_type = string_at(value, &["fingerprints", "system", "osType"])?;
@@ -475,14 +561,14 @@ fn parse_base_profile(value: &Value) -> Result<BaseContent> {
     let full_version_list = brand_list(ua_data, &["fullVersionList"])?;
     let brand_major_ok = brands.iter().any(|item| {
         (item.brand == "Google Chrome" || item.brand == "Chromium")
-            && item.version == "145"
+            && item.version == browser_major
     });
     let full_version_ok = full_version_list.iter().any(|item| {
         (item.brand == "Google Chrome" || item.brand == "Chromium")
             && item.version == browser_version
     });
     if !brand_major_ok || !full_version_ok {
-        bail!("UA data brand versions do not match Chrome 145");
+        bail!("UA data brand versions do not match the browser version");
     }
 
     let languages = string_list(
@@ -769,7 +855,7 @@ fn optional_u32(value: Option<&Value>) -> Result<Option<u32>> {
         .transpose()
 }
 
-fn normalize_webgpu_adapter(value: &Value) -> Result<WebGpuAdapter> {
+fn normalize_webgpu_adapter(value: &Value) -> Result<WebGpuAdapterContent> {
     let raw_info = value
         .get("info")
         .and_then(Value::as_object)
@@ -805,9 +891,9 @@ fn normalize_webgpu_adapter(value: &Value) -> Result<WebGpuAdapter> {
     };
 
     let mut features = string_list(value, &["features"])?;
-    features.sort();
-    features.dedup();
-    Ok(WebGpuAdapter {
+    let mut seen = HashSet::new();
+    features.retain(|feature| seen.insert(feature.clone()));
+    Ok(WebGpuAdapterContent {
         info,
         features,
         limits: numeric_map(value.get("limits"), "limits")?,
@@ -831,7 +917,108 @@ fn normalize_webgpu(value: &Value) -> Result<WebGpuContent> {
             }
         }
     }
+    if !adapters.contains_key("default") {
+        bail!("default WebGPU adapter is missing");
+    }
     Ok(WebGpuContent { adapters })
+}
+
+fn parse_graphics_content(
+    value: &Value,
+    webgl1_components: &mut BTreeMap<String, WebGlComponent>,
+    webgl2_components: &mut BTreeMap<String, WebGlComponent>,
+    webgpu_components: &mut BTreeMap<String, WebGpuComponent>,
+    webgpu_adapter_components: &mut BTreeMap<String, WebGpuAdapterComponent>,
+    webgpu_limits_components: &mut BTreeMap<String, WebGpuLimitsComponent>,
+    collisions: &mut CollisionGuard,
+) -> Result<GraphicsContent> {
+    let webgl1_source = value_at(value, &["fingerprints", "browser", "webglContext"])?;
+    let webgl1 = normalize_webgl(webgl1_source, false)?;
+    let webgl2_source = value_at(value, &["fingerprints", "browser", "webgl2Context"])?;
+    let webgl2 = normalize_webgl(webgl2_source, true)?;
+    let gpu = value_at(value, &["fingerprints", "hardware", "gpu"])?;
+    let webgpu = normalize_webgpu(value_at(gpu, &["adapter"])?)?;
+    let unmasked_vendor = string_at(gpu, &["unmaskedVendor"])?;
+    let unmasked_renderer = string_at(gpu, &["unmaskedRenderer"])?;
+    if !unmasked_renderer.contains("Direct3D11") || !unmasked_renderer.contains("D3D11") {
+        bail!("graphics renderer is not ANGLE/D3D11");
+    }
+    let preferred_canvas_format = string_at(gpu, &["preferredCanvasFormat"])?;
+    if preferred_canvas_format != "bgra8unorm" && preferred_canvas_format != "rgba8unorm" {
+        bail!("preferred WebGPU canvas format is invalid");
+    }
+    let wgsl_language_features =
+        string_list_allow_empty(gpu, &["wgslLanguageFeatures"])?;
+    let mut seen_wgsl = HashSet::new();
+    if wgsl_language_features
+        .iter()
+        .any(|feature| !seen_wgsl.insert(feature.as_str()))
+    {
+        bail!("WGSL language feature list has a duplicate");
+    }
+
+    let webgl1_id = add_component(
+        webgl1,
+        webgl1_components,
+        collisions,
+        |id, content| WebGlComponent { id, content },
+    )?;
+    let webgl2_id = add_component(
+        webgl2,
+        webgl2_components,
+        collisions,
+        |id, content| WebGlComponent { id, content },
+    )?;
+    let webgpu_id = add_webgpu_component(
+        webgpu,
+        webgpu_components,
+        webgpu_adapter_components,
+        webgpu_limits_components,
+        collisions,
+    )?;
+    Ok(GraphicsContent {
+        masked_vendor: MASKED_VENDOR.to_owned(),
+        masked_renderer: MASKED_RENDERER.to_owned(),
+        unmasked_vendor,
+        unmasked_renderer,
+        webgl1_id,
+        webgl2_id,
+        webgpu_id,
+        preferred_canvas_format,
+        wgsl_language_features,
+    })
+}
+
+fn insert_graphics_observation(
+    rows: &mut BTreeMap<Vec<u8>, GraphicsAggregate>,
+    content: GraphicsContent,
+    browser_version: &str,
+) -> Result<()> {
+    let key = serde_json::to_vec(&content)?;
+    let row = rows.entry(key).or_insert_with(|| GraphicsAggregate {
+        content,
+        observations_by_browser_version: BTreeMap::new(),
+    });
+    let weight = row
+        .observations_by_browser_version
+        .entry(browser_version.to_owned())
+        .or_default();
+    *weight = weight
+        .checked_add(1)
+        .ok_or_else(|| anyhow!("graphics observation weight overflow"))?;
+    Ok(())
+}
+
+fn browser_major_weight(weights: &BTreeMap<String, u64>, major: &str) -> Result<u64> {
+    weights.iter().try_fold(0u64, |total, (version, weight)| {
+        if chrome_major(version)? == major {
+            total
+                .checked_add(*weight)
+                .ok_or_else(|| anyhow!("graphics browser-major weight overflow"))
+        } else {
+            Ok(total)
+        }
+    })
 }
 
 fn insert_weighted<T>(rows: &mut BTreeMap<Vec<u8>, (T, u64)>, content: T) -> Result<()>
@@ -865,13 +1052,21 @@ where
 
 fn sorted_profile_paths(directory: &Path) -> Result<Vec<PathBuf>> {
     let mut paths = Vec::new();
-    for entry in fs::read_dir(directory)
-        .with_context(|| format!("read profile directory {}", directory.display()))?
-    {
-        let entry = entry?;
-        let path = entry.path();
-        if path.extension().and_then(|value| value.to_str()) == Some("json") {
-            paths.push(path);
+    let mut directories = vec![directory.to_path_buf()];
+    while let Some(current) = directories.pop() {
+        for entry in fs::read_dir(&current)
+            .with_context(|| format!("read profile directory {}", current.display()))?
+        {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            let path = entry.path();
+            if file_type.is_dir() {
+                directories.push(path);
+            } else if file_type.is_file()
+                && path.extension().and_then(|value| value.to_str()) == Some("json")
+            {
+                paths.push(path);
+            }
         }
     }
     paths.sort();
@@ -879,6 +1074,64 @@ fn sorted_profile_paths(directory: &Path) -> Result<Vec<PathBuf>> {
         bail!("profile directory has no JSON files");
     }
     Ok(paths)
+}
+
+fn add_webgpu_limits_component(
+    values: BTreeMap<String, Value>,
+    components: &mut BTreeMap<String, WebGpuLimitsComponent>,
+    collisions: &mut CollisionGuard,
+) -> Result<String> {
+    let id = collisions.id(&values)?;
+    components
+        .entry(id.clone())
+        .or_insert_with(|| WebGpuLimitsComponent {
+            id: id.clone(),
+            values,
+        });
+    Ok(id)
+}
+
+fn add_webgpu_component(
+    content: WebGpuContent,
+    components: &mut BTreeMap<String, WebGpuComponent>,
+    adapter_components: &mut BTreeMap<String, WebGpuAdapterComponent>,
+    limits_components: &mut BTreeMap<String, WebGpuLimitsComponent>,
+    collisions: &mut CollisionGuard,
+) -> Result<String> {
+    let id = collisions.id(&content)?;
+    if components.contains_key(&id) {
+        return Ok(id);
+    }
+
+    let mut adapters = BTreeMap::new();
+    for (name, adapter) in content.adapters {
+        let adapter_id = collisions.id(&adapter)?;
+        if !adapter_components.contains_key(&adapter_id) {
+            let limits_id = add_webgpu_limits_component(
+                adapter.limits,
+                limits_components,
+                collisions,
+            )?;
+            let default_device_limits_id = add_webgpu_limits_component(
+                adapter.default_device_limits,
+                limits_components,
+                collisions,
+            )?;
+            adapter_components.insert(
+                adapter_id.clone(),
+                WebGpuAdapterComponent {
+                    id: adapter_id.clone(),
+                    info: adapter.info,
+                    features: adapter.features,
+                    limits_id,
+                    default_device_limits_id,
+                },
+            );
+        }
+        adapters.insert(name, adapter_id);
+    }
+    components.insert(id.clone(), WebGpuComponent { id: id.clone(), adapters });
+    Ok(id)
 }
 
 fn add_component<T, O>(
@@ -900,8 +1153,8 @@ where
 fn make_schema() -> Value {
     json!({
         "$schema": "https://json-schema.org/draft/2020-12/schema",
-        "$id": "https://obscura.dev/schema/chrome-145-windows-v1.schema.json",
-        "title": "Obscura Chrome 145 Windows fingerprint catalog",
+        "$id": "https://obscura.dev/schema/chrome-windows-v1.schema.json",
+        "title": "Obscura Chrome Windows fingerprint catalog",
         "type": "object",
         "additionalProperties": false,
         "required": [
@@ -930,19 +1183,19 @@ fn make_schema() -> Value {
             },
             "target": {
                 "type": "object", "additionalProperties": false,
-                "required": ["browser","browserMajor","browserRevision","os","graphicsBackend"],
+                "required": ["browser","defaultBrowserMajor","graphicsApiBrowserMajor","graphicsApiRevision","transportBrowserMajors","os","graphicsBackend"],
                 "properties": {
-                    "browser":{"const":"Chrome"}, "browserMajor":{"const":145},
-                    "browserRevision":{"const":"145.0.7632.75"},
+                    "browser":{"const":"Chrome"}, "defaultBrowserMajor":{"const":145},
+                    "graphicsApiBrowserMajor":{"const":145},
+                    "graphicsApiRevision":{"const":"145.0.7632.75"},
+                    "transportBrowserMajors":{"type":"array","minItems":1,"items":{"type":"integer","minimum":1},"uniqueItems":true},
                     "os":{"const":"Windows"}, "graphicsBackend":{"const":"ANGLE/D3D11"}
                 }
             },
             "sourceDigests": {
                 "type":"object", "additionalProperties":false,
-                "required":["adaptersSha256","adaptersBytes","windowsSha256","windowsBytes","profilesSha256","profilesFiles","profilesBytes"],
+                "required":["windowsSha256","windowsBytes","profilesSha256","profilesFiles","profilesBytes"],
                 "properties": {
-                    "adaptersSha256":{"type":"string","pattern":"^[0-9a-f]{64}$"},
-                    "adaptersBytes":{"type":"integer","minimum":1},
                     "windowsSha256":{"type":"string","pattern":"^[0-9a-f]{64}$"},
                     "windowsBytes":{"type":"integer","minimum":1},
                     "profilesSha256":{"type":"string","pattern":"^[0-9a-f]{64}$"},
@@ -959,7 +1212,7 @@ fn make_schema() -> Value {
                 "type":"object", "additionalProperties":false,
                 "required":["id","browserVersion","userAgent","brands","fullVersionList","platform","platformVersion","architecture","bitness","languages","hardwareConcurrency","deviceMemory","maxTouchPoints","weight"],
                 "properties": {
-                    "id":{"$ref":"#/$defs/id"}, "browserVersion":{"type":"string","pattern":"^145\\."},
+                    "id":{"$ref":"#/$defs/id"}, "browserVersion":{"type":"string","pattern":"^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$"},
                     "userAgent":{"type":"string"}, "brands":{"type":"array","items":{"$ref":"#/$defs/brand"}},
                     "fullVersionList":{"type":"array","items":{"$ref":"#/$defs/brand"}},
                     "platform":{"const":"Windows"}, "platformVersion":{"type":"string"},
@@ -982,13 +1235,15 @@ fn make_schema() -> Value {
             },
             "graphicsProfile": {
                 "type":"object", "additionalProperties":false,
-                "required":["id","maskedVendor","maskedRenderer","unmaskedVendor","unmaskedRenderer","webgl1Id","webgl2Id","webgpuId","preferredCanvasFormat","wgslLanguageFeatures","weight"],
+                "required":["id","maskedVendor","maskedRenderer","unmaskedVendor","unmaskedRenderer","webgl1Id","webgl2Id","webgpuId","preferredCanvasFormat","wgslLanguageFeatures","observationsByBrowserVersion","weight"],
                 "properties": {
                     "id":{"$ref":"#/$defs/id"}, "maskedVendor":{"type":"string"}, "maskedRenderer":{"type":"string"},
                     "unmaskedVendor":{"type":"string"}, "unmaskedRenderer":{"type":"string"},
                     "webgl1Id":{"$ref":"#/$defs/id"}, "webgl2Id":{"$ref":"#/$defs/id"}, "webgpuId":{"$ref":"#/$defs/id"},
                     "preferredCanvasFormat":{"enum":["bgra8unorm","rgba8unorm"]},
-                    "wgslLanguageFeatures":{"type":"array","items":{"type":"string"},"uniqueItems":true}, "weight":{"$ref":"#/$defs/weight"}
+                    "wgslLanguageFeatures":{"type":"array","items":{"type":"string"},"uniqueItems":true},
+                    "observationsByBrowserVersion":{"type":"object","minProperties":1,"propertyNames":{"pattern":"^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$"},"additionalProperties":{"$ref":"#/$defs/weight"}},
+                    "weight":{"$ref":"#/$defs/weight"}
                 }
             },
             "parameter": {
@@ -999,13 +1254,30 @@ fn make_schema() -> Value {
                 "type":"object", "required":["id","contextAttributes","parameters","initialState","extensions","supportedExtensions","shaderPrecisionFormats","version","shadingLanguageVersion","maxAnisotropy"],
                 "properties":{"id":{"$ref":"#/$defs/id"},"parameters":{"type":"object","additionalProperties":{"$ref":"#/$defs/parameter"}},"initialState":{"type":"object","additionalProperties":{"$ref":"#/$defs/parameter"}}}
             },
-            "webgpu": {"type":"object","required":["id","adapters"],"properties":{"id":{"$ref":"#/$defs/id"},"adapters":{"type":"object"}}},
+            "webgpu": {
+                "type":"object","additionalProperties":false,"required":["id","adapters"],
+                "properties":{
+                    "id":{"$ref":"#/$defs/id"},
+                    "adapters":{
+                        "type":"object","additionalProperties":false,"required":["default"],
+                        "properties":{
+                            "default":{"$ref":"#/$defs/id"},
+                            "lowPower":{"$ref":"#/$defs/id"},
+                            "highPerformance":{"$ref":"#/$defs/id"}
+                        }
+                    }
+                }
+            },
+            "webgpuAdapter": {"type":"object","additionalProperties":false,"required":["id","info","features","limitsId","defaultDeviceLimitsId"],"properties":{"id":{"$ref":"#/$defs/id"},"info":{"type":"object"},"features":{"type":"array","items":{"type":"string"},"uniqueItems":true},"limitsId":{"$ref":"#/$defs/id"},"defaultDeviceLimitsId":{"$ref":"#/$defs/id"}}},
+            "webgpuLimits": {"type":"object","additionalProperties":false,"required":["id","values"],"properties":{"id":{"$ref":"#/$defs/id"},"values":{"type":"object"}}},
             "components": {
-                "type":"object", "additionalProperties":false, "required":["webgl1","webgl2","webgpu"],
+                "type":"object", "additionalProperties":false, "required":["webgl1","webgl2","webgpu","webgpuAdapters","webgpuLimits"],
                 "properties": {
                     "webgl1":{"type":"array","minItems":1,"items":{"$ref":"#/$defs/webgl"}},
                     "webgl2":{"type":"array","minItems":1,"items":{"$ref":"#/$defs/webgl"}},
-                    "webgpu":{"type":"array","minItems":1,"items":{"$ref":"#/$defs/webgpu"}}
+                    "webgpu":{"type":"array","minItems":1,"items":{"$ref":"#/$defs/webgpu"}},
+                    "webgpuAdapters":{"type":"array","minItems":1,"items":{"$ref":"#/$defs/webgpuAdapter"}},
+                    "webgpuLimits":{"type":"array","minItems":1,"items":{"$ref":"#/$defs/webgpuLimits"}}
                 }
             }
         }
@@ -1035,6 +1307,18 @@ fn validate_catalog(catalog: &FingerprintCatalog) -> Result<()> {
     let webgl1: HashSet<&str> = catalog.components.webgl1.iter().map(|row| row.id.as_str()).collect();
     let webgl2: HashSet<&str> = catalog.components.webgl2.iter().map(|row| row.id.as_str()).collect();
     let webgpu: HashSet<&str> = catalog.components.webgpu.iter().map(|row| row.id.as_str()).collect();
+    let webgpu_adapters: HashSet<&str> = catalog
+        .components
+        .webgpu_adapters
+        .iter()
+        .map(|row| row.id.as_str())
+        .collect();
+    let webgpu_limits: HashSet<&str> = catalog
+        .components
+        .webgpu_limits
+        .iter()
+        .map(|row| row.id.as_str())
+        .collect();
     if !bases.contains(catalog.default_composition.base_id.as_str())
         || !screens.contains(catalog.default_composition.screen_id.as_str())
         || !graphics.contains(catalog.default_composition.graphics_id.as_str())
@@ -1048,6 +1332,36 @@ fn validate_catalog(catalog: &FingerprintCatalog) -> Result<()> {
         {
             bail!("graphics profile {} has an unknown component", row.id);
         }
+        if row.observations_by_browser_version.is_empty()
+            || row
+                .observations_by_browser_version
+                .values()
+                .try_fold(0u64, |total, weight| total.checked_add(*weight))
+                != Some(row.weight)
+        {
+            bail!("graphics profile {} has invalid browser-version weights", row.id);
+        }
+    }
+    if catalog
+        .components
+        .webgpu
+        .iter()
+        .any(|row| {
+            !row.adapters.contains_key("default")
+                || row.adapters.keys().any(|name| {
+                    !matches!(name.as_str(), "default" | "lowPower" | "highPerformance")
+                })
+                || row
+                    .adapters
+                    .values()
+                    .any(|id| !webgpu_adapters.contains(id.as_str()))
+        })
+        || catalog.components.webgpu_adapters.iter().any(|row| {
+            !webgpu_limits.contains(row.limits_id.as_str())
+                || !webgpu_limits.contains(row.default_device_limits_id.as_str())
+        })
+    {
+        bail!("WebGPU component has an unknown nested component");
     }
     if bases.len() != catalog.base_profiles.len()
         || screens.len() != catalog.screen_profiles.len()
@@ -1055,6 +1369,8 @@ fn validate_catalog(catalog: &FingerprintCatalog) -> Result<()> {
         || webgl1.len() != catalog.components.webgl1.len()
         || webgl2.len() != catalog.components.webgl2.len()
         || webgpu.len() != catalog.components.webgpu.len()
+        || webgpu_adapters.len() != catalog.components.webgpu_adapters.len()
+        || webgpu_limits.len() != catalog.components.webgpu_limits.len()
     {
         bail!("catalog has a duplicate ID");
     }
@@ -1063,95 +1379,8 @@ fn validate_catalog(catalog: &FingerprintCatalog) -> Result<()> {
 
 fn generate(args: &GenerateArgs) -> Result<()> {
     let mut collisions = CollisionGuard::default();
-    let mut adapter_rejects = Vec::new();
     let mut window_rejects = Vec::new();
     let mut profile_rejects = Vec::new();
-
-    let (adapter_bytes, adapter_json) = read_json(&args.adapters)?;
-    let adapter_rows = adapter_json
-        .as_array()
-        .ok_or_else(|| anyhow!("adapters input is not an array"))?;
-    let mut webgl1_components = BTreeMap::<String, WebGlComponent>::new();
-    let mut webgl2_components = BTreeMap::<String, WebGlComponent>::new();
-    let mut webgpu_components = BTreeMap::<String, WebGpuComponent>::new();
-    let mut graphics_rows = BTreeMap::<Vec<u8>, (GraphicsContent, u64)>::new();
-    let mut adapter_observations = 0u64;
-
-    for (source_index, row) in adapter_rows.iter().enumerate() {
-        let parsed = (|| -> Result<(String, Vec<String>, WebGlContent, WebGlContent, WebGpuContent)> {
-            let vendor = string_at(row, &["vendor"])?;
-            let renderers = string_list(row, &["renderers"])?;
-            let total = u32_at(row, &["total"])? as usize;
-            if total != renderers.len() {
-                bail!("total does not match renderer observation count");
-            }
-            let context = value_at(row, &["context"])?;
-            Ok((
-                vendor,
-                renderers,
-                normalize_webgl(value_at(context, &["webglContext"])?, false)?,
-                normalize_webgl(value_at(context, &["webgl2Context"])?, true)?,
-                normalize_webgpu(value_at(context, &["adapter"])?)?,
-            ))
-        })();
-        let (vendor, renderers, webgl1, webgl2, webgpu) = match parsed {
-            Ok(value) => value,
-            Err(error) => {
-                adapter_rejects.push(Reject {
-                    source_index,
-                    reason: error.to_string(),
-                });
-                continue;
-            }
-        };
-        let webgl1_id = add_component(
-            webgl1,
-            &mut webgl1_components,
-            &mut collisions,
-            |id, content| WebGlComponent { id, content },
-        )?;
-        let webgl2_id = add_component(
-            webgl2,
-            &mut webgl2_components,
-            &mut collisions,
-            |id, content| WebGlComponent { id, content },
-        )?;
-        let webgpu_id = add_component(
-            webgpu,
-            &mut webgpu_components,
-            &mut collisions,
-            |id, content| WebGpuComponent { id, content },
-        )?;
-        for renderer in renderers {
-            adapter_observations += 1;
-            insert_weighted(
-                &mut graphics_rows,
-                GraphicsContent {
-                    masked_vendor: MASKED_VENDOR.to_owned(),
-                    masked_renderer: MASKED_RENDERER.to_owned(),
-                    unmasked_vendor: vendor.clone(),
-                    unmasked_renderer: renderer,
-                    webgl1_id: webgl1_id.clone(),
-                    webgl2_id: webgl2_id.clone(),
-                    webgpu_id: webgpu_id.clone(),
-                    preferred_canvas_format: PREFERRED_CANVAS_FORMAT.to_owned(),
-                    wgsl_language_features: WGSL_LANGUAGE_FEATURES
-                        .iter()
-                        .map(|value| (*value).to_owned())
-                        .collect(),
-                },
-            )?;
-        }
-    }
-    if graphics_rows.is_empty() {
-        let reasons = adapter_rejects
-            .iter()
-            .take(3)
-            .map(|reject| format!("{}: {}", reject.source_index, reject.reason))
-            .collect::<Vec<_>>()
-            .join("; ");
-        bail!("no valid graphics observations ({reasons})");
-    }
 
     let (window_bytes, window_json) = read_json(&args.windows)?;
     let window_rows = window_json
@@ -1189,12 +1418,22 @@ fn generate(args: &GenerateArgs) -> Result<()> {
     let profile_paths = sorted_profile_paths(&args.profiles)?;
     let mut profile_hashes = Vec::with_capacity(profile_paths.len());
     let mut profiles_bytes = 0u64;
+    let mut profile_records = 0u64;
+    let mut skipped_non_windows = 0u64;
+    let mut graphics_observations = 0u64;
+    let mut default_major_graphics_observations = 0u64;
+    let mut browser_version_observations = BTreeMap::<String, u64>::new();
+    let mut browser_major_observations = BTreeMap::<String, u64>::new();
     let mut base_rows = BTreeMap::<Vec<u8>, (BaseContent, u64)>::new();
+    let mut graphics_rows = BTreeMap::<Vec<u8>, GraphicsAggregate>::new();
+    let mut webgl1_components = BTreeMap::<String, WebGlComponent>::new();
+    let mut webgl2_components = BTreeMap::<String, WebGlComponent>::new();
+    let mut webgpu_components = BTreeMap::<String, WebGpuComponent>::new();
+    let mut webgpu_adapter_components = BTreeMap::<String, WebGpuAdapterComponent>::new();
+    let mut webgpu_limits_components = BTreeMap::<String, WebGpuLimitsComponent>::new();
     let screen_keys: HashSet<Vec<u8>> = screen_rows.keys().cloned().collect();
-    let graphics_keys: HashSet<Vec<u8>> = graphics_rows.keys().cloned().collect();
     let mut base_overlap = 0u64;
     let mut screen_overlap = 0u64;
-    let mut graphics_overlap = 0u64;
     let mut full_overlap = 0u64;
 
     for (source_index, path) in profile_paths.iter().enumerate() {
@@ -1203,7 +1442,7 @@ fn generate(args: &GenerateArgs) -> Result<()> {
             .checked_add(bytes.len() as u64)
             .ok_or_else(|| anyhow!("profile byte count overflow"))?;
         profile_hashes.push(Sha256::digest(&bytes).to_vec());
-        let value: Value = match serde_json::from_slice(&bytes) {
+        let source: Value = match serde_json::from_slice(&bytes) {
             Ok(value) => value,
             Err(error) => {
                 profile_rejects.push(Reject {
@@ -1213,81 +1452,104 @@ fn generate(args: &GenerateArgs) -> Result<()> {
                 continue;
             }
         };
-        let base = match parse_base_profile(&value) {
-            Ok(value) => value,
-            Err(error) => {
-                profile_rejects.push(Reject {
-                    source_index,
-                    reason: error.to_string(),
-                });
+        let records: &[Value] = source
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_else(|| std::slice::from_ref(&source));
+        for (record_index, value) in records.iter().enumerate() {
+            profile_records += 1;
+            let os_type = match string_at(value, &["fingerprints", "system", "osType"]) {
+                Ok(value) => value,
+                Err(error) => {
+                    profile_rejects.push(Reject {
+                        source_index,
+                        reason: format!("record {record_index}: {error}"),
+                    });
+                    continue;
+                }
+            };
+            if os_type != "win" {
+                skipped_non_windows += 1;
                 continue;
             }
-        };
-        insert_weighted(&mut base_rows, base.clone())?;
-        base_overlap += 1;
+            let browser_version = match parse_windows_browser_version(value) {
+                Ok(value) => value,
+                Err(error) => {
+                    profile_rejects.push(Reject {
+                        source_index,
+                        reason: format!("record {record_index}: {error}"),
+                    });
+                    continue;
+                }
+            };
+            let major = chrome_major(&browser_version)?.to_owned();
+            *browser_version_observations
+                .entry(browser_version.clone())
+                .or_default() += 1;
+            *browser_major_observations.entry(major.clone()).or_default() += 1;
 
-        let profile_screen = (|| -> Result<ScreenContent> {
-            parse_screen_profile(
-                value_at(&value, &["fingerprints", "hardware", "screen"] )?,
-                value_at(&value, &["fingerprints", "browser", "window"] )?,
-            )
-        })();
-        let has_screen = profile_screen
-            .as_ref()
+            let base = match parse_base_profile(value) {
+                Ok(value) => value,
+                Err(error) => {
+                    profile_rejects.push(Reject {
+                        source_index,
+                        reason: format!("record {record_index} base: {error}"),
+                    });
+                    continue;
+                }
+            };
+            insert_weighted(&mut base_rows, base)?;
+            base_overlap += 1;
+
+            let has_graphics = match parse_graphics_content(
+                value,
+                &mut webgl1_components,
+                &mut webgl2_components,
+                &mut webgpu_components,
+                &mut webgpu_adapter_components,
+                &mut webgpu_limits_components,
+                &mut collisions,
+            ) {
+                Ok(content) => {
+                    insert_graphics_observation(
+                        &mut graphics_rows,
+                        content,
+                        &browser_version,
+                    )?;
+                    graphics_observations += 1;
+                    if major == DEFAULT_BROWSER_MAJOR {
+                        default_major_graphics_observations += 1;
+                    }
+                    true
+                }
+                Err(error) => {
+                    profile_rejects.push(Reject {
+                        source_index,
+                        reason: format!("record {record_index} graphics: {error}"),
+                    });
+                    false
+                }
+            };
+
+            let screen = value_at(value, &["fingerprints", "hardware", "screen"])?;
+            let window = value_at(value, &["fingerprints", "browser", "window"])?;
+            let has_screen = parse_screen_profile(screen, window)
             .ok()
-            .and_then(|content| serde_json::to_vec(content).ok())
+            .and_then(|content| serde_json::to_vec(&content).ok())
             .is_some_and(|key| screen_keys.contains(&key));
-        if has_screen {
-            screen_overlap += 1;
-        }
-
-        let profile_graphics = (|| -> Result<GraphicsContent> {
-            let webgl1 = normalize_webgl(
-                value_at(&value, &["fingerprints", "browser", "webglContext"] )?,
-                false,
-            )?;
-            let webgl2 = normalize_webgl(
-                value_at(&value, &["fingerprints", "browser", "webgl2Context"] )?,
-                true,
-            )?;
-            let webgpu = normalize_webgpu(
-                value_at(&value, &["fingerprints", "hardware", "gpu", "adapter"] )?,
-            )?;
-            Ok(GraphicsContent {
-                masked_vendor: MASKED_VENDOR.to_owned(),
-                masked_renderer: MASKED_RENDERER.to_owned(),
-                unmasked_vendor: string_at(
-                    &value,
-                    &["fingerprints", "hardware", "gpu", "unmaskedVendor"],
-                )?,
-                unmasked_renderer: string_at(
-                    &value,
-                    &["fingerprints", "hardware", "gpu", "unmaskedRenderer"],
-                )?,
-                webgl1_id: collisions.id(&webgl1)?,
-                webgl2_id: collisions.id(&webgl2)?,
-                webgpu_id: collisions.id(&webgpu)?,
-                preferred_canvas_format: PREFERRED_CANVAS_FORMAT.to_owned(),
-                wgsl_language_features: WGSL_LANGUAGE_FEATURES
-                    .iter()
-                    .map(|value| (*value).to_owned())
-                    .collect(),
-            })
-        })();
-        let has_graphics = profile_graphics
-            .as_ref()
-            .ok()
-            .and_then(|content| serde_json::to_vec(content).ok())
-            .is_some_and(|key| graphics_keys.contains(&key));
-        if has_graphics {
-            graphics_overlap += 1;
-        }
-        if has_screen && has_graphics {
-            full_overlap += 1;
+            if has_screen {
+                screen_overlap += 1;
+            }
+            if has_screen && has_graphics {
+                full_overlap += 1;
+            }
         }
     }
     if base_rows.is_empty() {
-        bail!("no valid Chrome 145 Windows base profiles");
+        bail!("no valid Chrome Windows base profiles");
+    }
+    if default_major_graphics_observations == 0 {
+        bail!("no valid default-major Chrome Windows graphics observations");
     }
 
     profile_hashes.sort();
@@ -1296,8 +1558,6 @@ fn generate(args: &GenerateArgs) -> Result<()> {
         profiles_hasher.update(hash);
     }
     let source_digests = SourceDigests {
-        adapters_sha256: sha256(&adapter_bytes),
-        adapters_bytes: adapter_bytes.len() as u64,
         windows_sha256: sha256(&window_bytes),
         windows_bytes: window_bytes.len() as u64,
         profiles_sha256: hex(&profiles_hasher.finalize()),
@@ -1325,27 +1585,72 @@ fn generate(args: &GenerateArgs) -> Result<()> {
     }
     screen_profiles.sort_by(|left, right| left.id.cmp(&right.id));
 
-    let mut graphics_profiles = Vec::with_capacity(graphics_rows.len());
-    for (_, (content, weight)) in graphics_rows {
+    let mut graphics_profiles = Vec::new();
+    for (_, row) in graphics_rows {
+        let weight = row
+            .observations_by_browser_version
+            .values()
+            .try_fold(0u64, |total, weight| total.checked_add(*weight))
+            .ok_or_else(|| anyhow!("graphics observation weight overflow"))?;
         graphics_profiles.push(GraphicsProfile {
-            id: collisions.id(&content)?,
-            content,
+            id: collisions.id(&row.content)?,
+            content: row.content,
+            observations_by_browser_version: row.observations_by_browser_version,
             weight,
         });
     }
     graphics_profiles.sort_by(|left, right| left.id.cmp(&right.id));
 
-    let default_base = rank_default(&base_profiles, |row| (row.weight, row.id.as_str()))?;
+    let used_webgl1: HashSet<&str> = graphics_profiles
+        .iter()
+        .map(|row| row.content.webgl1_id.as_str())
+        .collect();
+    let used_webgl2: HashSet<&str> = graphics_profiles
+        .iter()
+        .map(|row| row.content.webgl2_id.as_str())
+        .collect();
+    let used_webgpu: HashSet<&str> = graphics_profiles
+        .iter()
+        .map(|row| row.content.webgpu_id.as_str())
+        .collect();
+    webgl1_components.retain(|id, _| used_webgl1.contains(id.as_str()));
+    webgl2_components.retain(|id, _| used_webgl2.contains(id.as_str()));
+    webgpu_components.retain(|id, _| used_webgpu.contains(id.as_str()));
+
+    let default_bases: Vec<&BaseProfile> = base_profiles
+        .iter()
+        .filter(|row| chrome_major(&row.content.browser_version).ok() == Some(DEFAULT_BROWSER_MAJOR))
+        .collect();
+    let default_base = *rank_default(&default_bases, |row| (row.weight, row.id.as_str()))?;
     let default_screen = rank_default(&screen_profiles, |row| (row.weight, row.id.as_str()))?;
-    let default_graphics = rank_default(&graphics_profiles, |row| (row.weight, row.id.as_str()))?;
+    let default_graphics_rows: Vec<(&GraphicsProfile, u64)> = graphics_profiles
+        .iter()
+        .map(|row| {
+            browser_major_weight(
+                &row.observations_by_browser_version,
+                DEFAULT_BROWSER_MAJOR,
+            )
+            .map(|weight| (row, weight))
+        })
+        .collect::<Result<_>>()?;
+    let default_graphics_rows: Vec<(&GraphicsProfile, u64)> = default_graphics_rows
+        .into_iter()
+        .filter(|(_, weight)| *weight > 0)
+        .collect();
+    let default_graphics = rank_default(&default_graphics_rows, |(row, weight)| {
+        (*weight, row.id.as_str())
+    })?
+    .0;
 
     let catalog = FingerprintCatalog {
         schema_version: 1,
         catalog_id: CATALOG_ID.to_owned(),
         target: Target {
             browser: "Chrome".to_owned(),
-            browser_major: 145,
-            browser_revision: "145.0.7632.75".to_owned(),
+            default_browser_major: 145,
+            graphics_api_browser_major: GRAPHICS_API_BROWSER_MAJOR,
+            graphics_api_revision: GRAPHICS_API_REVISION.to_owned(),
+            transport_browser_majors: WREQ_BROWSER_MAJORS.to_vec(),
             os: "Windows".to_owned(),
             graphics_backend: "ANGLE/D3D11".to_owned(),
         },
@@ -1362,6 +1667,8 @@ fn generate(args: &GenerateArgs) -> Result<()> {
             webgl1: webgl1_components.into_values().collect(),
             webgl2: webgl2_components.into_values().collect(),
             webgpu: webgpu_components.into_values().collect(),
+            webgpu_adapters: webgpu_adapter_components.into_values().collect(),
+            webgpu_limits: webgpu_limits_components.into_values().collect(),
         },
     };
     validate_catalog(&catalog)?;
@@ -1369,9 +1676,17 @@ fn generate(args: &GenerateArgs) -> Result<()> {
     let catalog_bytes = serde_json::to_vec(&catalog)?;
     if catalog_bytes.len() > MAX_CATALOG_BYTES {
         bail!(
-            "compact catalog is {} bytes; limit is {} bytes",
+            "compact catalog is {} bytes; limit is {} bytes (base {}, screen {}, graphics {}, webgl1 {}, webgl2 {}, webgpu {}, webgpu adapters {}, webgpu limits {})",
             catalog_bytes.len(),
-            MAX_CATALOG_BYTES
+            MAX_CATALOG_BYTES,
+            serde_json::to_vec(&catalog.base_profiles)?.len(),
+            serde_json::to_vec(&catalog.screen_profiles)?.len(),
+            serde_json::to_vec(&catalog.graphics_profiles)?.len(),
+            serde_json::to_vec(&catalog.components.webgl1)?.len(),
+            serde_json::to_vec(&catalog.components.webgl2)?.len(),
+            serde_json::to_vec(&catalog.components.webgpu)?.len(),
+            serde_json::to_vec(&catalog.components.webgpu_adapters)?.len(),
+            serde_json::to_vec(&catalog.components.webgpu_limits)?.len(),
         );
     }
     let banned_fields = [
@@ -1403,39 +1718,46 @@ fn generate(args: &GenerateArgs) -> Result<()> {
         "catalogLimitBytes": MAX_CATALOG_BYTES,
         "bannedFieldScan": { "passed": true, "fields": banned_fields },
         "input": {
-            "adapterGroups": adapter_rows.len(),
-            "adapterObservations": adapter_observations,
             "windowGroups": window_rows.len(),
             "windowObservations": window_observations,
-            "profileFiles": profile_paths.len()
+            "profileFiles": profile_paths.len(),
+            "profileRecords": profile_records
         },
         "accepted": {
-            "adapterGroups": adapter_rows.len() - adapter_rejects.len(),
             "windowGroups": window_rows.len() - window_rejects.len(),
-            "baseObservations": base_overlap
+            "baseObservations": base_overlap,
+            "graphicsObservations": graphics_observations,
+            "defaultMajorGraphicsObservations": default_major_graphics_observations
+        },
+        "skipped": {
+            "nonWindowsProfiles": skipped_non_windows
         },
         "rejected": {
-            "adapters": adapter_rejects,
             "windows": window_rejects,
             "profiles": profile_rejects
         },
+        "browserVersionObservations": browser_version_observations,
+        "browserMajorObservations": browser_major_observations,
         "unique": {
             "baseProfiles": catalog.base_profiles.len(),
             "screenProfiles": catalog.screen_profiles.len(),
             "graphicsProfiles": catalog.graphics_profiles.len(),
             "webgl1Components": catalog.components.webgl1.len(),
             "webgl2Components": catalog.components.webgl2.len(),
-            "webgpuComponents": catalog.components.webgpu.len()
+            "webgpuComponents": catalog.components.webgpu.len(),
+            "webgpuAdapterComponents": catalog.components.webgpu_adapters.len(),
+            "webgpuLimitsComponents": catalog.components.webgpu_limits.len()
         },
         "exactOverlap": {
             "baseProfiles": base_overlap,
             "screenProfiles": screen_overlap,
-            "graphicsProfiles": graphics_overlap,
             "fullProfiles": full_overlap
         },
         "assumptions": [
-            "preferredCanvasFormat is fixed to bgra8unorm for Chrome 145 Windows",
-            "wgslLanguageFeatures uses the most common set from exact 145.0.7632.75 reference profiles"
+            "Chrome 145 remains the fixed default browser major",
+            "every valid Windows Chrome profile is selectable",
+            "a browser major without an exact wreq transport uses the nearest available transport and emits a runtime warning",
+            "the graphics API shape remains pinned to Chromium 145 and non-145 profiles emit a runtime warning"
         ]
     });
 
@@ -1468,6 +1790,62 @@ mod tests {
             _ => panic!("unknown fixture"),
         })
         .unwrap()
+    }
+
+    fn complete_profile(name: &str) -> Value {
+        let mut profile = fixture(name);
+        let window = json!({
+            "devicePixelRatio":1,"innerHeight":919,"innerWidth":1920,
+            "outerHeight":1040,"outerWidth":1920,"screenX":0,"screenY":0
+        });
+        profile["fingerprints"]["browser"]["window"] = window;
+        profile["fingerprints"]["browser"]["webglContext"] = test_webgl(82, false);
+        profile["fingerprints"]["browser"]["webgl2Context"] = test_webgl(132, true);
+        profile["fingerprints"]["hardware"]["screen"] = json!({
+            "availHeight":1040,"availLeft":0,"availTop":0,"availWidth":1920,
+            "colorDepth":24,"height":1080,"pixelDepth":24,"width":1920
+        });
+        profile["fingerprints"]["hardware"]["gpu"] = json!({
+            "unmaskedVendor":"Google Inc. (Intel)",
+            "unmaskedRenderer":"ANGLE (Intel, Test GPU Direct3D11, D3D11)",
+            "preferredCanvasFormat":"bgra8unorm",
+            "wgslLanguageFeatures":[
+                "packed_4x8_integer_dot_product",
+                "pointer_composite_access",
+                "readonly_and_readwrite_storage_textures",
+                "unrestricted_pointer_parameters"
+            ],
+            "adapter":{"default":fixture("adapter")}
+        });
+        profile
+    }
+
+    fn with_browser_version(mut profile: Value, version: &str) -> Value {
+        let major = version.split('.').next().unwrap();
+        let user_agent = format!(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/{major}.0.0.0 Safari/537.36"
+        );
+        profile["fingerprints"]["browser"]["version"] = json!(version);
+        profile["fingerprints"]["browser"]["userAgent"] = json!(user_agent);
+        profile["fingerprints"]["browser"]["navigator"]["userAgent"] = json!(user_agent);
+        profile["fingerprints"]["browser"]["userAgentData"]["uaFullVersion"] = json!(version);
+        for item in profile["fingerprints"]["browser"]["userAgentData"]["brands"]
+            .as_array_mut()
+            .unwrap()
+        {
+            if matches!(item["brand"].as_str(), Some("Google Chrome" | "Chromium")) {
+                item["version"] = json!(major);
+            }
+        }
+        for item in profile["fingerprints"]["browser"]["userAgentData"]["fullVersionList"]
+            .as_array_mut()
+            .unwrap()
+        {
+            if matches!(item["brand"].as_str(), Some("Google Chrome" | "Chromium")) {
+                item["version"] = json!(version);
+            }
+        }
+        profile
     }
 
     fn test_webgl(parameter_count: usize, webgl2: bool) -> Value {
@@ -1531,7 +1909,7 @@ mod tests {
     fn adapter_info_fallback_is_normalized_and_probe_results_are_dropped() {
         let adapter = normalize_webgpu_adapter(&fixture("adapter")).unwrap();
         assert_eq!(adapter.info.vendor, "intel");
-        assert_eq!(adapter.features, vec!["shader-f16", "texture-compression-bc"]);
+        assert_eq!(adapter.features, vec!["texture-compression-bc", "shader-f16"]);
         let text = serde_json::to_string(&adapter).unwrap();
         assert!(!text.contains("textureHashs"));
         assert!(!text.contains("bc1-rgba-unorm"));
@@ -1544,6 +1922,19 @@ mod tests {
         let normalized = normalize_webgpu_adapter(&with_info).unwrap();
         assert_eq!(normalized.info.subgroup_min_size, Some(8));
         assert_eq!(normalized.info.subgroup_max_size, Some(32));
+
+        let mut reordered = fixture("adapter");
+        reordered["features"].as_array_mut().unwrap().reverse();
+        let reordered = normalize_webgpu_adapter(&reordered).unwrap();
+        let mut collisions = CollisionGuard::default();
+        assert_ne!(
+            collisions.id(&adapter).unwrap(),
+            collisions.id(&reordered).unwrap()
+        );
+
+        let error = normalize_webgpu(&json!({ "low-power": fixture("adapter") }))
+            .unwrap_err();
+        assert!(error.to_string().contains("default WebGPU adapter"));
     }
 
     #[test]
@@ -1589,31 +1980,28 @@ mod tests {
     fn write_test_inputs(root: &Path, reverse_profiles: bool) -> GenerateArgs {
         let profile_dir = root.join("profiles");
         fs::create_dir_all(&profile_dir).unwrap();
-        let v1 = include_str!("../tests/fixtures/profile-v1.json");
-        let v2 = include_str!("../tests/fixtures/profile-v2.json");
+        let v1 = serde_json::to_vec_pretty(&complete_profile("profile-v1")).unwrap();
+        let v2 = serde_json::to_vec_pretty(&complete_profile("profile-v2")).unwrap();
+        let v148 = serde_json::to_vec_pretty(&with_browser_version(
+            complete_profile("profile-v1"),
+            "148.0.7778.169",
+        ))
+        .unwrap();
         if reverse_profiles {
-            fs::write(profile_dir.join("a.json"), v2).unwrap();
-            fs::write(profile_dir.join("z.json"), v1).unwrap();
+            let nested = profile_dir.join("145");
+            fs::create_dir_all(&nested).unwrap();
+            let other = profile_dir.join("148");
+            fs::create_dir_all(&other).unwrap();
+            fs::write(profile_dir.join("a.json"), &v2).unwrap();
+            fs::write(nested.join("z.json"), &v1).unwrap();
+            fs::write(other.join("m.json"), &v148).unwrap();
         } else {
-            fs::write(profile_dir.join("a.json"), v1).unwrap();
-            fs::write(profile_dir.join("z.json"), v2).unwrap();
+            fs::write(profile_dir.join("a.json"), &v1).unwrap();
+            fs::write(profile_dir.join("z.json"), &v2).unwrap();
+            let nested = profile_dir.join("148");
+            fs::create_dir_all(&nested).unwrap();
+            fs::write(nested.join("m.json"), &v148).unwrap();
         }
-
-        let adapter = fixture("adapter");
-        let adapters = json!([{
-            "total":2,
-            "vendor":"Google Inc. (Intel)",
-            "renderers":[
-                "ANGLE (Intel, Test GPU Direct3D11, D3D11)",
-                "ANGLE (Intel, Test GPU Direct3D11, D3D11)"
-            ],
-            "context":{
-                "adapter":{"default":adapter},
-                "webglContext":test_webgl(82, false),
-                "webgl2Context":test_webgl(132, true)
-            }
-        }]);
-        fs::write(root.join("adapters.json"), serde_json::to_vec_pretty(&adapters).unwrap()).unwrap();
         let window = json!({
             "devicePixelRatio":1,"innerHeight":919,"innerWidth":1920,
             "outerHeight":1040,"outerWidth":1920,"screenX":0,"screenY":0
@@ -1627,7 +2015,6 @@ mod tests {
 
         GenerateArgs {
             profiles: profile_dir,
-            adapters: root.join("adapters.json"),
             windows: root.join("windows.json"),
             out: root.join("catalog.json"),
             schema: root.join("schema.json"),
@@ -1648,12 +2035,25 @@ mod tests {
 
         let catalog: FingerprintCatalog =
             serde_json::from_slice(&fs::read(&first_args.out).unwrap()).unwrap();
-        assert_eq!(catalog.base_profiles.len(), 1);
-        assert_eq!(catalog.base_profiles[0].weight, 2);
+        assert_eq!(catalog.base_profiles.len(), 2);
+        assert_eq!(catalog.base_profiles.iter().map(|row| row.weight).sum::<u64>(), 3);
+        let default_base = catalog
+            .base_profiles
+            .iter()
+            .find(|row| row.id == catalog.default_composition.base_id)
+            .unwrap();
+        assert_eq!(chrome_major(&default_base.content.browser_version).unwrap(), "145");
         assert_eq!(catalog.screen_profiles.len(), 1);
         assert_eq!(catalog.screen_profiles[0].weight, 2);
         assert_eq!(catalog.graphics_profiles.len(), 1);
-        assert_eq!(catalog.graphics_profiles[0].weight, 2);
+        assert_eq!(catalog.graphics_profiles[0].weight, 3);
+        assert_eq!(
+            catalog.graphics_profiles[0].observations_by_browser_version,
+            BTreeMap::from([
+                ("145.0.7632.75".to_owned(), 2),
+                ("148.0.7778.169".to_owned(), 1),
+            ])
+        );
         let text = fs::read_to_string(&first_args.out).unwrap();
         assert!(!text.contains("private-test-name"));
         assert!(fs::metadata(&first_args.out).unwrap().len() <= MAX_CATALOG_BYTES as u64 + 1);

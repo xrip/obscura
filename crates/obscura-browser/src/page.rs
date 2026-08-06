@@ -219,6 +219,7 @@ impl Page {
                 &context.user_agent,
                 &context.fingerprint_profile.navigator.sec_ch_ua_header(),
                 &context.fingerprint_profile.navigator.sec_ch_ua_platform_header(),
+                context.fingerprint_profile.browser.major,
                 context.allow_private_network,
             )))
         } else {

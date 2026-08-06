@@ -293,7 +293,6 @@ fn is_loopback_host(host: &str, port: u16) -> bool {
 #[serde(rename_all = "camelCase")]
 struct SavedCapture {
     profile: String,
-    adapter_rows: usize,
     window_rows: usize,
 }
 
@@ -301,30 +300,23 @@ fn save_capture(root: &Path, body: &Value) -> anyhow::Result<SavedCapture> {
     let profile = body
         .get("profile")
         .ok_or_else(|| anyhow!("profile is missing"))?;
-    let capture_adapters = body
-        .get("adapters")
-        .ok_or_else(|| anyhow!("adapters is missing"))?;
     let capture_windows = body
         .get("windows")
         .ok_or_else(|| anyhow!("windows is missing"))?;
-    check_capture(profile, capture_adapters, capture_windows)?;
+    check_capture(profile, capture_windows)?;
 
     fs::create_dir_all(root.join("profiles"))?;
-    let adapters_path = root.join("adapters.json");
     let windows_path = root.join("window.json");
-    let mut adapters = read_array(&adapters_path)?;
     let mut windows = read_array(&windows_path)?;
-    adapters.extend(capture_adapters.as_array().unwrap().iter().cloned());
     windows.extend(capture_windows.as_array().unwrap().iter().cloned());
-    let adapter_rows = adapters.len();
     let window_rows = windows.len();
 
     let profile_bytes = pretty_json(profile)?;
     let profile_path = next_profile_path(&root.join("profiles"), &profile_bytes)?;
-    let files = [
-        PendingFile::new(adapters_path, pretty_json(&Value::Array(adapters))?),
-        PendingFile::new(windows_path, pretty_json(&Value::Array(windows))?),
-    ];
+    let files = [PendingFile::new(
+        windows_path,
+        pretty_json(&Value::Array(windows))?,
+    )];
     for (index, file) in files.iter().enumerate() {
         if let Err(error) = file.prepare() {
             let _ = fs::remove_file(&file.next);
@@ -340,7 +332,7 @@ fn save_capture(root: &Path, body: &Value) -> anyhow::Result<SavedCapture> {
         }
         return Err(error);
     }
-    if let Err(error) = replace_pair(&files) {
+    if let Err(error) = replace_files(&files) {
         let _ = fs::remove_file(&profile_path);
         return Err(error);
     }
@@ -351,12 +343,11 @@ fn save_capture(root: &Path, body: &Value) -> anyhow::Result<SavedCapture> {
             .unwrap_or(&profile_path)
             .to_string_lossy()
             .replace('\\', "/"),
-        adapter_rows,
         window_rows,
     })
 }
 
-fn check_capture(profile: &Value, adapters: &Value, windows: &Value) -> anyhow::Result<()> {
+fn check_capture(profile: &Value, windows: &Value) -> anyhow::Result<()> {
     if profile.get("profileVersion").and_then(Value::as_str) != Some("obscura-capture-v1") {
         bail!("profile is not an Obscura browser capture");
     }
@@ -376,49 +367,31 @@ fn check_capture(profile: &Value, adapters: &Value, windows: &Value) -> anyhow::
         .get("gpu")
         .and_then(Value::as_object)
         .ok_or_else(|| anyhow!("profile graphics data is missing"))?;
-    let unmasked_vendor = graphics
+    graphics
         .get("unmaskedVendor")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("profile graphics vendor is missing"))?;
-    let unmasked_renderer = graphics
+    graphics
         .get("unmaskedRenderer")
         .and_then(Value::as_str)
         .ok_or_else(|| anyhow!("profile graphics renderer is missing"))?;
-    let gpu_adapter = graphics
+    graphics
         .get("adapter")
         .ok_or_else(|| anyhow!("profile WebGPU data is missing"))?;
-    let webgl1 = browser
+    graphics
+        .get("preferredCanvasFormat")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("profile preferred canvas format is missing"))?;
+    graphics
+        .get("wgslLanguageFeatures")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("profile WGSL language features are missing"))?;
+    browser
         .get("webglContext")
         .ok_or_else(|| anyhow!("profile WebGL 1 data is missing"))?;
-    let webgl2 = browser
+    browser
         .get("webgl2Context")
         .ok_or_else(|| anyhow!("profile WebGL 2 data is missing"))?;
-
-    let adapter_rows = adapters
-        .as_array()
-        .filter(|rows| rows.len() == 1)
-        .ok_or_else(|| anyhow!("adapters must contain one observation"))?;
-    let adapter = adapter_rows[0]
-        .as_object()
-        .ok_or_else(|| anyhow!("adapter observation is not an object"))?;
-    let renderers = adapter
-        .get("renderers")
-        .and_then(Value::as_array)
-        .filter(|rows| rows.len() == 1)
-        .ok_or_else(|| anyhow!("adapter observation must have one renderer"))?;
-    let context = adapter
-        .get("context")
-        .and_then(Value::as_object)
-        .ok_or_else(|| anyhow!("adapter context is missing"))?;
-    if adapter.get("total").and_then(Value::as_u64) != Some(1)
-        || adapter.get("vendor").and_then(Value::as_str) != Some(unmasked_vendor)
-        || renderers[0].as_str() != Some(unmasked_renderer)
-        || context.get("adapter") != Some(gpu_adapter)
-        || context.get("webglContext") != Some(webgl1)
-        || context.get("webgl2Context") != Some(webgl2)
-    {
-        bail!("profile and adapter data are not from the same capture");
-    }
 
     let window_rows = windows
         .as_array()
@@ -510,7 +483,7 @@ fn write_new(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn replace_pair(files: &[PendingFile; 2]) -> anyhow::Result<()> {
+fn replace_files(files: &[PendingFile]) -> anyhow::Result<()> {
     let mut changed = Vec::new();
     for (index, file) in files.iter().enumerate() {
         let existed = file.target.exists();
@@ -537,7 +510,7 @@ fn replace_pair(files: &[PendingFile; 2]) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn rollback(files: &[PendingFile; 2], changed: &[(usize, bool)]) {
+fn rollback(files: &[PendingFile], changed: &[(usize, bool)]) {
     for (index, existed) in changed.iter().rev() {
         let file = &files[*index];
         let _ = fs::remove_file(&file.target);
@@ -612,18 +585,16 @@ mod tests {
                 "browser": { "window": window, "webglContext": webgl1, "webgl2Context": webgl2 },
                 "hardware": {
                     "screen": screen,
-                    "gpu": { "unmaskedVendor": "vendor", "unmaskedRenderer": "renderer", "adapter": adapter }
+                    "gpu": {
+                        "unmaskedVendor": "vendor", "unmaskedRenderer": "renderer",
+                        "preferredCanvasFormat": "bgra8unorm", "wgslLanguageFeatures": ["feature"],
+                        "adapter": adapter
+                    }
                 }
             }
         });
         json!({
             "profile": profile,
-            "adapters": [{
-                "total": 1,
-                "vendor": "vendor",
-                "renderers": ["renderer"],
-                "context": { "adapter": adapter, "webglContext": webgl1, "webgl2Context": webgl2 }
-            }],
             "windows": [{ "total": 1, "window": [window], "screen": screen }]
         })
     }
@@ -648,10 +619,10 @@ mod tests {
     #[test]
     fn capture_parts_must_match() {
         let good = capture();
-        check_capture(&good["profile"], &good["adapters"], &good["windows"]).unwrap();
+        check_capture(&good["profile"], &good["windows"]).unwrap();
         let mut bad = good.clone();
-        bad["adapters"][0]["vendor"] = json!("other");
-        assert!(check_capture(&bad["profile"], &bad["adapters"], &bad["windows"]).is_err());
+        bad["windows"][0]["screen"] = json!({ "width": 800 });
+        assert!(check_capture(&bad["profile"], &bad["windows"]).is_err());
     }
 
     #[test]
@@ -661,12 +632,10 @@ mod tests {
         let body = capture();
         let first = save_capture(&root, &body).unwrap();
         let second = save_capture(&root, &body).unwrap();
-        assert_eq!(first.adapter_rows, 1);
-        assert_eq!(second.adapter_rows, 2);
         assert_eq!(second.window_rows, 2);
         assert_ne!(first.profile, second.profile);
         assert_eq!(fs::read_dir(root.join("profiles")).unwrap().count(), 2);
-        assert!(!root.join("adapters.json.obscura-new").exists());
+        assert!(!root.join("window.json.obscura-new").exists());
         assert!(!root.join("window.json.obscura-backup").exists());
         fs::remove_dir_all(root).unwrap();
     }
