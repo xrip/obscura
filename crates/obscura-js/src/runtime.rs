@@ -382,6 +382,82 @@ impl ObscuraJsRuntime {
         }
     }
 
+    /// Copies the browser-identity globals from the main realm into `realm`.
+    ///
+    /// A frame must present the same identity as its parent: anti-bot code
+    /// fingerprints inside the frame and compares it with the top document.
+    /// Copying the values the parent already has makes that true by
+    /// construction, instead of relying on a caller to reapply the same
+    /// settings to both.
+    pub(crate) fn copy_identity_to_realm(
+        &mut self,
+        realm: &deno_core::v8::Global<deno_core::v8::Context>,
+    ) {
+        use deno_core::v8;
+
+        const IDENTITY_GLOBALS: [&str; 8] = [
+            "__obscura_ua",
+            "__obscura_platform",
+            "__obscura_ua_platform",
+            "__obscura_ua_platform_version",
+            "__obscura_fingerprint_profile",
+            "__obscura_stealth",
+            "__obscura_geo_lat",
+            "__obscura_geo_lon",
+        ];
+
+        let main = self.runtime.main_context();
+        let isolate = self.runtime.v8_isolate();
+        let scope = &mut v8::HandleScope::new(isolate);
+
+        let main_context = v8::Local::new(scope, main);
+        let mut carried = Vec::new();
+        {
+            let scope = &mut v8::ContextScope::new(scope, main_context);
+            let global = main_context.global(scope);
+            for name in IDENTITY_GLOBALS {
+                let Some(key) = v8::String::new(scope, name) else {
+                    continue;
+                };
+                match global.get(scope, key.into()) {
+                    Some(value) if !value.is_undefined() => {
+                        carried.push((name, v8::Global::new(scope, value)));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let realm_context = v8::Local::new(scope, realm);
+        let scope = &mut v8::ContextScope::new(scope, realm_context);
+        let global = realm_context.global(scope);
+        for (name, value) in carried {
+            let Some(key) = v8::String::new(scope, name) else {
+                continue;
+            };
+            let value = v8::Local::new(scope, value);
+            global.set(scope, key.into(), value);
+        }
+    }
+
+    /// Gives a frame's state the resources the page owns: cookie jar, storage,
+    /// HTTP client, callbacks and the stealth transport. A frame shares these
+    /// with its page, exactly as it shares them in a browser.
+    pub(crate) fn share_resources_with(&self, frame: &mut ObscuraState) {
+        let parent = self.state.borrow();
+        frame.cookie_jar = parent.cookie_jar.clone();
+        frame.local_storage = parent.local_storage.clone();
+        frame.http_client = parent.http_client.clone();
+        frame.callbacks = parent.callbacks.clone();
+        frame.encoding = parent.encoding.clone();
+        frame.blocked_urls = parent.blocked_urls.clone();
+        frame.intercept_enabled = parent.intercept_enabled;
+        #[cfg(feature = "stealth")]
+        {
+            frame.stealth_client = parent.stealth_client.clone();
+        }
+    }
+
     /// Swaps the state every op reads. Only one realm runs at a time, so the
     /// frame's DOM, URL and origin can be made current for the duration of that
     /// realm's work and then restored, without touching any op signature.
@@ -391,32 +467,6 @@ impl ObscuraJsRuntime {
         let previous = op_state.borrow::<Rc<RefCell<ObscuraState>>>().clone();
         op_state.put(replacement);
         previous
-    }
-
-    /// Hand this runtime's isolate to the current thread.
-    ///
-    /// deno_core never calls `Isolate::enter`/`exit`: it assumes one isolate per
-    /// thread. A child frame realm is a second runtime on the *same* thread, so
-    /// creating it leaves its isolate current and the parent then aborts inside
-    /// V8 scope bookkeeping. Frames therefore park their isolate and only claim
-    /// the thread around their own work.
-    ///
-    /// # Safety
-    ///
-    /// Every `enter_isolate` must be paired with exactly one `exit_isolate`, in
-    /// LIFO order, and no other runtime's JavaScript may run in between. Use
-    /// [`crate::frame::FrameRuntime`] rather than calling this directly.
-    pub(crate) unsafe fn enter_isolate(&mut self) {
-        unsafe { self.runtime.v8_isolate().enter() };
-    }
-
-    /// Give the thread back to whichever isolate was current before.
-    ///
-    /// # Safety
-    ///
-    /// See [`Self::enter_isolate`].
-    pub(crate) unsafe fn exit_isolate(&mut self) {
-        unsafe { self.runtime.v8_isolate().exit() };
     }
 
     pub fn set_cookie_jar(&self, jar: std::sync::Arc<obscura_net::CookieJar>) {

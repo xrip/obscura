@@ -5,107 +5,73 @@
 //! HTML and dropped the body into a detached `_IframeDocument` in the *parent's*
 //! realm, so no script inside a frame ever ran.
 //!
-//! deno_core 0.350 exposes no multi-realm API (`JsRealm` is crate-private and
-//! `create_realm` is gone), so a frame realm is a second [`ObscuraJsRuntime`]
-//! with its own V8 isolate. That is stronger isolation than a second
-//! `v8::Context` would give, and it carries a large practical benefit: the frame
-//! gets its own `ObscuraState`, so every existing op keeps working inside a
-//! frame with no changes at all.
+//! A frame realm is a second `v8::Context` in the page's isolate. Three things
+//! make that practical:
 //!
-//! # Sharing one thread between two isolates
+//! - The startup snapshot already contains the whole bootstrap, so a restored
+//!   context arrives with every DOM class installed. A realm costs a context
+//!   restore, not a re-parse.
+//! - The realm's op table is filled from the page realm's, so every shim in the
+//!   frame can call ops.
+//! - Ops read one isolate-wide `ObscuraState`. Only one realm runs at a time, so
+//!   a frame is made current by swapping that state around its work. No op
+//!   signature changes.
 //!
-//! deno_core never calls `Isolate::enter`/`exit`; it assumes one isolate per
-//! thread. Creating a frame leaves the frame's isolate current, and the parent
-//! then aborts inside V8 scope bookkeeping the next time it runs anything. A
-//! frame therefore *parks* its isolate and only claims the thread for the
-//! duration of its own work, through [`FrameRuntime::with_entered`].
-//!
-//! Because only one isolate may be current at a time, a frame must never call
-//! back into its parent while entered. Cross-frame messaging is queued and
-//! delivered after the frame has parked again, which also matches the
-//! asynchronous semantics `postMessage` is specified to have.
-//!
-//! # Identity
-//!
-//! A frame must present the *same* browser identity as its parent: the same
-//! fingerprint profile, user agent, platform, and geolocation. Anti-bot code
-//! fingerprints inside the frame and compares it against the top document, so a
-//! frame that resolved its own profile would be an immediate mismatch. The
-//! caller supplies a `configure` closure for this, and callers are expected to
-//! pass the same routine that configures the top-level document rather than a
-//! second, drift-prone copy of the list.
+//! Staying in one isolate is what lets same-origin frames share objects with
+//! their parent, the way `iframe.contentWindow.document` does in a browser. A
+//! second isolate could never do that.
+
+use std::cell::RefCell;
+use std::rc::Rc;
 
 use obscura_dom::parse_html;
 
+use crate::ops::ObscuraState;
 use crate::runtime::ObscuraJsRuntime;
 
-/// Claims a frame's isolate for the current thread and always gives it back,
-/// including while a panic unwinds. An isolate left entered after a panic would
-/// abort the process the next time the parent ran any JavaScript, so the
-/// give-back lives in `Drop` rather than at the end of a function body.
-struct IsolateGuard<'a> {
-    runtime: &'a mut ObscuraJsRuntime,
-}
-
-impl<'a> IsolateGuard<'a> {
-    fn enter(runtime: &'a mut ObscuraJsRuntime) -> Self {
-        // SAFETY: paired with the `exit_isolate` in `Drop`, which cannot be
-        // skipped, so entries and exits stay balanced and LIFO-ordered.
-        unsafe { runtime.enter_isolate() };
-        IsolateGuard { runtime }
-    }
-}
-
-impl Drop for IsolateGuard<'_> {
-    fn drop(&mut self) {
-        // SAFETY: pairs with the `enter_isolate` in `enter`.
-        unsafe { self.runtime.exit_isolate() };
-    }
-}
-
-/// One child browsing context: a parked isolate plus the identity of the
-/// document living in it.
-pub struct FrameRuntime {
-    runtime: ObscuraJsRuntime,
+/// One child browsing context: its own realm, document and origin, living in
+/// the page's isolate.
+pub struct FrameRealm {
+    context: deno_core::v8::Global<deno_core::v8::Context>,
+    state: Rc<RefCell<ObscuraState>>,
     frame_id: u32,
     url: String,
     origin: String,
 }
 
-impl FrameRuntime {
+impl FrameRealm {
     /// Builds a frame realm around an already-fetched document.
     ///
-    /// `configure` receives the frame's runtime before its document is
-    /// installed and must apply the same identity the top-level document uses:
-    /// fingerprint profile, user agent, platform, geolocation, and the shared
-    /// cookie jar, storage, and HTTP client. Pass the same routine that
-    /// configures the page runtime so the two can never drift apart.
-    ///
-    /// The isolate is parked before returning, so the caller's isolate stays
-    /// current.
+    /// The frame inherits the page's browser identity and its shared resources,
+    /// by copying them from the parent rather than by being told them, so the
+    /// two cannot drift apart.
     pub fn new(
+        parent: &mut ObscuraJsRuntime,
         frame_id: u32,
         url: &str,
         html: &str,
-        configure: impl FnOnce(&mut ObscuraJsRuntime),
-    ) -> Self {
-        // ObscuraJsRuntime::new leaves its own isolate current, so everything
-        // below already runs with the frame's isolate on the thread.
-        let mut runtime = ObscuraJsRuntime::new();
-        configure(&mut runtime);
-        runtime.set_dom(parse_html(html));
-        runtime.set_url(url);
-        runtime.run_page_init();
-        // SAFETY: balanced by the `enter_isolate` calls in `with_entered` and
-        // `Drop`. Parking hands the thread back to whoever created this frame.
-        unsafe { runtime.exit_isolate() };
+    ) -> Option<Self> {
+        let context = parent.create_realm_context()?;
+        if !parent.share_ops_with_realm(&context) {
+            return None;
+        }
+        parent.copy_identity_to_realm(&context);
 
-        FrameRuntime {
-            runtime,
+        let mut state = ObscuraState::new();
+        state.dom = Some(parse_html(html));
+        state.url = url.to_string();
+        parent.share_resources_with(&mut state);
+
+        let realm = FrameRealm {
+            context,
+            state: Rc::new(RefCell::new(state)),
             frame_id,
             url: url.to_string(),
             origin: origin_of(url),
-        }
+        };
+        // Build the frame's document against the frame's own state.
+        realm.run(parent, "globalThis.__obscura_init();").ok()?;
+        Some(realm)
     }
 
     pub fn frame_id(&self) -> u32 {
@@ -128,60 +94,67 @@ impl FrameRuntime {
         self.origin != "null" && self.origin == other_origin
     }
 
-    /// Runs `work` with this frame's isolate current, then parks it again.
-    ///
-    /// Do not run another runtime's JavaScript inside `work`: only one isolate
-    /// may hold the thread at a time.
-    pub fn with_entered<R>(&mut self, work: impl FnOnce(&mut ObscuraJsRuntime) -> R) -> R {
-        let guard = IsolateGuard::enter(&mut self.runtime);
-        work(&mut *guard.runtime)
-    }
-
-    /// Evaluates an expression inside the frame.
-    pub fn evaluate(&mut self, source: &str) -> Result<serde_json::Value, String> {
-        self.with_entered(|runtime| runtime.evaluate(source))
+    /// Runs `source` in the frame's realm with the frame's document current.
+    fn run(&self, parent: &mut ObscuraJsRuntime, source: &str) -> Result<String, String> {
+        let previous = parent.swap_op_state(self.state.clone());
+        let result = parent.eval_in_realm(&self.context, source);
+        parent.swap_op_state(previous);
+        result
     }
 
     /// Runs a script inside the frame, reporting a script error as `Err`.
-    pub fn execute_script(&mut self, name: &str, source: &str) -> Result<(), String> {
-        self.with_entered(|runtime| runtime.execute_script(name, source))
+    pub fn execute_script(
+        &self,
+        parent: &mut ObscuraJsRuntime,
+        source: &str,
+    ) -> Result<(), String> {
+        self.run(parent, source).map(|_| ())
+    }
+
+    /// Evaluates an expression inside the frame and decodes it as JSON.
+    pub fn evaluate(
+        &self,
+        parent: &mut ObscuraJsRuntime,
+        expression: &str,
+    ) -> Result<serde_json::Value, String> {
+        let json = self.run(parent, &format!("JSON.stringify({expression})"))?;
+        serde_json::from_str(&json).map_err(|error| error.to_string())
     }
 
     /// Runs the frame document's classic scripts, in document order.
     ///
     /// `load_external` resolves a `src=` script to its source text; returning
-    /// `None` skips that script, which is what a failed subresource fetch looks
-    /// like to the page. One script throwing does not stop the ones after it,
-    /// matching how a browser treats separate classic scripts.
+    /// `None` skips it, which is what a failed subresource fetch looks like to
+    /// the page. One script throwing does not stop the ones after it, matching
+    /// how a browser treats separate classic scripts.
     ///
     /// Module scripts are skipped and reported: they need the frame's own module
     /// loader, which is not wired up yet.
     ///
     /// Returns one message per script that failed or was skipped.
     pub fn run_document_scripts(
-        &mut self,
+        &self,
+        parent: &mut ObscuraJsRuntime,
         load_external: impl Fn(&str) -> Option<String>,
     ) -> Vec<String> {
         let listed = self.evaluate(
-            r#"JSON.stringify([...document.querySelectorAll('script')].map(node => ({
+            parent,
+            r#"[...document.querySelectorAll('script')].map(node => ({
                 src: node.getAttribute('src') || '',
                 type: (node.getAttribute('type') || '').toLowerCase(),
                 text: node.textContent || '',
-            })))"#,
+            }))"#,
         );
         let scripts: Vec<DocumentScript> = match listed {
-            Ok(value) => value
-                .as_str()
-                .and_then(|raw| serde_json::from_str(raw).ok())
-                .unwrap_or_default(),
+            Ok(value) => serde_json::from_value(value).unwrap_or_default(),
             Err(error) => return vec![format!("could not list frame scripts: {error}")],
         };
 
         let base = url::Url::parse(&self.url).ok();
         let mut problems = Vec::new();
         for (index, script) in scripts.iter().enumerate() {
-            // Classic scripts only. An empty type, or a JavaScript MIME type, is
-            // classic; anything else is data or a module.
+            // An empty type, or a JavaScript MIME type, is a classic script.
+            // Anything else is data or a module.
             let classic = script.type_attribute.is_empty()
                 || matches!(
                     script.type_attribute.as_str(),
@@ -195,7 +168,7 @@ impl FrameRuntime {
             }
 
             let (name, source) = if script.src.is_empty() {
-                (format!("<frame:inline:{index}>"), script.text.clone())
+                (format!("inline {index}"), script.text.clone())
             } else {
                 let resolved = base
                     .as_ref()
@@ -213,7 +186,7 @@ impl FrameRuntime {
             if source.trim().is_empty() {
                 continue;
             }
-            if let Err(error) = self.execute_script(&name, &source) {
+            if let Err(error) = self.execute_script(parent, &source) {
                 problems.push(format!("frame script {name} failed: {error}"));
             }
         }
@@ -227,17 +200,6 @@ struct DocumentScript {
     #[serde(rename = "type")]
     type_attribute: String,
     text: String,
-}
-
-impl Drop for FrameRuntime {
-    fn drop(&mut self) {
-        // deno_core built this isolate entered and tears it down expecting to
-        // still own the thread, so claim it one last time. The runtime field is
-        // dropped immediately after this body, while the isolate is current.
-        // SAFETY: a frame is parked whenever it is not inside `with_entered`,
-        // so this restores the state deno_core created the isolate in.
-        unsafe { self.runtime.enter_isolate() };
-    }
 }
 
 /// Serializes an origin the way `location.origin` does, using `"null"` for
@@ -260,7 +222,7 @@ fn origin_of(url: &str) -> String {
 mod tests {
     use super::*;
 
-    fn page_runtime(url: &str, html: &str) -> ObscuraJsRuntime {
+    fn page(url: &str, html: &str) -> ObscuraJsRuntime {
         let mut runtime = ObscuraJsRuntime::new();
         runtime.set_dom(parse_html(html));
         runtime.set_url(url);
@@ -270,7 +232,7 @@ mod tests {
 
     #[test]
     fn frame_has_its_own_realm_dom_and_origin() {
-        let mut parent = page_runtime(
+        let mut parent = page(
             "https://parent.example/page",
             "<html><body><h1>Parent</h1></body></html>",
         );
@@ -278,14 +240,35 @@ mod tests {
             .execute_script("p", "globalThis.marker = 'parent';")
             .unwrap();
 
-        let mut frame = FrameRuntime::new(
+        let frame = FrameRealm::new(
+            &mut parent,
             1,
             "https://child.example/frame",
             "<html><body><h1>Child</h1></body></html>",
-            |_| {},
+        )
+        .expect("frame realm");
+
+        frame
+            .execute_script(&mut parent, "globalThis.marker = 'child';")
+            .unwrap();
+
+        // Separate realm: own globals, own DOM, own URL.
+        assert_eq!(
+            frame
+                .evaluate(&mut parent, "document.querySelector('h1').textContent")
+                .unwrap(),
+            serde_json::json!("Child")
+        );
+        assert_eq!(
+            frame.evaluate(&mut parent, "globalThis.marker").unwrap(),
+            serde_json::json!("child")
+        );
+        assert_eq!(
+            frame.evaluate(&mut parent, "location.href").unwrap(),
+            serde_json::json!("https://child.example/frame")
         );
 
-        // The parent survives the frame's construction with its state intact.
+        // The parent keeps its own document and globals throughout.
         assert_eq!(
             parent
                 .evaluate("document.querySelector('h1').textContent")
@@ -297,65 +280,10 @@ mod tests {
             serde_json::json!("parent")
         );
 
-        // The frame is a genuinely separate realm: own globals, own DOM, own URL.
-        frame
-            .execute_script("c", "globalThis.marker = 'child';")
-            .unwrap();
-        assert_eq!(
-            frame
-                .evaluate("document.querySelector('h1').textContent")
-                .unwrap(),
-            serde_json::json!("Child")
-        );
-        assert_eq!(
-            frame.evaluate("globalThis.marker").unwrap(),
-            serde_json::json!("child")
-        );
-        assert_eq!(
-            frame.evaluate("location.href").unwrap(),
-            serde_json::json!("https://child.example/frame")
-        );
-
-        // Interleaving still works after the frame has run.
-        assert_eq!(
-            parent.evaluate("globalThis.marker").unwrap(),
-            serde_json::json!("parent")
-        );
         assert_eq!(frame.origin(), "https://child.example");
+        assert_eq!(frame.frame_id(), 1);
         assert!(!frame.is_same_origin_as("https://parent.example"));
         assert!(frame.is_same_origin_as("https://child.example"));
-    }
-
-    /// The capability the frame realm exists for: a script that arrived with the
-    /// frame's own document actually executes, against the frame's own DOM.
-    #[test]
-    fn frame_script_runs_against_the_frame_document() {
-        let mut parent = page_runtime("https://parent.example/", "<html><body></body></html>");
-
-        let mut frame = FrameRuntime::new(
-            7,
-            "https://child.example/f",
-            "<html><body><div id=\"out\"></div></body></html>",
-            |_| {},
-        );
-        frame
-            .execute_script(
-                "inline",
-                "document.getElementById('out').textContent = 'ran:' + location.origin;",
-            )
-            .unwrap();
-
-        assert_eq!(
-            frame
-                .evaluate("document.getElementById('out').textContent")
-                .unwrap(),
-            serde_json::json!("ran:https://child.example")
-        );
-        // The frame's document writes never touch the parent's DOM.
-        assert_eq!(
-            parent.evaluate("document.body.innerHTML").unwrap(),
-            serde_json::json!("")
-        );
     }
 
     /// A frame must not look like a different browser than its parent. Anti-bot
@@ -363,23 +291,20 @@ mod tests {
     #[test]
     fn frame_inherits_the_parent_browser_identity() {
         let user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) TestAgent/150.0.0.0";
-        let configure = |runtime: &mut ObscuraJsRuntime| {
-            runtime.set_user_agent(user_agent);
-            runtime.set_platform("Win32", "Windows", "19.0.0");
-        };
-
         let mut parent = ObscuraJsRuntime::new();
-        configure(&mut parent);
+        parent.set_user_agent(user_agent);
+        parent.set_platform("Win32", "Windows", "19.0.0");
         parent.set_dom(parse_html("<html><body></body></html>"));
         parent.set_url("https://parent.example/");
         parent.run_page_init();
 
-        let mut frame = FrameRuntime::new(
+        let frame = FrameRealm::new(
+            &mut parent,
             1,
             "https://child.example/f",
             "<html><body></body></html>",
-            configure,
-        );
+        )
+        .expect("frame realm");
 
         for surface in [
             "navigator.userAgent",
@@ -387,54 +312,24 @@ mod tests {
             "navigator.userAgentData.platform",
         ] {
             assert_eq!(
-                frame.evaluate(surface),
-                parent.evaluate(surface),
+                frame.evaluate(&mut parent, surface).unwrap(),
+                parent.evaluate(surface).unwrap(),
                 "frame and parent disagree on {surface}"
             );
         }
         assert_eq!(
-            frame.evaluate("navigator.userAgent").unwrap(),
+            frame.evaluate(&mut parent, "navigator.userAgent").unwrap(),
             serde_json::json!(user_agent)
         );
     }
 
-    #[test]
-    fn many_frames_can_be_alive_at_once() {
-        let mut parent = page_runtime("https://parent.example/", "<html><body></body></html>");
-
-        let mut frames: Vec<FrameRuntime> = (0..4)
-            .map(|index| {
-                FrameRuntime::new(
-                    index,
-                    &format!("https://f{index}.example/"),
-                    "<html><body></body></html>",
-                    |_| {},
-                )
-            })
-            .collect();
-
-        for (index, frame) in frames.iter_mut().enumerate() {
-            frame
-                .execute_script("set", &format!("globalThis.n = {index};"))
-                .unwrap();
-        }
-        // Out-of-order access must be safe: parking makes entry order irrelevant.
-        for (index, frame) in frames.iter_mut().enumerate().rev() {
-            // V8 hands numbers back as doubles, so compare numerically rather
-            // than against an integer-typed JSON literal.
-            assert_eq!(
-                frame.evaluate("globalThis.n").unwrap().as_f64(),
-                Some(index as f64)
-            );
-        }
-        assert_eq!(parent.evaluate("1 + 1").unwrap().as_f64(), Some(2.0));
-    }
-
-    /// The whole point of the frame realm: scripts that arrived with the frame's
-    /// document run, in order, against the frame's own DOM.
+    /// The capability the frame realm exists for: scripts that arrived with the
+    /// frame's document run, in order, against the frame's own DOM.
     #[test]
     fn frame_runs_its_document_scripts_in_order() {
-        let mut frame = FrameRuntime::new(
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let frame = FrameRealm::new(
+            &mut parent,
             1,
             "https://child.example/dir/page",
             r#"<html><body><div id="out"></div>
@@ -444,11 +339,11 @@ mod tests {
                <script>window.log.push('inline2');
                        document.getElementById('out').textContent = window.log.join(',');</script>
                </body></html>"#,
-            |_| {},
-        );
+        )
+        .expect("frame realm");
 
-        let requested = std::cell::RefCell::new(Vec::new());
-        let problems = frame.run_document_scripts(|url| {
+        let requested = RefCell::new(Vec::new());
+        let problems = frame.run_document_scripts(&mut parent, |url| {
             requested.borrow_mut().push(url.to_string());
             match url {
                 "https://child.example/dir/first.js" => Some("window.log.push('ext1');".into()),
@@ -458,8 +353,8 @@ mod tests {
         });
 
         assert!(problems.is_empty(), "unexpected problems: {problems:?}");
-        // Relative and root-relative src both resolve against the frame's URL,
-        // not the parent's.
+        // Relative and root-relative src resolve against the frame's URL, not
+        // the parent's.
         assert_eq!(
             requested.into_inner(),
             vec![
@@ -469,15 +364,22 @@ mod tests {
         );
         assert_eq!(
             frame
-                .evaluate("document.getElementById('out').textContent")
+                .evaluate(&mut parent, "document.getElementById('out').textContent")
                 .unwrap(),
             serde_json::json!("inline1,ext1,ext2,inline2")
+        );
+        // The frame's document writes never touch the parent's DOM.
+        assert_eq!(
+            parent.evaluate("document.body.innerHTML").unwrap(),
+            serde_json::json!("")
         );
     }
 
     #[test]
     fn one_bad_frame_script_does_not_stop_the_rest() {
-        let mut frame = FrameRuntime::new(
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let frame = FrameRealm::new(
+            &mut parent,
             1,
             "https://child.example/",
             r#"<html><body>
@@ -487,13 +389,13 @@ mod tests {
                <script type="module">window.log.push('module');</script>
                <script>window.log.push('b');</script>
                </body></html>"#,
-            |_| {},
-        );
+        )
+        .expect("frame realm");
 
-        let problems = frame.run_document_scripts(|_| None);
+        let problems = frame.run_document_scripts(&mut parent, |_| None);
 
         assert_eq!(
-            frame.evaluate("window.log.join(',')").unwrap(),
+            frame.evaluate(&mut parent, "window.log.join(',')").unwrap(),
             serde_json::json!("a,b")
         );
         assert_eq!(problems.len(), 3, "problems: {problems:?}");
@@ -506,8 +408,45 @@ mod tests {
     }
 
     #[test]
+    fn many_frames_can_be_alive_at_once() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let frames: Vec<FrameRealm> = (0..4)
+            .map(|index| {
+                FrameRealm::new(
+                    &mut parent,
+                    index,
+                    &format!("https://f{index}.example/"),
+                    &format!("<html><body><h1>{index}</h1></body></html>"),
+                )
+                .expect("frame realm")
+            })
+            .collect();
+
+        for (index, frame) in frames.iter().enumerate() {
+            frame
+                .execute_script(&mut parent, &format!("globalThis.n = {index};"))
+                .unwrap();
+        }
+        // Out-of-order access must be safe: each frame carries its own state.
+        for (index, frame) in frames.iter().enumerate().rev() {
+            assert_eq!(
+                frame.evaluate(&mut parent, "globalThis.n").unwrap().as_f64(),
+                Some(index as f64)
+            );
+            assert_eq!(
+                frame
+                    .evaluate(&mut parent, "document.querySelector('h1').textContent")
+                    .unwrap(),
+                serde_json::json!(index.to_string())
+            );
+        }
+    }
+
+    #[test]
     fn opaque_origin_frames_are_never_same_origin() {
-        let frame = FrameRuntime::new(1, "about:blank", "<html><body></body></html>", |_| {});
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let frame = FrameRealm::new(&mut parent, 1, "about:blank", "<html><body></body></html>")
+            .expect("frame realm");
         assert_eq!(frame.origin(), "null");
         assert!(!frame.is_same_origin_as("null"));
         assert!(!frame.is_same_origin_as("https://parent.example"));
