@@ -121,6 +121,7 @@ impl StealthHttpClient {
             .build();
 
         let mut builder = wreq::Client::builder()
+            .no_proxy()
             .emulation(emulation_opts)
             .timeout(Duration::from_secs(30))
             .redirect(wreq::redirect::Policy::none())

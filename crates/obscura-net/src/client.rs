@@ -495,6 +495,7 @@ impl ObscuraHttpClient {
     async fn get_client(&self) -> &Client {
         self.client.get_or_init(|| async {
             let mut builder = Client::builder()
+                .no_proxy()
                 .redirect(Policy::none())
                 .timeout(Duration::from_secs(30))
                 .danger_accept_invalid_certs(false)

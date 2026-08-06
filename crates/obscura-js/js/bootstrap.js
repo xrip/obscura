@@ -45,8 +45,8 @@
     // the later `globalThis.X = X` assignments only update the value.
     'Node', 'Element', 'Document', 'DocumentFragment', 'DocumentType',
     'Text', 'Comment', 'CDATASection', 'ProcessingInstruction', 'CharacterData',
-    'CSSStyleDeclaration', 'DOMTokenList', 'Screen', 'NetworkInformation', 'Navigator',
-    'NavigatorUAData', 'Permissions', 'ScreenOrientation',
+    'CSSStyleDeclaration', 'DOMTokenList', 'EventTarget', 'Screen', 'NetworkInformation', 'Navigator',
+    'MediaDevices', 'NavigatorManagedData', 'NavigatorUAData', 'Permissions', 'ProtectedAudience', 'ScreenOrientation',
     'HTMLDocument',
     'MessageChannel', 'MessagePort', 'CustomElementRegistry',
     'XMLHttpRequestEventTarget', 'HTMLMediaElement', 'HTMLVideoElement',
@@ -105,7 +105,19 @@ const _patchedFunctionToString = ({toString() {
   if (_nativeFns.has(this)) {
     return `function ${this.name || ''}() { [native code] }`;
   }
-  return _origToString.call(this);
+  try {
+    return _origToString.call(this);
+  } catch (error) {
+    if (error && typeof error.stack === 'string') {
+      try {
+        Object.defineProperty(error, 'stack', {
+          value: _sanitizeStack(error.stack),
+          writable: true, enumerable: false, configurable: true,
+        });
+      } catch (_) {}
+    }
+    throw error;
+  }
 }}).toString;
 Function.prototype.toString = _patchedFunctionToString;
 function _markNative(fn) { if (typeof fn === 'function') _nativeFns.add(fn); return fn; }
@@ -178,11 +190,17 @@ _nativeFns.add(Function.prototype.toString);
 
 const _stackCache = new WeakMap();
 const _origStackDesc = Object.getOwnPropertyDescriptor(Error.prototype, 'stack');
+function _sanitizeStack(stack) {
+  if (typeof stack !== 'string') return stack;
+  return stack.split('\n').filter(line => !line.includes('<obscura:')).join('\n');
+}
 if (_origStackDesc && _origStackDesc.get) {
   Object.defineProperty(Error.prototype, 'stack', {
     configurable: false, enumerable: false,
     get: function() {
-      if (!_stackCache.has(this)) _stackCache.set(this, _origStackDesc.get.call(this));
+      if (!_stackCache.has(this)) {
+        _stackCache.set(this, _sanitizeStack(_origStackDesc.get.call(this)));
+      }
       return _stackCache.get(this);
     }
   });
@@ -514,7 +532,9 @@ globalThis.clearInterval = (id) => {
   _intervals.delete(id);
   _clearedTimers.add(id);
 };
-globalThis.requestAnimationFrame = (fn) => setTimeout(fn, 0);
+globalThis.requestAnimationFrame = _markNative(function requestAnimationFrame(fn) {
+  return setTimeout(() => fn(performance.now()), 16);
+});
 globalThis.cancelAnimationFrame = globalThis.clearTimeout;
 globalThis.queueMicrotask = globalThis.queueMicrotask || ((fn) => Promise.resolve().then(fn));
 
@@ -627,6 +647,10 @@ class CSSStyleDeclaration {
   // repeated style reads do not cross the JS/Rust op boundary.
   _pull() {
     if (this._loaded) return;
+    if (!this._owner || typeof this._owner.getAttribute !== 'function') {
+      this._loaded = true;
+      return;
+    }
     _parseCssInto(this._props, this._owner.getAttribute("style"));
     this._loaded = true;
   }
@@ -639,7 +663,7 @@ class CSSStyleDeclaration {
   // serialization. No-op when owner-less.
   _push() {
     const o = this._owner;
-    if (!o) return;
+    if (!o || typeof o.setAttribute !== 'function' || typeof o.removeAttribute !== 'function') return;
     const text = _serializeCss(this._props);
     if (text) o.setAttribute("style", text);
     else o.removeAttribute("style");
@@ -741,7 +765,49 @@ function _nodeId(node) { const slot = node && _nodeSlots.get(node); return slot 
 function _nodeStyle(node) { const slot = node && _nodeSlots.get(node); return slot && slot.style; }
 globalThis.__obscura_nodeId = _nodeId;
 
-class Node {
+const _eventTargetListeners = new WeakMap();
+class EventTarget {
+  constructor() { _eventTargetListeners.set(this, new Map()); }
+  addEventListener(type, callback) {
+    if (callback === null || callback === undefined) return;
+    const listeners = _eventTargetListeners.get(this);
+    if (!listeners) throw new TypeError('Illegal invocation');
+    const key = String(type);
+    const list = listeners.get(key) || [];
+    if (!list.includes(callback)) list.push(callback);
+    listeners.set(key, list);
+  }
+  removeEventListener(type, callback) {
+    const listeners = _eventTargetListeners.get(this);
+    if (!listeners) throw new TypeError('Illegal invocation');
+    const key = String(type);
+    const list = listeners.get(key);
+    if (list) listeners.set(key, list.filter(value => value !== callback));
+  }
+  dispatchEvent(event) {
+    const listeners = _eventTargetListeners.get(this);
+    if (!listeners) throw new TypeError('Illegal invocation');
+    if (!event || event.type === undefined) throw new TypeError('The event provided is invalid');
+    const list = listeners.get(String(event.type)) || [];
+    for (const callback of list.slice()) {
+      if (typeof callback === 'function') callback.call(this, event);
+      else if (callback && typeof callback.handleEvent === 'function') callback.handleEvent(event);
+    }
+    return !event.defaultPrevented;
+  }
+}
+_markNative(EventTarget);
+for (const name of ['addEventListener', 'removeEventListener', 'dispatchEvent']) {
+  const descriptor = Object.getOwnPropertyDescriptor(EventTarget.prototype, name);
+  _markNative(descriptor.value);
+  Object.defineProperty(EventTarget.prototype, name, { ...descriptor, enumerable: true });
+}
+Object.defineProperty(EventTarget.prototype, Symbol.toStringTag, {
+  value: 'EventTarget', configurable: true,
+});
+globalThis.EventTarget = EventTarget;
+
+class Node extends EventTarget {
   static ELEMENT_NODE = 1;
   static ATTRIBUTE_NODE = 2;
   static TEXT_NODE = 3;
@@ -761,7 +827,7 @@ class Node {
   static DOCUMENT_POSITION_CONTAINED_BY = 16;
   static DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC = 32;
 
-  constructor(nid) { _nodeSlots.set(this, {nid, style:null}); }
+  constructor(nid) { super(); _nodeSlots.set(this, {nid, style:null}); }
   get nodeType() { return +_dom("node_type", _nodeId(this)); }
   get nodeName() { return _domParse("node_name", _nodeId(this)) || ""; }
   get ownerDocument() { return globalThis.document; }
@@ -978,7 +1044,10 @@ class Node {
     // -1 => this precedes other => other FOLLOWS this(4); +1 => this PRECEDING(2)).
     return (+_dom("compare_order", _nodeId(this), _nodeId(other)) < 0) ? 4 : 2;
   }
-  getRootNode() { return globalThis.document; }
+  getRootNode(options) {
+    const shadowRoot = this._obscuraShadowRoot;
+    return shadowRoot && !(options && options.composed) ? shadowRoot : globalThis.document;
+  }
   normalize() {
     // Merge adjacent exclusive Text nodes, drop empty ones, recurse. Detached
     // removed nodes keep their own data (read from the backing node by nid).
@@ -1020,7 +1089,6 @@ class Node {
     return true;
   }
   isSameNode(other) { return other && _nodeId(this) === _nodeId(other); }
-  addEventListener() {} removeEventListener() {} dispatchEvent() { return true; }
 }
 class CharacterData extends Node {
   get data() {
@@ -3276,6 +3344,7 @@ function _elementClassFor(nid) {
   if (tag === "INPUT" && globalThis.HTMLInputElement) return globalThis.HTMLInputElement;
   if (tag === "IFRAME" && globalThis.HTMLIFrameElement) return globalThis.HTMLIFrameElement;
   if (tag === "SCRIPT" && globalThis.HTMLScriptElement) return globalThis.HTMLScriptElement;
+  if (tag === "SLOT" && globalThis.HTMLSlotElement) return globalThis.HTMLSlotElement;
   if (tag === "EMBED" && globalThis.HTMLEmbedElement) return globalThis.HTMLEmbedElement;
   if (tag === "SOURCE" && globalThis.HTMLSourceElement) return globalThis.HTMLSourceElement;
   if (tag === "TRACK" && globalThis.HTMLTrackElement) return globalThis.HTMLTrackElement;
@@ -3309,9 +3378,9 @@ globalThis.self = globalThis;
 
 globalThis.document = null;
 function _resolveUrl(url) {
-  if (!url) return url;
-  if (url.startsWith('http://') || url.startsWith('https://') || url.startsWith('about:')) return url;
-  try { return new URL(url, _domParse("document_url") || "about:blank").href; } catch(e) { return url; }
+  const value = String(url);
+  if (value.startsWith('http://') || value.startsWith('https://') || value.startsWith('about:')) return value;
+  try { return new URL(value, _domParse("document_url") || "about:blank").href; } catch(e) { return value; }
 }
 // `__virtualUrl` is set by `history.pushState`/`replaceState` (and cleared by
 // any real navigation). When set, `location.href` and friends read it instead
@@ -3344,6 +3413,28 @@ Object.defineProperty(globalThis, 'location', {
   get() { return _locationObj; },
   set(url) { var r = _resolveUrl(String(url)); globalThis.__virtualUrl = r; _denoCore.ops.op_navigate(r, 'GET', ''); },
   configurable: false,
+  enumerable: true,
+});
+
+function _isLoopbackHostname(hostname) {
+  const host = String(hostname || '').toLowerCase().replace(/^\[|\]$/g, '');
+  if (host === 'localhost' || host.endsWith('.localhost') || host === '::1') return true;
+  const parts = host.split('.');
+  return parts.length === 4 && parts[0] === '127' && parts.every(part => /^\d+$/.test(part));
+}
+const _isSecureContextGetter = _markNativeAs(function() {
+  try {
+    const url = new URL(__currentUrl());
+    return url.protocol === 'https:' || url.protocol === 'wss:' || url.protocol === 'file:' ||
+      ((url.protocol === 'http:' || url.protocol === 'ws:') && _isLoopbackHostname(url.hostname));
+  } catch (_) {
+    return false;
+  }
+}, 'function get isSecureContext() { [native code] }');
+Object.defineProperty(globalThis, 'isSecureContext', {
+  get: _isSecureContextGetter,
+  set: undefined,
+  configurable: true,
   enumerable: true,
 });
 
@@ -3496,7 +3587,7 @@ _markNative(MimeTypeArray.prototype.item);
 _markNative(MimeTypeArray.prototype.namedItem);
 
 const _networkInfoListeners = new WeakMap();
-const _networkInfoEventTarget = Object.create(Node.prototype);
+const _networkInfoEventTarget = Object.create(EventTarget.prototype);
 Object.defineProperties(_networkInfoEventTarget, {
   addEventListener: { value: function addEventListener(type, fn) {
     if (typeof fn !== 'function') return;
@@ -3566,6 +3657,153 @@ _markNative(Permissions.prototype.query);
 globalThis.Permissions = Permissions;
 const _permissions = new Permissions();
 
+const _mediaDevicesConstructionToken = {};
+const _mediaDevicesInstances = new WeakSet();
+const _mediaDevicesHandlers = new WeakMap();
+class MediaDevices extends EventTarget {
+  constructor(token) {
+    if (token !== _mediaDevicesConstructionToken) {
+      throw new TypeError("Failed to construct 'MediaDevices': Illegal constructor");
+    }
+    super();
+    _mediaDevicesInstances.add(this);
+    _mediaDevicesHandlers.set(this, null);
+  }
+  get ondevicechange() {
+    if (!_mediaDevicesInstances.has(this)) throw new TypeError('Illegal invocation');
+    return _mediaDevicesHandlers.get(this);
+  }
+  set ondevicechange(value) {
+    if (!_mediaDevicesInstances.has(this)) throw new TypeError('Illegal invocation');
+    _mediaDevicesHandlers.set(this, typeof value === 'function' ? value : null);
+  }
+  enumerateDevices() {
+    if (!_mediaDevicesInstances.has(this)) throw new TypeError('Illegal invocation');
+    return Promise.resolve([
+      {deviceId:"default",kind:"audioinput",label:"",groupId:"default"},
+      {deviceId:"comms",kind:"audioinput",label:"",groupId:"comms"},
+      {deviceId:"default",kind:"audiooutput",label:"",groupId:"default"},
+      {deviceId:"",kind:"videoinput",label:"",groupId:""},
+    ]);
+  }
+  getSupportedConstraints() {
+    if (!_mediaDevicesInstances.has(this)) throw new TypeError('Illegal invocation');
+    return {
+      aspectRatio: true, autoGainControl: true, backgroundBlur: true,
+      channelCount: true, deviceId: true, displaySurface: true, echoCancellation: true,
+      echoCancellationType: true, facingMode: true, focusDistance: true,
+      frameRate: true, groupId: true, height: true, latency: true,
+      logicalSurface: true, noiseSuppression: true, pan: true, pointsOfInterest: true,
+      resizeMode: true, restrictOwnAudio: true, sampleRate: true, sampleSize: true,
+      screenPixelRatio: true, suppressLocalAudioPlayback: true, tilt: true,
+      torch: true, voiceIsolation: true, whiteBalanceMode: true, width: true, zoom: true,
+    };
+  }
+  getUserMedia() {
+    if (!_mediaDevicesInstances.has(this)) throw new TypeError('Illegal invocation');
+    return Promise.reject(new DOMException('Permission denied', 'NotAllowedError'));
+  }
+  getDisplayMedia() {
+    if (!_mediaDevicesInstances.has(this)) throw new TypeError('Illegal invocation');
+    return Promise.reject(new DOMException('Permission denied', 'NotAllowedError'));
+  }
+  setCaptureHandleConfig() {
+    if (!_mediaDevicesInstances.has(this)) throw new TypeError('Illegal invocation');
+  }
+}
+_markNative(MediaDevices);
+for (const name of ['ondevicechange', 'enumerateDevices', 'getSupportedConstraints',
+                    'getUserMedia', 'getDisplayMedia', 'setCaptureHandleConfig']) {
+  const descriptor = Object.getOwnPropertyDescriptor(MediaDevices.prototype, name);
+  if (descriptor.value) _markNative(descriptor.value);
+  if (descriptor.get) _markNativeAs(descriptor.get, `function get ${name}() { [native code] }`);
+  if (descriptor.set) _markNativeAs(descriptor.set, `function set ${name}() { [native code] }`);
+  Object.defineProperty(MediaDevices.prototype, name, { ...descriptor, enumerable: true });
+}
+Object.defineProperty(MediaDevices.prototype, Symbol.toStringTag, {
+  value: 'MediaDevices', configurable: true,
+});
+globalThis.MediaDevices = MediaDevices;
+const _mediaDevices = new MediaDevices(_mediaDevicesConstructionToken);
+
+// Chromium exposes the Protected Audience feature-query service even when no
+// interest-group operation is allowed. Keep this as a normal WebIDL-style
+// interface on Navigator; its absence makes an otherwise Chromium identity
+// internally inconsistent.
+const _protectedAudienceConstructionToken = {};
+const _protectedAudienceInstances = new WeakSet();
+class ProtectedAudience {
+  constructor(token) {
+    if (token !== _protectedAudienceConstructionToken) throw new TypeError('Illegal constructor');
+    _protectedAudienceInstances.add(this);
+  }
+  queryFeatureSupport(feature) {
+    if (!_protectedAudienceInstances.has(this)) throw new TypeError('Illegal invocation');
+    if (arguments.length < 1) {
+      throw new TypeError("Failed to execute 'queryFeatureSupport' on 'ProtectedAudience': 1 argument required, but only 0 present.");
+    }
+    return String(feature) === 'adComponentsLimit' ? 40 : undefined;
+  }
+}
+_markNative(ProtectedAudience);
+_markNative(ProtectedAudience.prototype.queryFeatureSupport);
+Object.defineProperty(ProtectedAudience.prototype, 'queryFeatureSupport', {
+  ...Object.getOwnPropertyDescriptor(ProtectedAudience.prototype, 'queryFeatureSupport'),
+  enumerable: true,
+});
+Object.defineProperty(ProtectedAudience.prototype, Symbol.toStringTag, {
+  value: 'ProtectedAudience', configurable: true,
+});
+globalThis.ProtectedAudience = ProtectedAudience;
+const _protectedAudience = new ProtectedAudience(_protectedAudienceConstructionToken);
+
+const _navigatorManagedDataConstructionToken = {};
+const _navigatorManagedDataInstances = new WeakSet();
+const _navigatorManagedDataHandlers = new WeakMap();
+class NavigatorManagedData extends EventTarget {
+  constructor(token) {
+    if (token !== _navigatorManagedDataConstructionToken) throw new TypeError('Illegal constructor');
+    super();
+    _navigatorManagedDataInstances.add(this);
+    _navigatorManagedDataHandlers.set(this, null);
+  }
+  getManagedConfiguration(keys) {
+    if (!_navigatorManagedDataInstances.has(this)) throw new TypeError('Illegal invocation');
+    if (arguments.length < 1) {
+      throw new TypeError("Failed to execute 'getManagedConfiguration' on 'NavigatorManagedData': 1 argument required, but only 0 present.");
+    }
+    if (keys === null || typeof keys !== 'object' || typeof keys[Symbol.iterator] !== 'function') {
+      throw new TypeError("Failed to execute 'getManagedConfiguration' on 'NavigatorManagedData': The provided value cannot be converted to a sequence.");
+    }
+    Array.from(keys, String);
+    return Promise.reject(new DOMException(
+      'Managed configuration is empty. This API is available only for managed apps.',
+      'NotAllowedError'
+    ));
+  }
+  get onmanagedconfigurationchange() {
+    if (!_navigatorManagedDataInstances.has(this)) throw new TypeError('Illegal invocation');
+    return _navigatorManagedDataHandlers.get(this);
+  }
+  set onmanagedconfigurationchange(value) {
+    if (!_navigatorManagedDataInstances.has(this)) throw new TypeError('Illegal invocation');
+    _navigatorManagedDataHandlers.set(this, typeof value === 'function' ? value : null);
+  }
+}
+_markNative(NavigatorManagedData);
+for (const name of ['getManagedConfiguration', 'onmanagedconfigurationchange']) {
+  const descriptor = Object.getOwnPropertyDescriptor(NavigatorManagedData.prototype, name);
+  if (descriptor.value) _markNative(descriptor.value);
+  if (descriptor.get) _markNativeAs(descriptor.get, `function get ${name}() { [native code] }`);
+  if (descriptor.set) _markNativeAs(descriptor.set, `function set ${name}() { [native code] }`);
+  Object.defineProperty(NavigatorManagedData.prototype, name, { ...descriptor, enumerable: true });
+}
+Object.defineProperty(NavigatorManagedData.prototype, Symbol.toStringTag, {
+  value: 'NavigatorManagedData', configurable: true,
+});
+globalThis.NavigatorManagedData = NavigatorManagedData;
+const _navigatorManagedData = new NavigatorManagedData(_navigatorManagedDataConstructionToken);
+
 function _copyBrands(values) {
   return (values || []).map(function(value) {
     return {brand: value.brand, version: value.version};
@@ -3629,21 +3867,12 @@ const _navigatorData = {
   pdfViewerEnabled: true,
   userAgentData: _userAgentData,
   serviceWorker: { ready: Promise.resolve(), register(){return Promise.resolve();}, getRegistrations(){return Promise.resolve([]);}, controller: null, oncontrollerchange: null, onmessage: null, addEventListener(){}, removeEventListener(){}, dispatchEvent(){return true;} },
-  mediaDevices: {
-    enumerateDevices() {
-      return Promise.resolve([
-        {deviceId:"default",kind:"audioinput",label:"",groupId:"default"},
-        {deviceId:"comms",kind:"audioinput",label:"",groupId:"comms"},
-        {deviceId:"default",kind:"audiooutput",label:"",groupId:"default"},
-        {deviceId:"",kind:"videoinput",label:"",groupId:""},
-      ]);
-    },
-    getUserMedia() { return Promise.reject(new DOMException("NotAllowedError")); },
-    getDisplayMedia() { return Promise.reject(new DOMException("NotAllowedError")); },
-    addEventListener(){}, removeEventListener(){},
-  },
+  mediaDevices: _mediaDevices,
   clipboard: { writeText(){return Promise.resolve();}, readText(){return Promise.resolve("");} },
   permissions: _permissions,
+  protectedAudience: _protectedAudience,
+  deprecatedRunAdAuctionEnforcesKAnonymity: false,
+  managed: _navigatorManagedData,
   getBattery() { return Promise.resolve({ charging: _fp('batteryCharging'), chargingTime: _fp('batteryCharging') ? 0 : Infinity, dischargingTime: _fp('batteryCharging') ? Infinity : Math.floor(3600 + _fpRand(250) * 7200), level: _fp('batteryLevel'), addEventListener(){} }); },
   getGamepads() { return []; },
   sendBeacon() { return true; },
@@ -3705,6 +3934,9 @@ _navigatorInstances.add(globalThis.navigator);
   }
 
   defGetter('webdriver', function() { return false; });
+  defGetter('appCodeName', function() { return "Mozilla"; });
+  defGetter('appName', function() { return "Netscape"; });
+  defGetter('vendorSub', function() { return ""; });
   defGetter('userAgent', function() {
     return globalThis.__obscura_ua ||
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
@@ -5748,11 +5980,42 @@ globalThis.XMLSerializer = class XMLSerializer {
   }
 };
 const _performanceSlots = new WeakMap();
+const _performanceTimingToken = {};
+const _performanceTimingFields = [
+  'navigationStart', 'unloadEventStart', 'unloadEventEnd',
+  'redirectStart', 'redirectEnd', 'fetchStart',
+  'domainLookupStart', 'domainLookupEnd', 'connectStart', 'connectEnd',
+  'secureConnectionStart', 'requestStart', 'responseStart', 'responseEnd',
+  'domLoading', 'domInteractive', 'domContentLoadedEventStart',
+  'domContentLoadedEventEnd', 'domComplete', 'loadEventStart', 'loadEventEnd',
+];
+class PerformanceTiming {
+  constructor(token, values={}) {
+    if (token !== _performanceTimingToken) throw new TypeError('Illegal constructor');
+    for (const field of _performanceTimingFields) {
+      const value = Number(values[field]);
+      this[field] = Number.isFinite(value) ? value : 0;
+    }
+  }
+  toJSON() {
+    const result = {};
+    for (const field of _performanceTimingFields) result[field] = this[field];
+    return result;
+  }
+}
+_markNative(PerformanceTiming);
+_markNative(PerformanceTiming.prototype.toJSON);
+Object.defineProperty(PerformanceTiming.prototype, Symbol.toStringTag, {
+  value: 'PerformanceTiming', configurable: true,
+});
+globalThis.PerformanceTiming = PerformanceTiming;
+const _newPerformanceTiming = values => new PerformanceTiming(_performanceTimingToken, values);
+
 class Performance {
   constructor() {
     _performanceSlots.set(this, {
       timeOrigin: 0,
-      timing: { navigationStart: 0, domContentLoadedEventEnd: 0, loadEventEnd: 0 },
+      timing: _newPerformanceTiming({}),
       navigation: { type: 0, redirectCount: 0 },
       memory: {
         jsHeapSizeLimit: 4294705152,
@@ -5765,7 +6028,11 @@ class Performance {
   get timeOrigin() { return _performanceSlots.get(this).timeOrigin; }
   set timeOrigin(value) { _performanceSlots.get(this).timeOrigin = Number(value) || 0; }
   get timing() { return _performanceSlots.get(this).timing; }
-  set timing(value) { _performanceSlots.get(this).timing = value; }
+  set timing(value) {
+    _performanceSlots.get(this).timing = value instanceof PerformanceTiming
+      ? value
+      : _newPerformanceTiming(value || {});
+  }
   get navigation() { return _performanceSlots.get(this).navigation; }
   set navigation(value) { _performanceSlots.get(this).navigation = value; }
   get memory() { return _performanceSlots.get(this).memory; }
@@ -6262,7 +6529,30 @@ globalThis.HTMLLIElement = Element;
 globalThis.HTMLPreElement = Element;
 globalThis.HTMLHeadingElement = Element;
 globalThis.HTMLTemplateElement = Element;
-globalThis.HTMLSlotElement = Element;
+globalThis.HTMLSlotElement = class HTMLSlotElement extends Element {
+  assignedNodes(options) {
+    const root = this.getRootNode();
+    if (!(root instanceof ShadowRoot) || !root.host) return [];
+    const name = this.getAttribute('name') || '';
+    let nodes = Array.from(root.host.childNodes).filter(node => {
+      if (node.nodeType !== 1) return name === '';
+      return (node.getAttribute('slot') || '') === name;
+    });
+    if (nodes.length === 0) nodes = Array.from(this.childNodes);
+    if (options && options.flatten) {
+      nodes = nodes.flatMap(node =>
+        node instanceof HTMLSlotElement ? node.assignedNodes({ flatten: true }) : [node]
+      );
+    }
+    return nodes;
+  }
+  assignedElements(options) {
+    return this.assignedNodes(options).filter(node => node.nodeType === 1);
+  }
+};
+_markNative(globalThis.HTMLSlotElement);
+_markNative(globalThis.HTMLSlotElement.prototype.assignedNodes);
+_markNative(globalThis.HTMLSlotElement.prototype.assignedElements);
 globalThis.HTMLOptionElement = Element;
 globalThis.HTMLDataListElement = Element;
 globalThis.HTMLFieldSetElement = Element;
@@ -6364,7 +6654,7 @@ for (const _proto of [Document.prototype, DocumentFragment.prototype]) {
   _proto.prepend = Element.prototype.prepend;
   _proto.replaceChildren = Element.prototype.replaceChildren;
 }
-globalThis.EventTarget = Node;
+globalThis.EventTarget = EventTarget;
 globalThis.HTMLCollection = class HTMLCollection extends Array {
   item(i) {
     i = i >>> 0;
@@ -7232,6 +7522,13 @@ Element.prototype.attachShadow = function attachShadow(opts) {
   const host = this;
   const children = [];
   const shadowNid = +_dom("create_document_fragment");
+  const markShadowTree = (node, root) => {
+    if (!node || typeof node !== 'object') return;
+    Object.defineProperty(node, '_obscuraShadowRoot', {
+      value: root, writable: true, configurable: true,
+    });
+    for (const child of Array.from(node.childNodes || [])) markShadowTree(child, root);
+  };
   const shadow = {
     mode: opts.mode,
     host: host,
@@ -7241,7 +7538,11 @@ Element.prototype.attachShadow = function attachShadow(opts) {
       if (v) {
         const tmp = document.createElement('div');
         tmp.innerHTML = v;
-        for (let i = 0; i < tmp.childNodes.length; i++) children.push(tmp.childNodes[i]);
+        for (let i = 0; i < tmp.childNodes.length; i++) {
+          const child = tmp.childNodes[i];
+          children.push(child);
+          markShadowTree(child, shadow);
+        }
       }
     },
     get childNodes() { return children; },
@@ -7252,6 +7553,7 @@ Element.prototype.attachShadow = function attachShadow(opts) {
     appendChild(c) {
       if (c) {
         children.push(c);
+        markShadowTree(c, shadow);
         try { c.parentNode = shadow; } catch (_) { /* parentNode is getter-only on Node, ignore */ }
       }
       return c;
@@ -7262,6 +7564,7 @@ Element.prototype.attachShadow = function attachShadow(opts) {
       const idx = children.indexOf(ref);
       if (idx >= 0) {
         children.splice(idx, 0, n);
+        markShadowTree(n, shadow);
         try { n.parentNode = shadow; } catch (_) {}
       }
       else shadow.appendChild(n);
@@ -7272,6 +7575,7 @@ Element.prototype.attachShadow = function attachShadow(opts) {
       const idx = children.indexOf(o);
       if (idx >= 0) {
         children[idx] = n;
+        markShadowTree(n, shadow);
         try { n.parentNode = shadow; } catch (_) {}
       }
       return o;

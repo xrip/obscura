@@ -691,9 +691,10 @@ impl Page {
                     }
                 }
             } else if !script.inline.is_empty() {
+                let document_url = self.url_string();
                 if let Some(js) = &mut self.js {
                     let _ = js.execute_script("<current-script>", &format!("globalThis.__currentScriptNid={};", script.nid));
-                    if let Err(e) = js.execute_script_guarded("<inline>", &script.inline) {
+                    if let Err(e) = js.execute_script_guarded(&document_url, &script.inline) {
                         tracing::warn!("Inline script error: {}", e);
                     }
                     let _ = js.execute_script("<current-script>", "globalThis.__currentScriptNid=0;");
@@ -795,6 +796,13 @@ impl Page {
             let mut saw_async_work = false;
             let mut idle_since: Option<tokio::time::Instant> = None;
             loop {
+                // A real navigation abandons the old document and its timers.
+                // Let navigate_with_wait_post_inner follow the pending URL now
+                // instead of spending the settle budget on work that is about
+                // to be discarded.
+                if js.has_pending_navigation() {
+                    break;
+                }
                 let now = tokio::time::Instant::now();
                 if now >= dynamic_deadline {
                     break;

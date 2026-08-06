@@ -239,6 +239,10 @@ impl ObscuraJsRuntime {
         self.state.borrow_mut().pending_navigation.take()
     }
 
+    pub fn has_pending_navigation(&self) -> bool {
+        self.state.borrow().pending_navigation.is_some()
+    }
+
     pub fn take_pending_binding_calls(&self) -> Vec<(String, String)> {
         std::mem::take(&mut self.state.borrow_mut().pending_binding_calls)
     }
@@ -841,18 +845,15 @@ impl ObscuraJsRuntime {
         Ok(())
     }
 
-    pub fn execute_script(&mut self, _name: &str, source: &str) -> Result<(), String> {
-        self.runtime
-            .execute_script("<script>", source.to_string())
-            .map_err(|e| format!("JS error: {}", e))?;
-        Ok(())
+    pub fn execute_script(&mut self, name: &str, source: &str) -> Result<(), String> {
+        self.execute_named_script(name, source)
     }
 
-    pub fn execute_script_guarded(&mut self, _name: &str, source: &str) -> Result<(), String> {
+    pub fn execute_script_guarded(&mut self, name: &str, source: &str) -> Result<(), String> {
         if source.len() < 10_000 {
-            self.execute_script(_name, source)
+            self.execute_script(name, source)
         } else {
-            self.execute_script_with_timeout(source, std::time::Duration::from_secs(5))
+            self.execute_script_with_timeout_named(name, source, std::time::Duration::from_secs(5))
         }
     }
 
@@ -861,11 +862,17 @@ impl ObscuraJsRuntime {
         source: &str,
         timeout: std::time::Duration,
     ) -> Result<(), String> {
+        self.execute_script_with_timeout_named("<script>", source, timeout)
+    }
+
+    fn execute_script_with_timeout_named(
+        &mut self,
+        name: &str,
+        source: &str,
+        timeout: std::time::Duration,
+    ) -> Result<(), String> {
         if timeout.is_zero() {
-            self.runtime
-                .execute_script("<script>", source.to_string())
-                .map_err(|e| format!("JS error: {}", e))?;
-            return Ok(());
+            return self.execute_named_script(name, source);
         }
 
         let isolate_handle = self.runtime.v8_isolate().thread_safe_handle();
@@ -896,9 +903,7 @@ impl ObscuraJsRuntime {
             }
         });
 
-        let result = self
-            .runtime
-            .execute_script("<script>", source.to_string());
+        let result = self.execute_named_script(name, source);
 
         {
             let (lock, cvar) = &*pair;
@@ -910,17 +915,57 @@ impl ObscuraJsRuntime {
 
         match result {
             Ok(_) => Ok(()),
-            Err(e) => {
-                let msg = e.to_string();
+            Err(msg) => {
                 if msg.contains("Uncaught Error: execution terminated") {
                     tracing::warn!("Script killed after {}s timeout", timeout.as_secs());
                     self.runtime.execute_script("<reset>", "undefined".to_string()).ok();
                     Ok(())
                 } else {
-                    Err(format!("JS error: {}", msg))
+                    Err(msg)
                 }
             }
         }
+    }
+
+    fn execute_named_script(&mut self, name: &str, source: &str) -> Result<(), String> {
+        use deno_core::v8;
+
+        let context = self.runtime.main_context();
+        let isolate = self.runtime.v8_isolate();
+        let scope = &mut v8::HandleScope::new(isolate);
+        let context = v8::Local::new(scope, context);
+        let scope = &mut v8::ContextScope::new(scope, context);
+        let scope = &mut v8::TryCatch::new(scope);
+        let source = v8::String::new(scope, source)
+            .ok_or_else(|| "JS error: failed to allocate script source".to_string())?;
+        let resource_name = v8::String::new(scope, name)
+            .ok_or_else(|| "JS error: failed to allocate script name".to_string())?;
+        let origin = v8::ScriptOrigin::new(
+            scope,
+            resource_name.into(),
+            0,
+            0,
+            false,
+            -1,
+            None,
+            false,
+            false,
+            false,
+            None,
+        );
+        let script = v8::Script::compile(scope, source, Some(&origin));
+        if script.and_then(|script| script.run(scope)).is_some() {
+            return Ok(());
+        }
+        if scope.has_terminated() {
+            return Err("JS error: Uncaught Error: execution terminated".to_string());
+        }
+        let detail = scope
+            .stack_trace()
+            .or_else(|| scope.exception())
+            .map(|value| value.to_rust_string_lossy(scope))
+            .unwrap_or_else(|| "unknown JavaScript exception".to_string());
+        Err(format!("JS error: {detail}"))
     }
 
     pub async fn run_event_loop(&mut self) -> Result<(), String> {
@@ -1881,6 +1926,224 @@ mod tests {
             lead.as_f64().unwrap() <= 1.0,
             "performance.now() advanced ahead of elapsed time: {lead}"
         );
+    }
+
+    #[test]
+    fn native_function_errors_hide_internal_stack_frames() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "https://example.com/page",
+            r#"try {
+                Function.prototype.toString.call({});
+            } catch (error) {
+                globalThis.__nativeFunctionErrorStack = error.stack;
+            }"#,
+        ).unwrap();
+        let stack = rt
+            .evaluate("globalThis.__nativeFunctionErrorStack")
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(stack.contains("https://example.com/page"), "page source missing from stack: {stack}");
+        assert!(!stack.contains("<obscura:"), "internal source leaked into stack: {stack}");
+    }
+
+    #[test]
+    fn performance_timing_has_standard_json_shape() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(function(){
+                    const value = performance.timing.toJSON();
+                    return {
+                        type: Object.prototype.toString.call(performance.timing),
+                        method: typeof performance.timing.toJSON,
+                        navigationStart: value.navigationStart,
+                        loadEventEnd: value.loadEventEnd,
+                        keys: Object.keys(value).length,
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(result["type"], serde_json::json!("[object PerformanceTiming]"));
+        assert_eq!(result["method"], serde_json::json!("function"));
+        assert!(result["navigationStart"].as_f64().unwrap() > 0.0);
+        assert!(result["loadEventEnd"].as_f64().unwrap() > 0.0);
+        assert_eq!(result["keys"], serde_json::json!(21));
+    }
+
+    #[test]
+    fn secure_context_tracks_the_document_origin() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_eq!(rt.evaluate("isSecureContext").unwrap(), serde_json::json!(false));
+
+        rt.set_url("https://example.com/test");
+        assert_eq!(rt.evaluate("isSecureContext").unwrap(), serde_json::json!(true));
+
+        rt.set_url("http://localhost/test");
+        assert_eq!(rt.evaluate("isSecureContext").unwrap(), serde_json::json!(true));
+        assert_eq!(
+            rt.evaluate("Function.prototype.toString.call(Object.getOwnPropertyDescriptor(window, 'isSecureContext').get)").unwrap(),
+            serde_json::json!("function get isSecureContext() { [native code] }")
+        );
+    }
+
+    #[test]
+    fn protected_audience_has_chromium_interface_shape() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(function(){
+                    const value = navigator.protectedAudience;
+                    const navDescriptor = Object.getOwnPropertyDescriptor(Navigator.prototype, 'protectedAudience');
+                    const methodDescriptor = Object.getOwnPropertyDescriptor(ProtectedAudience.prototype, 'queryFeatureSupport');
+                    let missingArgumentError = false;
+                    let illegalConstructor = false;
+                    try { value.queryFeatureSupport(); } catch (error) { missingArgumentError = error instanceof TypeError; }
+                    try { new ProtectedAudience(); } catch (error) { illegalConstructor = error instanceof TypeError; }
+                    return {
+                        tag: Object.prototype.toString.call(value),
+                        stable: value === navigator.protectedAudience,
+                        navEnumerable: navDescriptor.enumerable,
+                        methodEnumerable: methodDescriptor.enumerable,
+                        getterText: Function.prototype.toString.call(navDescriptor.get),
+                        methodText: Function.prototype.toString.call(value.queryFeatureSupport),
+                        adComponentsLimit: value.queryFeatureSupport('adComponentsLimit'),
+                        unknownIsUndefined: value.queryFeatureSupport('unknown') === undefined,
+                        missingArgumentError,
+                        illegalConstructor,
+                        deprecatedFlag: navigator.deprecatedRunAdAuctionEnforcesKAnonymity,
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(result["tag"], serde_json::json!("[object ProtectedAudience]"));
+        assert_eq!(result["stable"], serde_json::json!(true));
+        assert_eq!(result["navEnumerable"], serde_json::json!(true));
+        assert_eq!(result["methodEnumerable"], serde_json::json!(true));
+        assert_eq!(result["getterText"], serde_json::json!("function get protectedAudience() { [native code] }"));
+        assert_eq!(result["methodText"], serde_json::json!("function queryFeatureSupport() { [native code] }"));
+        assert_eq!(result["adComponentsLimit"], serde_json::json!(40));
+        assert_eq!(result["unknownIsUndefined"], serde_json::json!(true));
+        assert_eq!(result["missingArgumentError"], serde_json::json!(true));
+        assert_eq!(result["illegalConstructor"], serde_json::json!(true));
+        assert_eq!(result["deprecatedFlag"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn managed_data_and_event_target_have_chromium_shape() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(function(){
+                    const managed = navigator.managed;
+                    const navDescriptor = Object.getOwnPropertyDescriptor(Navigator.prototype, 'managed');
+                    const methodDescriptor = Object.getOwnPropertyDescriptor(NavigatorManagedData.prototype, 'getManagedConfiguration');
+                    let eventCount = 0;
+                    const target = new EventTarget();
+                    target.addEventListener('test', () => eventCount++);
+                    target.dispatchEvent(new Event('test'));
+                    let illegalConstructor = false;
+                    let missingArgumentError = false;
+                    try { new NavigatorManagedData(); } catch (error) { illegalConstructor = error instanceof TypeError; }
+                    try { managed.getManagedConfiguration(); } catch (error) { missingArgumentError = error instanceof TypeError; }
+                    return {
+                        tag: Object.prototype.toString.call(managed),
+                        eventTargetTag: Object.prototype.toString.call(target),
+                        nodeIsEventTarget: document instanceof EventTarget,
+                        eventCount,
+                        stable: managed === navigator.managed,
+                        navEnumerable: navDescriptor.enumerable,
+                        methodEnumerable: methodDescriptor.enumerable,
+                        getterText: Function.prototype.toString.call(navDescriptor.get),
+                        methodText: Function.prototype.toString.call(managed.getManagedConfiguration),
+                        illegalConstructor,
+                        missingArgumentError,
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(result["tag"], serde_json::json!("[object NavigatorManagedData]"));
+        assert_eq!(result["eventTargetTag"], serde_json::json!("[object EventTarget]"));
+        assert_eq!(result["nodeIsEventTarget"], serde_json::json!(true));
+        assert_eq!(result["eventCount"], serde_json::json!(1));
+        assert_eq!(result["stable"], serde_json::json!(true));
+        assert_eq!(result["navEnumerable"], serde_json::json!(true));
+        assert_eq!(result["methodEnumerable"], serde_json::json!(true));
+        assert_eq!(result["getterText"], serde_json::json!("function get managed() { [native code] }"));
+        assert_eq!(result["methodText"], serde_json::json!("function getManagedConfiguration() { [native code] }"));
+        assert_eq!(result["illegalConstructor"], serde_json::json!(true));
+        assert_eq!(result["missingArgumentError"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn navigator_has_complete_legacy_identity() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(function(){
+                    const proto = Object.getPrototypeOf(navigator);
+                    const names = ['appCodeName', 'appName', 'vendorSub'];
+                    return {
+                        values: names.map(name => navigator[name]),
+                        own: names.map(name => Object.prototype.hasOwnProperty.call(navigator, name)),
+                        descriptors: names.map(name => {
+                            const descriptor = Object.getOwnPropertyDescriptor(proto, name);
+                            return [descriptor.enumerable, descriptor.configurable,
+                                Function.prototype.toString.call(descriptor.get)];
+                        }),
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(result["values"], serde_json::json!(["Mozilla", "Netscape", ""]));
+        assert_eq!(result["own"], serde_json::json!([false, false, false]));
+        assert_eq!(
+            result["descriptors"],
+            serde_json::json!([
+                [true, true, "function get appCodeName() { [native code] }"],
+                [true, true, "function get appName() { [native code] }"],
+                [true, true, "function get vendorSub() { [native code] }"],
+            ])
+        );
+    }
+
+    #[test]
+    fn media_devices_has_chromium_interface_shape() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(function(){
+                    const value = navigator.mediaDevices;
+                    const proto = Object.getPrototypeOf(value);
+                    const descriptor = Object.getOwnPropertyDescriptor(proto, 'enumerateDevices');
+                    const navDescriptor = Object.getOwnPropertyDescriptor(Navigator.prototype, 'mediaDevices');
+                    let illegalConstructor = false;
+                    try { new MediaDevices(); } catch (error) { illegalConstructor = error instanceof TypeError; }
+                    return {
+                        tag: Object.prototype.toString.call(value),
+                        stable: value === navigator.mediaDevices,
+                        eventTarget: value instanceof EventTarget,
+                        methodEnumerable: descriptor.enumerable,
+                        navEnumerable: navDescriptor.enumerable,
+                        methodText: Function.prototype.toString.call(value.enumerateDevices),
+                        getterText: Function.prototype.toString.call(navDescriptor.get),
+                        promiseTag: Object.prototype.toString.call(value.enumerateDevices()),
+                        illegalConstructor,
+                    };
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(result["tag"], serde_json::json!("[object MediaDevices]"));
+        assert_eq!(result["stable"], serde_json::json!(true));
+        assert_eq!(result["eventTarget"], serde_json::json!(true));
+        assert_eq!(result["methodEnumerable"], serde_json::json!(true));
+        assert_eq!(result["navEnumerable"], serde_json::json!(true));
+        assert_eq!(result["methodText"], serde_json::json!("function enumerateDevices() { [native code] }"));
+        assert_eq!(result["getterText"], serde_json::json!("function get mediaDevices() { [native code] }"));
+        assert_eq!(result["promiseTag"], serde_json::json!("[object Promise]"));
+        assert_eq!(result["illegalConstructor"], serde_json::json!(true));
     }
 
     #[test]
@@ -4544,6 +4807,106 @@ mod tests {
                 "undefined", "function", false, false
             ])
         );
+    }
+
+    #[test]
+    fn location_navigation_accepts_url_objects() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let href = rt.evaluate(
+            "const next = new URL('/from-url-object', location.href); location.assign(next); return location.href;",
+        ).unwrap();
+        assert_eq!(href, serde_json::json!("http://example.com/from-url-object"));
+        assert_eq!(
+            rt.take_pending_navigation(),
+            Some((
+                "http://example.com/from-url-object".to_string(),
+                "GET".to_string(),
+                "".to_string(),
+            ))
+        );
+    }
+
+    #[test]
+    fn pending_navigation_can_be_checked_without_consuming_it() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert!(!rt.has_pending_navigation());
+        rt.evaluate("location.replace('/next')").unwrap();
+        assert!(rt.has_pending_navigation());
+        assert_eq!(
+            rt.take_pending_navigation(),
+            Some(("http://example.com/next".to_string(), "GET".to_string(), "".to_string()))
+        );
+        assert!(!rt.has_pending_navigation());
+    }
+
+    #[test]
+    fn slot_assignment_methods_follow_the_shadow_host_children() {
+        let mut rt = setup_runtime(
+            r#"<div id="host"><span id="default"></span><b id="named" slot="named"></b></div>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+                const host = document.getElementById('host');
+                const root = host.attachShadow({ mode: 'open' });
+                root.innerHTML = '<slot></slot><slot name="named"></slot>';
+                const slots = root.querySelectorAll('slot');
+                return [
+                    slots[0] instanceof HTMLSlotElement,
+                    slots[0].assignedElements().map(node => node.id),
+                    slots[1].assignedNodes().map(node => node.id),
+                    slots[0].getRootNode() === root,
+                    slots[0].getRootNode({ composed: true }) === document,
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([true, ["default"], ["named"], true, true])
+        );
+    }
+
+    #[test]
+    fn css_declaration_with_invalid_owner_does_not_crash_page_code() {
+        let mut rt = setup_runtime(r#"<div id="target" style="color: red"></div>"#);
+        let result = rt
+            .evaluate(
+                r#"
+                const style = document.getElementById('target').style;
+                Object.defineProperty(style, '_owner', { value: 'invalid', configurable: true });
+                return [style.getPropertyValue('color'), Reflect.set(style, 'color', 'blue')];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!(["", true]));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn recursive_animation_frames_yield_between_callbacks() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "raf-test",
+            r#"
+            globalThis.__rafTimes = [];
+            function frame(timestamp) {
+                __rafTimes.push(timestamp);
+                if (__rafTimes.length < 3) requestAnimationFrame(frame);
+            }
+            requestAnimationFrame(frame);
+            "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(250).await.unwrap();
+        let result = rt
+            .evaluate(
+                "[__rafTimes.length, __rafTimes[1] - __rafTimes[0], __rafTimes[2] - __rafTimes[1]]",
+            )
+            .unwrap();
+        let values = result.as_array().unwrap();
+        assert_eq!(values[0], serde_json::json!(3));
+        assert!(values[1].as_f64().unwrap() >= 8.0);
+        assert!(values[2].as_f64().unwrap() >= 8.0);
     }
 
     #[test]
