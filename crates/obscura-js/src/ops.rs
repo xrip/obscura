@@ -818,8 +818,10 @@ async fn op_fetch_url(
     #[string] body: String,
     #[string] origin: String,
     #[string] mode: String,
+    #[string] resource_kind: String,
 ) -> Result<String, deno_error::JsErrorBox> {
     tracing::debug!("op_fetch_url called: {} {} (intercept check pending)", method, url);
+    let request_resource_type = resource_type_from_kind(&resource_kind);
 
     let (cookie_jar, in_flight, intercept_tx, proxy_url, callbacks, http_client, _document_url) = {
         let state_borrow = state.borrow();
@@ -894,7 +896,7 @@ async fn op_fetch_url(
             url: url.clone(),
             method: method.clone(),
             headers: custom_headers.clone(),
-            resource_type: "Fetch".to_string(),
+            resource_type: resource_type_name(request_resource_type).to_string(),
             resolver: resolve_tx,
         };
         if tx.send(intercepted).is_ok() {
@@ -994,7 +996,7 @@ async fn op_fetch_url(
                     url: parsed,
                     method: method.clone(),
                     headers: custom_headers.clone(),
-                    resource_type: ResourceType::Fetch,
+                    resource_type: request_resource_type,
                 };
                 cbs.fire_request(&info).await;
             }
@@ -1024,6 +1026,7 @@ async fn op_fetch_url(
                 page_origin.clone(),
                 is_cross_origin,
                 mode.clone(),
+                request_resource_type,
                 _document_url.clone(),
                 callbacks.clone(),
                 allow_private_network,
@@ -1099,14 +1102,14 @@ async fn op_fetch_url(
             }
         }
 
-        // Send a default User-Agent on fetch()/XHR requests (the navigation path
-        // sets one, but this op did not, so scripted requests went out with no UA
-        // and UA-gated servers rejected them). Honor an explicit override.
+        // Scripted requests use the selected profile UA from the owning client.
         if !custom_headers.keys().any(|k| k.eq_ignore_ascii_case("user-agent")) {
-            req = req.header(
-                "User-Agent",
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
-            );
+            if let Some(client) = http_client.as_ref() {
+                let user_agent = client.user_agent.read().await.clone();
+                if !user_agent.is_empty() {
+                    req = req.header("User-Agent", user_agent);
+                }
+            }
         }
 
         for (k, v) in &custom_headers {
@@ -1242,7 +1245,7 @@ async fn op_fetch_url(
                 url: resp.url.clone(),
                 method: method.clone(),
                 headers: resp_headers.clone(),
-                resource_type: ResourceType::Fetch,
+                resource_type: request_resource_type,
             };
             cbs.fire_response(&info, &resp).await;
         }
@@ -1321,16 +1324,54 @@ fn fetch_response(url: &str, status: u16, headers: HashMap<String, String>, body
     }
 }
 
+fn resource_type_from_kind(kind: &str) -> ResourceType {
+    match kind.to_ascii_lowercase().as_str() {
+        "script" => ResourceType::Script,
+        "stylesheet" | "style" => ResourceType::Stylesheet,
+        "image" => ResourceType::Image,
+        "font" => ResourceType::Font,
+        "xhr" => ResourceType::Xhr,
+        "other" => ResourceType::Other,
+        _ => ResourceType::Fetch,
+    }
+}
+
+fn resource_type_name(resource_type: ResourceType) -> &'static str {
+    match resource_type {
+        ResourceType::Document => "Document",
+        ResourceType::Script => "Script",
+        ResourceType::Stylesheet => "Stylesheet",
+        ResourceType::Image => "Image",
+        ResourceType::Font => "Font",
+        ResourceType::Xhr => "Xhr",
+        ResourceType::Fetch => "Fetch",
+        ResourceType::Other => "Other",
+    }
+}
+
+fn document_referrer_for_target(document_url: &str, target: &url::Url) -> Option<String> {
+    let mut referrer = url::Url::parse(document_url).ok()?;
+    if referrer.scheme() == "https" && target.scheme() == "http" {
+        return None;
+    }
+    referrer.set_fragment(None);
+    Some(referrer.to_string())
+}
+
 #[cfg(feature = "stealth")]
 fn insert_scripted_fetch_metadata(
     headers: &mut HashMap<String, String>,
     mode: &str,
     is_cross_origin: bool,
+    resource_type: ResourceType,
 ) {
-    let fetch_mode = if mode.is_empty() { "cors" } else { mode };
-    // fetch() and XHR have an empty destination in Chromium, including
-    // no-cors requests. Script element loads use "script" on their own path.
-    headers.insert("sec-fetch-dest".to_string(), "empty".to_string());
+    let (_, resource_mode, resource_dest) = obscura_net::resource_request_headers(resource_type);
+    let fetch_mode = match resource_type {
+        ResourceType::Script | ResourceType::Stylesheet => resource_mode,
+        _ if mode.is_empty() => "cors",
+        _ => mode,
+    };
+    headers.insert("sec-fetch-dest".to_string(), resource_dest.to_string());
     headers.insert("sec-fetch-mode".to_string(), fetch_mode.to_string());
     headers.insert(
         "sec-fetch-site".to_string(),
@@ -1354,6 +1395,7 @@ async fn stealth_fetch_all(
     page_origin: String,
     is_cross_origin: bool,
     mode: String,
+    resource_type: ResourceType,
     document_url: String,
     callbacks: Option<Arc<CallbackRegistry>>,
     allow_private_network: bool,
@@ -1375,41 +1417,39 @@ async fn stealth_fetch_all(
         };
 
         let mut req_headers: HashMap<String, String> = HashMap::new();
+        let (resource_accept, _, _) = obscura_net::resource_request_headers(resource_type);
         let fetch_mode = if mode.is_empty() { "cors" } else { mode.as_str() };
         req_headers.insert(
             "accept".to_string(),
             custom_headers
                 .get("accept")
                 .cloned()
-                .unwrap_or_else(|| "*/*".to_string()),
+                .unwrap_or_else(|| resource_accept.to_string()),
         );
-        insert_scripted_fetch_metadata(&mut req_headers, fetch_mode, is_cross_origin);
+        insert_scripted_fetch_metadata(
+            &mut req_headers,
+            fetch_mode,
+            is_cross_origin,
+            resource_type,
+        );
         // Browsers send Origin on non-GET same-origin fetches too. This is
         // important for token and challenge endpoints that bind the issued
         // token to the page origin.
-        if (!is_cross_origin && current_method != "GET" && current_method != "HEAD")
-            || is_cross_origin
-        {
+        let sends_origin = match resource_type {
+            ResourceType::Script | ResourceType::Stylesheet => false,
+            _ => (!is_cross_origin && current_method != "GET" && current_method != "HEAD")
+                || is_cross_origin,
+        };
+        if sends_origin {
             req_headers.insert("origin".to_string(), page_origin.clone());
         }
         for (k, v) in &custom_headers {
             req_headers.insert(k.to_lowercase(), v.clone());
         }
 
-        // Fetch uses the document as its referrer. Same-origin requests carry
-        // the full document URL; cross-origin requests carry only the origin
-        // under the default strict-origin-when-cross-origin policy.
-        if let Ok(mut referrer_url) = url::Url::parse(&document_url) {
-            referrer_url.set_fragment(None);
-            let referer = if referrer_url.origin().ascii_serialization()
-                == parsed_current.origin().ascii_serialization()
-            {
-                referrer_url.to_string()
-            } else {
-                page_origin.clone()
-            };
-            if !referer.is_empty() {
-                req_headers.insert("referer".to_string(), referer);
+        if !req_headers.contains_key("referer") {
+            if let Some(referrer) = document_referrer_for_target(&document_url, &parsed_current) {
+                req_headers.insert("referer".to_string(), referrer);
             }
         }
 
@@ -1482,7 +1522,7 @@ async fn stealth_fetch_all(
                 url: resp.url.clone(),
                 method: current_method.clone(),
                 headers: resp_headers.clone(),
-                resource_type: ResourceType::Fetch,
+                resource_type,
             };
             cbs.fire_response(&info, &resp).await;
         }
@@ -1531,12 +1571,14 @@ mod tests {
 
     #[cfg(feature = "stealth")]
     use super::insert_scripted_fetch_metadata;
+    #[cfg(feature = "stealth")]
+    use obscura_net::ResourceType;
 
     #[cfg(feature = "stealth")]
     #[test]
     fn no_cors_fetch_keeps_an_empty_destination() {
         let mut headers = std::collections::HashMap::new();
-        insert_scripted_fetch_metadata(&mut headers, "no-cors", true);
+        insert_scripted_fetch_metadata(&mut headers, "no-cors", true, ResourceType::Fetch);
         assert_eq!(headers.get("sec-fetch-dest").map(String::as_str), Some("empty"));
         assert_eq!(headers.get("sec-fetch-mode").map(String::as_str), Some("no-cors"));
         assert_eq!(headers.get("sec-fetch-site").map(String::as_str), Some("cross-site"));

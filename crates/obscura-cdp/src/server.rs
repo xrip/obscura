@@ -206,6 +206,13 @@ pub async fn start_with_profile_workbench_options_and_limit(
         .map(ProfileWorkbench::new)
         .transpose()?
         .map(Arc::new);
+    let control_user_agent = user_agent.clone().unwrap_or_else(|| {
+        obscura_browser::profiles::resolve_profile()
+            .expect("the browser fingerprint profile must be available")
+            .browser
+            .user_agent
+            .clone()
+    });
 
     // Issue #62: the HTTP control plane (/json/version, /json) must remain
     // reachable even while V8 JS evaluation blocks the tokio LocalSet thread.
@@ -261,6 +268,7 @@ pub async fn start_with_profile_workbench_options_and_limit(
                             port,
                             &ws_tx,
                             accept_workbench.as_deref(),
+                            &control_user_agent,
                         ) {
                             if !format!("{}", e).contains("close") {
                                 error!("Accept dispatch error: {}", e);
@@ -638,6 +646,7 @@ fn accept_dispatch(
     port: u16,
     ws_tx: &mpsc::Sender<std::net::TcpStream>,
     profile_workbench: Option<&ProfileWorkbench>,
+    user_agent: &str,
 ) -> anyhow::Result<()> {
     let mut buf = [0u8; WS_PEEK_BUF];
     let n = stream.peek(&mut buf)?;
@@ -667,7 +676,7 @@ fn accept_dispatch(
         };
 
         if let Some(ep) = endpoint {
-            return handle_http_json_blocking(stream, port, ep);
+            return handle_http_json_blocking(stream, port, ep, user_agent);
         }
         // Fall through: GET request that isn't a /json endpoint → treat as
         // WebSocket upgrade (Chromium DevTools clients issue GET with
@@ -696,6 +705,7 @@ fn handle_http_json_blocking(
     mut stream: std::net::TcpStream,
     port: u16,
     endpoint: &str,
+    user_agent: &str,
 ) -> anyhow::Result<()> {
     use std::io::{Read, Write};
 
@@ -704,9 +714,9 @@ fn handle_http_json_blocking(
 
     let body = match endpoint {
         "version" => serde_json::to_string_pretty(&json!({
-            "Browser": "Chrome/145.0.0.0",
+            "Browser": browser_label(user_agent),
             "Protocol-Version": "1.3",
-            "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
+            "User-Agent": user_agent,
             "V8-Version": "14.5.0.0",
             "WebKit-Version": "537.36",
             "webSocketDebuggerUrl": format!("ws://127.0.0.1:{}/devtools/browser", port),
@@ -733,6 +743,14 @@ fn handle_http_json_blocking(
     stream.write_all(resp.as_bytes())?;
     stream.flush()?;
     Ok(())
+}
+
+fn browser_label(user_agent: &str) -> String {
+    user_agent
+        .split_once("Chrome/")
+        .and_then(|(_, version)| version.split_whitespace().next())
+        .map(|version| format!("Chrome/{version}"))
+        .unwrap_or_else(|| "Obscura".to_string())
 }
 
 /// Per-connection CDP processor. Each connection runs its own processor (with

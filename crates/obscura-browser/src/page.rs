@@ -301,15 +301,16 @@ impl Page {
         resource_type: ResourceType,
     ) -> Result<Response, ObscuraNetError> {
         #[cfg(feature = "stealth")]
-        if let Some(ref stealth) = self.stealth_client {
-            return stealth
-                .fetch_with_context(url, referrer, Some(&self.callbacks), resource_type)
-                .await;
+        {
+            if let Some(ref stealth) = self.stealth_client {
+                return stealth
+                    .fetch_with_context(url, referrer, Some(&self.callbacks), resource_type)
+                    .await;
+            }
         }
-        #[cfg(not(feature = "stealth"))]
-        let _ = (referrer, resource_type);
-        self.http_client
-            .fetch_with_callbacks(url, Some(&self.callbacks))
+        self
+            .http_client
+            .fetch_with_context(url, referrer, Some(&self.callbacks), resource_type)
             .await
     }
 
@@ -746,6 +747,19 @@ impl Page {
                     src.clone()
                 };
 
+                if !module_source_allowed(self.url.as_ref(), &full_url) {
+                    tracing::warn!(
+                        "blocking disallowed module source: page={} src={}",
+                        self.url_string(),
+                        full_url,
+                    );
+                    continue;
+                }
+                if self.should_block_url(&full_url) {
+                    tracing::info!("Blocked module by interception: {}", full_url);
+                    continue;
+                }
+
                 tracing::info!("Loading ES module: {}", full_url);
                 if let Some(js) = &mut self.js {
                     match js.load_module(&full_url, module_budget_ms).await {
@@ -850,9 +864,7 @@ impl Page {
                         }
                     }
                     Ok(Err(_)) => break,
-                    Err(_) => {
-                        idle_count = 0;
-                    }
+                    Err(_) => idle_count = 0,
                 }
             }
             js.disarm_watchdog(settle_wd);
@@ -1828,7 +1840,11 @@ fn url_matches_cdp_pattern(pattern: &str, url: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{truncate_on_char_boundary, url_matches_cdp_pattern};
+    use super::{
+        module_source_allowed, subresource_allowed, truncate_on_char_boundary,
+        url_matches_cdp_pattern,
+    };
+    use url::Url;
 
     #[test]
     fn truncate_never_splits_a_multibyte_char() {
@@ -1864,6 +1880,40 @@ mod tests {
             "*://*.gstatic.com/*.woff2",
             "https://fonts.gstatic.com/s/inter/v18/font.woff",
         ));
+    }
+
+    #[test]
+    fn module_subresources_keep_file_access_on_the_same_scheme_only() {
+        let web_page = Url::parse("https://example.com/index.html").unwrap();
+        let file_page = Url::parse("file:///tmp/index.html").unwrap();
+        assert!(subresource_allowed(
+            Some(&web_page),
+            "https://cdn.example.com/app.mjs"
+        ));
+        assert!(!subresource_allowed(Some(&web_page), "file:///tmp/app.mjs"));
+        assert!(subresource_allowed(Some(&file_page), "file:///tmp/app.mjs"));
+        assert!(!subresource_allowed(
+            Some(&web_page),
+            "javascript:alert(1)"
+        ));
+        assert!(!module_source_allowed(Some(&web_page), "file:///tmp/app.mjs"));
+        assert!(!module_source_allowed(
+            Some(&web_page),
+            "data:text/javascript,export%20default%201"
+        ));
+        assert!(module_source_allowed(
+            Some(&file_page),
+            "file:///tmp/app.mjs"
+        ));
+    }
+}
+
+fn module_source_allowed(page_url: Option<&Url>, resource: &str) -> bool {
+    let Ok(target) = Url::parse(resource) else { return false };
+    match target.scheme().to_ascii_lowercase().as_str() {
+        "http" | "https" => true,
+        "file" => page_url.map(|u| u.scheme().eq_ignore_ascii_case("file")).unwrap_or(false),
+        _ => false,
     }
 }
 

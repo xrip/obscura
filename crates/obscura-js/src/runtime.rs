@@ -39,6 +39,7 @@ pub struct RemoteObjectInfo {
 pub struct ObscuraJsRuntime {
     runtime: JsRuntime,
     state: Rc<RefCell<ObscuraState>>,
+    module_loader: Rc<ObscuraModuleLoader>,
     object_store: HashMap<String, String>,
     object_counter: u64,
     /// Thread-safe handle to this runtime's V8 isolate, captured at
@@ -150,6 +151,7 @@ impl ObscuraJsRuntime {
     fn with_module_loader(module_loader: Rc<ObscuraModuleLoader>) -> Self {
         let state = Rc::new(RefCell::new(ObscuraState::new()));
         let state_clone = state.clone();
+        let module_loader_for_runtime = module_loader.clone();
 
         // Build the isolate under the process-wide creation lock so two
         // connection threads never construct isolates concurrently (#430).
@@ -181,6 +183,7 @@ impl ObscuraJsRuntime {
         ObscuraJsRuntime {
             runtime,
             state,
+            module_loader: module_loader_for_runtime,
             object_store: HashMap::new(),
             object_counter: 0,
             isolate_handle,
@@ -196,12 +199,14 @@ impl ObscuraJsRuntime {
     }
 
     pub fn set_http_client(&self, client: std::sync::Arc<obscura_net::ObscuraHttpClient>) {
+        self.module_loader.set_http_client(client.clone());
         self.state.borrow_mut().http_client = Some(client);
     }
 
     /// Install the owning page's passive on_request/on_response callback
     /// registry so scripted fetch()/XHR observation is page-scoped (issue #408).
     pub fn set_callbacks(&self, callbacks: std::sync::Arc<obscura_net::CallbackRegistry>) {
+        self.module_loader.set_callbacks(callbacks.clone());
         self.state.borrow_mut().callbacks = Some(callbacks);
     }
 
@@ -209,6 +214,7 @@ impl ObscuraJsRuntime {
     /// through it in stealth mode (see op_fetch_url / stealth_fetch_all).
     #[cfg(feature = "stealth")]
     pub fn set_stealth_client(&self, client: std::sync::Arc<obscura_net::StealthHttpClient>) {
+        self.module_loader.set_stealth_client(client.clone());
         self.state.borrow_mut().stealth_client = Some(client);
     }
 
@@ -691,19 +697,16 @@ impl ObscuraJsRuntime {
         let specifier = deno_core::ModuleSpecifier::parse(url)
             .map_err(|e| format!("Invalid module URL {}: {}", url, e))?;
 
-        // Fetch the module source. The old impl registered an empty string
-        // and called it loaded, so every Vite / Next module bundle "loaded"
-        // in 1ms with zero code and the SPA never mounted (issue #205).
         let (client, callbacks, document_url) = {
             let st = self.state.borrow();
             (st.http_client.clone(), st.callbacks.clone(), st.url.clone())
         };
+        let referrer = deno_core::ModuleSpecifier::parse(&document_url).ok();
         #[cfg(feature = "stealth")]
-        let source_code = {
+        let response = {
             let stealth_client = self.state.borrow().stealth_client.clone();
             if let Some(stealth) = stealth_client {
-                let referrer = deno_core::ModuleSpecifier::parse(&document_url).ok();
-                match stealth
+                stealth
                     .fetch_with_context(
                         &specifier,
                         referrer.as_ref(),
@@ -711,45 +714,38 @@ impl ObscuraJsRuntime {
                         obscura_net::ResourceType::Script,
                     )
                     .await
-                {
-                    Ok(resp) => obscura_net::decode_non_html(&resp.body, resp.content_type()),
-                    Err(e) => {
-                        tracing::warn!("Module fetch failed ({}): {}", url, e);
-                        String::new()
-                    }
-                }
             } else {
-                match client {
-                    Some(c) => match c.fetch_with_callbacks(&specifier, callbacks.as_deref()).await {
-                        Ok(resp) => obscura_net::decode_non_html(&resp.body, resp.content_type()),
-                        Err(e) => {
-                            tracing::warn!("Module fetch failed ({}): {}", url, e);
-                            String::new()
-                        }
-                    },
-                    None => {
-                        tracing::warn!("No http_client wired to runtime; module {} will be empty", url);
-                        String::new()
-                    }
-                }
+                client
+                    .ok_or_else(|| obscura_net::ObscuraNetError::Network("No HTTP client wired to runtime".into()))
+                    .map_err(|e| e.to_string())?
+                    .fetch_with_context(
+                        &specifier,
+                        referrer.as_ref(),
+                        callbacks.as_deref(),
+                        obscura_net::ResourceType::Script,
+                    )
+                    .await
             }
         };
         #[cfg(not(feature = "stealth"))]
-        let _ = &document_url;
-        #[cfg(not(feature = "stealth"))]
-        let source_code = match client {
-            Some(c) => match c.fetch_with_callbacks(&specifier, callbacks.as_deref()).await {
-                Ok(resp) => obscura_net::decode_non_html(&resp.body, resp.content_type()),
-                Err(e) => {
-                    tracing::warn!("Module fetch failed ({}): {}", url, e);
-                    String::new()
-                }
-            },
-            None => {
-                tracing::warn!("No http_client wired to runtime; module {} will be empty", url);
-                String::new()
-            }
-        };
+        let response = client
+            .ok_or_else(|| obscura_net::ObscuraNetError::Network("No HTTP client wired to runtime".into()))
+            .map_err(|e| e.to_string())?
+            .fetch_with_context(
+                &specifier,
+                referrer.as_ref(),
+                callbacks.as_deref(),
+                obscura_net::ResourceType::Script,
+            )
+            .await;
+        let response = response.map_err(|e| format!("Module fetch failed ({}): {}", url, e))?;
+        if !(200..300).contains(&response.status) {
+            return Err(format!(
+                "Module {} returned HTTP {}",
+                url, response.status
+            ));
+        }
+        let source_code = obscura_net::decode_non_html(&response.body, response.content_type());
 
         // Bound the recursive import-graph fetch. deno_core fetches the graph
         // concurrently, but a module whose top-level eval idle-waits forever (no
@@ -1890,6 +1886,80 @@ mod tests {
         assert_eq!(parsed[1], serde_json::json!(8));
         assert_eq!(parsed[2], serde_json::json!(true));
         assert_eq!(parsed[3], serde_json::json!("ANGLE (NVIDIA, D3D11)"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_scope_is_persistent_and_supports_import_scripts() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "worker-compatibility-test",
+            r#"
+              globalThis.__workerState = [];
+              const importedUrl = URL.createObjectURL(new Blob([
+                'globalThis.__importedValue = 41;'
+              ], {type:'text/javascript'}));
+              const source = 'importScripts("' + importedUrl + '");' +
+                'let count = 0;' +
+                'postMessage(JSON.stringify([' +
+                  'self === globalThis,typeof document,typeof window,' +
+                  'self instanceof WorkerGlobalScope,' +
+                  'self instanceof DedicatedWorkerGlobalScope,' +
+                  'typeof importScripts,globalThis.__importedValue]));' +
+                'onmessage = () => postMessage(String(++count));';
+              const worker = new Worker(
+                URL.createObjectURL(new Blob([source], {type:'text/javascript'}))
+              );
+              worker.onmessage = event => {
+                globalThis.__workerState.push(event.data);
+                if (globalThis.__workerState.length === 1) {
+                  worker.postMessage('one');
+                  worker.postMessage('two');
+                } else if (globalThis.__workerState.length === 3) {
+                  worker.terminate();
+                }
+              };
+            "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        let state = rt.evaluate("globalThis.__workerState").unwrap();
+        let state: Vec<String> = serde_json::from_value(state).unwrap();
+        let first: Vec<serde_json::Value> = serde_json::from_str(&state[0]).unwrap();
+        assert_eq!(
+            serde_json::Value::Array(first),
+            serde_json::json!([true, "undefined", "undefined", true, true, "function", 41])
+        );
+        assert_eq!(&state[1..], ["1", "2"]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_errors_dispatch_error_events_without_worker_prefix() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "worker-error-test",
+            r#"
+              globalThis.__workerError = null;
+              const source = 'throw new Error("worker boom")';
+              const worker = new Worker(
+                URL.createObjectURL(new Blob([source], {type:'text/javascript'}))
+              );
+              worker.onerror = event => {
+                globalThis.__workerError = [
+                  event.type,
+                  event.message,
+                  event.error && event.error.message,
+                  typeof event.preventDefault
+                ];
+                event.preventDefault();
+              };
+            "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("globalThis.__workerError").unwrap(),
+            serde_json::json!(["error", "worker boom", "worker boom", "function"])
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3652,8 +3722,10 @@ mod tests {
     #[test]
     fn test_navigator() {
         let mut rt = setup_runtime("<html><body></body></html>");
+        let profile_ua = "profile-derived-test-agent";
+        rt.set_user_agent(profile_ua);
         let ua = rt.evaluate("navigator.userAgent").unwrap();
-        assert!(ua.as_str().unwrap().contains("Chrome"), "UA should contain Chrome: {}", ua);
+        assert_eq!(ua, serde_json::json!(profile_ua));
         let wd = rt.evaluate("navigator.webdriver").unwrap();
         assert_eq!(wd, serde_json::json!(false));
         let plugins = rt.evaluate("navigator.plugins.length").unwrap();

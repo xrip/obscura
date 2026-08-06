@@ -280,7 +280,7 @@ async function __processDynScriptQueue() {
           if (task.url.startsWith('data:')) {
             body = _decodeDataScriptUrl(task.url);
           } else {
-            const raw = await _denoCore.ops.op_fetch_url(task.url, "GET", "{}", "", task.pageOrigin, "no-cors");
+            const raw = await _denoCore.ops.op_fetch_url(task.url, "GET", "{}", "", task.pageOrigin, "no-cors", "script");
             body = JSON.parse(raw).body;
           }
           if (body) {
@@ -341,7 +341,7 @@ async function _loadLinkedStylesheet(c) {
   let pageOrigin = "";
   try { pageOrigin = new URL(fullUrl).origin; } catch(e) {}
   try {
-    await _denoCore.ops.op_fetch_url(fullUrl, "GET", "{}", "", pageOrigin, "no-cors");
+    await _denoCore.ops.op_fetch_url(fullUrl, "GET", "{}", "", pageOrigin, "no-cors", "stylesheet");
     try { c.dispatchEvent(new Event('load', { bubbles: true })); } catch(e) {}
   } catch(e) {
     try { c.dispatchEvent(new Event('error', { bubbles: true })); } catch(e) {}
@@ -3834,7 +3834,7 @@ class NavigatorUAData {
       fullVersionList: _copyBrands(profile.fullVersionList),
       model: "",
       platformVersion: profile.uaPlatformVersion || globalThis.__obscura_ua_platform_version || "19.0.0",
-      uaFullVersion: browser.version || "145.0.7632.75",
+      uaFullVersion: browser.version || "",
       wow64: false,
     };
     var requested = hints === undefined ? [] : Array.from(hints, String);
@@ -3937,15 +3937,16 @@ _navigatorInstances.add(globalThis.navigator);
   defGetter('appCodeName', function() { return "Mozilla"; });
   defGetter('appName', function() { return "Netscape"; });
   defGetter('vendorSub', function() { return ""; });
-  defGetter('userAgent', function() {
+  function profileUserAgent() {
     return globalThis.__obscura_ua ||
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-      "(KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
+      (_fingerprintProfile && _fingerprintProfile.browser && _fingerprintProfile.browser.userAgent) ||
+      "";
+  }
+  defGetter('userAgent', function() {
+    return profileUserAgent();
   });
   defGetter('appVersion', function() {
-    return (globalThis.__obscura_ua ||
-      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 " +
-      "(KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36").replace('Mozilla/', '');
+    return profileUserAgent().replace('Mozilla/', '');
   });
   defGetter('platform', function() {
     return globalThis.__obscura_platform || "Win32";
@@ -4261,7 +4262,7 @@ globalThis.fetch = async (input, init = {}) => {
   const hdrs = JSON.stringify(_h);
   const fetchMode = init.mode || (input instanceof Request ? input.mode : "cors");
   const pageOrigin = (function() { try { const u = new URL(_domParse("document_url") || "about:blank"); return u.origin; } catch(e) { return ""; } })();
-  const raw = await _denoCore.ops.op_fetch_url(url, method, hdrs, body, pageOrigin, fetchMode);
+  const raw = await _denoCore.ops.op_fetch_url(url, method, hdrs, body, pageOrigin, fetchMode, "fetch");
   const parsed = JSON.parse(raw);
   if (parsed.blocked) {
     const err = new TypeError('net::ERR_FAILED');
@@ -7940,109 +7941,218 @@ globalThis.Worker = class Worker {
     this.onerror = null;
     this._terminated = false;
     this._listeners = {};
+    this._scope = null;
+    this._code = null;
+    this._url = '';
     const worker = this;
 
-    let resolvedUrl = url;
-    if (typeof url === 'string') {
-      const blob = globalThis.__blobStore?.[url];
+    const sourceUrl = String(url);
+    let resolvedUrl = sourceUrl;
+    if (typeof sourceUrl === 'string') {
+      const blob = globalThis.__blobStore?.[sourceUrl];
       if (blob) {
         worker._code = blob;
+        worker._url = sourceUrl;
         // Auto-start on next tick so caller can set onmessage first.
         setTimeout(() => worker._autoRun(), 0);
         return;
       }
-      // Resolve relative URLs against the current page.
-      if (!url.startsWith('http') && !url.startsWith('blob:') && !url.startsWith('data:')) {
-        try { resolvedUrl = new URL(url, globalThis.location?.href || '').href; } catch(e) {}
-      }
-      (async () => {
+      if (sourceUrl.startsWith('data:')) {
         try {
-          const resp = await fetch(resolvedUrl);
-          worker._code = await resp.text();
-          if (!worker._terminated) worker._autoRun();
-        } catch(e) { if (worker.onerror) worker.onerror(e); }
-      })();
+          worker._code = _decodeDataScriptUrl(sourceUrl);
+          worker._url = sourceUrl;
+          setTimeout(() => worker._autoRun(), 0);
+        } catch (e) {
+          setTimeout(() => worker._dispatchError(e), 0);
+        }
+        return;
+      }
+      // Resolve relative URLs against the current page.
+      if (!sourceUrl.startsWith('http') && !sourceUrl.startsWith('blob:')) {
+        try { resolvedUrl = new URL(sourceUrl, globalThis.location?.href || '').href; } catch(e) {}
+      }
+      worker._url = resolvedUrl;
+      setTimeout(() => worker._loadAndRun(), 0);
     }
   }
+
+  _loadAndRun() {
+    if (this._terminated || this._code) return;
+    try {
+      if (this._url.startsWith('file:')
+          && !String(globalThis.location?.href || '').startsWith('file:')) {
+        throw new Error('Cross-scheme Worker script access to file is not allowed');
+      }
+      const result = JSON.parse(_denoCore.ops.op_worker_import_scripts(this._url));
+      if (!result.ok) throw new Error(result.error || 'Worker script load failed');
+      this._code = result.body;
+      this._autoRun();
+    } catch (e) {
+      this._dispatchError(e);
+    }
+  }
+
   _makeScope() {
+    if (this._scope) return this._scope;
     const worker = this;
-    // WorkerGlobalScope defined + no document property → IS_WORKER_SCOPE = true in creepjs
-    const scope = {
-      WorkerGlobalScope: function WorkerGlobalScope() {},
-      DedicatedWorkerGlobalScope: function DedicatedWorkerGlobalScope() {},
-      postMessage: (msg) => {
-        if (worker._terminated) return;
-        const evt = { data: msg };
-        if (worker.onmessage) worker.onmessage(evt);
-        const ls = worker._listeners['message'] || [];
-        for (const h of ls) h(evt);
-      },
-      addEventListener: (type, fn) => {
-        if (!scope._ev) scope._ev = {};
-        if (!scope._ev[type]) scope._ev[type] = [];
-        scope._ev[type].push(fn);
-      },
-      close: () => { worker._terminated = true; },
-      crypto: globalThis.crypto,
-      Crypto: globalThis.Crypto,
-      TextEncoder: globalThis.TextEncoder,
-      TextDecoder: globalThis.TextDecoder,
-      atob: globalThis.atob,
-      btoa: globalThis.btoa,
-      setTimeout: globalThis.setTimeout,
-      setInterval: globalThis.setInterval,
-      clearTimeout: globalThis.clearTimeout,
-      clearInterval: globalThis.clearInterval,
-      fetch: globalThis.fetch,
-      console: globalThis.console,
-      performance: globalThis.performance,
-      location: globalThis.location,
-      navigator: globalThis.navigator,
-      OffscreenCanvas: globalThis.OffscreenCanvas,
-      WebGLRenderingContext: globalThis.WebGLRenderingContext,
-      WebGL2RenderingContext: globalThis.WebGL2RenderingContext,
-      GPU: globalThis.GPU,
-      GPUAdapter: globalThis.GPUAdapter,
-      GPUDevice: globalThis.GPUDevice,
-      GPUBuffer: globalThis.GPUBuffer,
-      GPUTexture: globalThis.GPUTexture,
-      GPUBufferUsage: globalThis.GPUBufferUsage,
-      GPUTextureUsage: globalThis.GPUTextureUsage,
-      GPUShaderStage: globalThis.GPUShaderStage,
-      GPUMapMode: globalThis.GPUMapMode,
+    function WorkerGlobalScope() {}
+    function DedicatedWorkerGlobalScope() {}
+    Object.setPrototypeOf(DedicatedWorkerGlobalScope.prototype, WorkerGlobalScope.prototype);
+    const target = Object.create(DedicatedWorkerGlobalScope.prototype);
+    const define = (name, value) => {
+      Object.defineProperty(target, name, {
+        value, writable: true, configurable: true, enumerable: false,
+      });
     };
-    scope.self = scope;
+    const scope = new Proxy(target, {
+      has: (object, name) => name !== Symbol.unscopables
+        && name !== '__obscura_scope'
+        && name !== '__obscura_source'
+        && name !== 'eval',
+      get: (object, name, receiver) => name === Symbol.unscopables
+        ? undefined
+        : Reflect.get(object, name, receiver),
+      set: (object, name, value) => Reflect.set(object, name, value),
+    });
+
+    const listeners = {};
+    const addEventListener = (type, fn) => {
+      if (!listeners[type]) listeners[type] = [];
+      if (typeof fn === 'function') listeners[type].push(fn);
+    };
+    const removeEventListener = (type, fn) => {
+      if (listeners[type]) listeners[type] = listeners[type].filter(h => h !== fn);
+    };
+    const postMessage = (msg) => {
+      if (!worker._terminated) setTimeout(() => worker._dispatchMessageToOwner(msg), 0);
+    };
+    const importScripts = (...urls) => {
+      for (const value of urls) {
+        const targetUrl = new URL(String(value), scope.location.href).href;
+        let source;
+        const blob = globalThis.__blobStore?.[targetUrl];
+        if (blob !== undefined) {
+          source = blob;
+        } else if (targetUrl.startsWith('data:')) {
+          source = _decodeDataScriptUrl(targetUrl);
+        } else {
+          if (targetUrl.startsWith('file:')
+              && !String(scope.location?.href || '').startsWith('file:')) {
+            throw new Error('Cross-scheme importScripts access to file is not allowed');
+          }
+          const result = JSON.parse(_denoCore.ops.op_worker_import_scripts(targetUrl));
+          if (!result.ok) throw new Error(result.error || 'Worker importScripts failed');
+          source = result.body;
+        }
+        worker._execute(source);
+        if (worker._terminated) return;
+      }
+    };
+
+    define('WorkerGlobalScope', WorkerGlobalScope);
+    define('DedicatedWorkerGlobalScope', DedicatedWorkerGlobalScope);
+    define('postMessage', postMessage);
+    define('addEventListener', addEventListener);
+    define('removeEventListener', removeEventListener);
+    define('dispatchEvent', (event) => {
+      const list = listeners[event?.type] || [];
+      for (const handler of list) handler.call(scope, event);
+      return true;
+    });
+    define('_workerListeners', listeners);
+    define('close', () => { worker._terminated = true; });
+    define('importScripts', importScripts);
+    define('self', scope);
+    define('globalThis', scope);
+    define('window', undefined);
+    define('document', undefined);
+    define('location', new URL(worker._url || globalThis.location?.href || 'about:blank'));
+    define('navigator', globalThis.navigator);
+    define('console', globalThis.console);
+    define('crypto', globalThis.crypto);
+    define('performance', globalThis.performance);
+    define('onmessage', null);
+    define('onerror', null);
+
+    const blocked = new Set([
+      'Deno', 'document', 'window', 'globalThis', 'location', 'self',
+      'top', 'parent', 'frames', 'opener', '__obscura_errors',
+    ]);
+    for (const name of Object.getOwnPropertyNames(globalThis)) {
+      if (blocked.has(name) || name.startsWith('__obscura')) continue;
+      if (Object.prototype.hasOwnProperty.call(target, name)) continue;
+      try { define(name, globalThis[name]); } catch (e) {}
+    }
+    this._scope = scope;
     return scope;
   }
-  _autoRun() {
-    if (this._terminated || !this._code) return;
-    const worker = this;
-    const scope = worker._makeScope();
+
+  _execute(source) {
+    if (this._terminated) return;
+    const scope = this._makeScope();
+    const run = new Function(
+      '__obscura_scope',
+      '__obscura_source',
+      'eval',
+      'with (__obscura_scope) { return eval(__obscura_source); }',
+    );
+    return run.call(scope, scope, String(source), globalThis.eval);
+  }
+
+  _dispatchError(error) {
+    if (this._terminated) return;
+    const value = error instanceof Error ? error : new Error(String(error));
+    const event = {
+      type: 'error',
+      message: value.message,
+      filename: this._url,
+      lineno: 0,
+      colno: 0,
+      error: value,
+      defaultPrevented: false,
+      preventDefault() { this.defaultPrevented = true; },
+    };
+    let handled = false;
+    if (typeof this.onerror === 'function') {
+      handled = this.onerror.call(this, event) === false;
+    }
+    for (const handler of this._listeners.error || []) {
+      if (handler.call(this, event) === false) handled = true;
+    }
+    if (handled) event.preventDefault();
+  }
+
+  _dispatchMessageToOwner(data) {
+    if (this._terminated) return;
+    const event = { type: 'message', data };
+    if (typeof this.onmessage === 'function') this.onmessage.call(this, event);
+    for (const handler of this._listeners.message || []) handler.call(this, event);
+  }
+
+  _dispatchMessageToScope(data) {
+    if (this._terminated) return;
+    const scope = this._makeScope();
+    const event = { type: 'message', data };
     try {
-      const fn = new Function('self', 'postMessage', 'addEventListener', 'close', worker._code);
-      fn(scope, scope.postMessage, scope.addEventListener, scope.close);
-    } catch(e) {
-      console.error('Worker error:', e.message);
-      if (worker.onerror) worker.onerror(e);
+      for (const handler of scope._workerListeners?.message || []) handler.call(scope, event);
+      if (typeof scope.onmessage === 'function') scope.onmessage.call(scope, event);
+    } catch (e) {
+      this._dispatchError(e);
     }
   }
+
+  _autoRun() {
+    if (this._terminated || !this._code) return;
+    try {
+      this._execute(this._code);
+    } catch(e) {
+      this._dispatchError(e);
+    }
+  }
+
   postMessage(data) {
     if (this._terminated) return;
-    const worker = this;
-    setTimeout(() => {
-      if (worker._terminated || !worker._code) return;
-      const scope = worker._makeScope();
-      try {
-        const fn = new Function('self', 'postMessage', 'addEventListener', 'close', worker._code);
-        fn(scope, scope.postMessage, scope.addEventListener, scope.close);
-        const evs = (scope._ev && scope._ev['message']) || [];
-        if (evs.length) { for (const h of evs) h({ data }); }
-        else if (scope.onmessage) scope.onmessage({ data });
-      } catch(e) {
-        console.error('Worker error:', e.message);
-        if (worker.onerror) worker.onerror(e);
-      }
-    }, 0);
+    setTimeout(() => this._dispatchMessageToScope(data), 0);
   }
   terminate() { this._terminated = true; }
   addEventListener(type, fn) {

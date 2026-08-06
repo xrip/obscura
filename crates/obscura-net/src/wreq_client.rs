@@ -17,9 +17,6 @@ use crate::cookies::CookieJar;
 #[cfg(feature = "stealth")]
 use crate::client::{CallbackRegistry, RequestInfo, ResourceType, Response, ObscuraNetError};
 
-#[cfg(feature = "stealth")]
-pub const STEALTH_USER_AGENT: &str =
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36";
 // The wreq emulation (Profile::Chrome145, Platform::Windows) sends this exact
 // UA and sec-ch-ua-platform "Windows" on the wire. navigator has to report the
 // same identity, otherwise the TLS/HTTP layer and the JS layer disagree and a
@@ -153,11 +150,11 @@ pub struct StealthHttpClient {
 #[cfg(feature = "stealth")]
 impl StealthHttpClient {
     pub fn new(cookie_jar: Arc<CookieJar>) -> Self {
-        Self::with_proxy(cookie_jar, None)
+        Self::with_browser_identity(cookie_jar, None, "", "", "", 0, false)
     }
 
     pub fn with_proxy(cookie_jar: Arc<CookieJar>, proxy_url: Option<&str>) -> Self {
-        Self::with_proxy_and_user_agent(cookie_jar, proxy_url, STEALTH_USER_AGENT)
+        Self::with_browser_identity(cookie_jar, proxy_url, "", "", "", 0, false)
     }
 
     pub fn with_proxy_and_user_agent(
@@ -166,13 +163,19 @@ impl StealthHttpClient {
         user_agent: &str,
     ) -> Self {
         let (sec_ch_ua, sec_ch_ua_platform) = crate::client::chrome_client_hints(user_agent);
+        let browser_major = user_agent
+            .split("Chrome/")
+            .nth(1)
+            .and_then(|value| value.split('.').next())
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(0);
         Self::with_browser_identity(
             cookie_jar,
             proxy_url,
             user_agent,
             &sec_ch_ua,
             &sec_ch_ua_platform,
-            145,
+            browser_major,
             false,
         )
     }
@@ -276,6 +279,49 @@ impl StealthHttpClient {
         callbacks: Option<&CallbackRegistry>,
         resource_type: ResourceType,
     ) -> Result<Response, ObscuraNetError> {
+        self.fetch_with_context_policy(url, referrer, callbacks, resource_type, false, false)
+            .await
+    }
+
+    /// Fetch a browser subresource while preserving the full HTTPS referrer.
+    /// Some pages opt into `no-referrer-when-downgrade`, which Chrome exposes
+    /// on cross-origin HTTPS script requests instead of reducing it to the
+    /// origin. The caller must use this only when that policy was observed.
+    pub async fn fetch_with_full_referrer(
+        &self,
+        url: &Url,
+        referrer: Option<&Url>,
+        callbacks: Option<&CallbackRegistry>,
+        resource_type: ResourceType,
+    ) -> Result<Response, ObscuraNetError> {
+        self.fetch_with_context_policy(url, referrer, callbacks, resource_type, true, false)
+            .await
+    }
+
+    /// Fetch a dynamically inserted script or stylesheet with the identity
+    /// and full referrer Chrome exposes for the resource. Keep the request
+    /// metadata minimal because the browser request observer does not expose
+    /// all transport-managed headers for these loads.
+    pub async fn fetch_dynamic_subresource(
+        &self,
+        url: &Url,
+        referrer: Option<&Url>,
+        callbacks: Option<&CallbackRegistry>,
+        resource_type: ResourceType,
+    ) -> Result<Response, ObscuraNetError> {
+        self.fetch_with_context_policy(url, referrer, callbacks, resource_type, true, true)
+            .await
+    }
+
+    async fn fetch_with_context_policy(
+        &self,
+        url: &Url,
+        referrer: Option<&Url>,
+        callbacks: Option<&CallbackRegistry>,
+        resource_type: ResourceType,
+        preserve_full_referrer: bool,
+        minimal_subresource_headers: bool,
+    ) -> Result<Response, ObscuraNetError> {
         crate::client::validate_url(url, self.allow_private_network)?;
         let mut current_url = url.clone();
         let mut redirects = Vec::new();
@@ -295,16 +341,34 @@ impl StealthHttpClient {
                 }
             }
 
-            let referrer = referrer.and_then(|value| referrer_for_target(value, &current_url));
+            let referrer = referrer.and_then(|value| {
+                if preserve_full_referrer {
+                    if value.scheme() == "https" && current_url.scheme() == "http" {
+                        None
+                    } else {
+                        let mut value = value.clone();
+                        value.set_fragment(None);
+                        Some(value)
+                    }
+                } else {
+                    referrer_for_target(value, &current_url)
+                }
+            });
             let extra_headers = self.extra_headers.read().await.clone();
             let cookie_header = self.cookie_jar.get_cookie_header(&current_url);
             let mut callback_headers = extra_headers.clone();
-            callback_headers.insert("user-agent".to_string(), self.user_agent.clone());
-            callback_headers.insert("sec-ch-ua".to_string(), self.sec_ch_ua.clone());
-            callback_headers.insert(
-                "sec-ch-ua-platform".to_string(),
-                self.sec_ch_ua_platform.clone(),
-            );
+            if !self.user_agent.is_empty() {
+                callback_headers.insert("user-agent".to_string(), self.user_agent.clone());
+            }
+            if !self.sec_ch_ua.is_empty() {
+                callback_headers.insert("sec-ch-ua".to_string(), self.sec_ch_ua.clone());
+            }
+            if !self.sec_ch_ua_platform.is_empty() {
+                callback_headers.insert(
+                    "sec-ch-ua-platform".to_string(),
+                    self.sec_ch_ua_platform.clone(),
+                );
+            }
             if let Some(referrer) = referrer.as_ref() {
                 callback_headers.insert("referer".to_string(), referrer.to_string());
             }
@@ -324,10 +388,34 @@ impl StealthHttpClient {
             let mut req = self
                 .client
                 .get(current_url.as_str())
-                .header("user-agent", self.user_agent.as_str())
-                .header("sec-ch-ua", self.sec_ch_ua.as_str())
-                .header("sec-ch-ua-mobile", "?0")
-                .header("sec-ch-ua-platform", self.sec_ch_ua_platform.as_str());
+                .default_headers(false);
+            if !minimal_subresource_headers {
+                let (accept, fetch_mode, fetch_dest) =
+                    crate::client::resource_request_headers(resource_type);
+                let fetch_site = crate::client::fetch_site_for_target(referrer.as_ref(), &current_url);
+                req = req
+                    .header("accept", accept)
+                    .header("accept-language", "en-US,en;q=0.9")
+                    .header("sec-fetch-site", fetch_site)
+                    .header("sec-fetch-mode", fetch_mode)
+                    .header("sec-fetch-dest", fetch_dest);
+            }
+            if !self.user_agent.is_empty() {
+                req = req.header("user-agent", self.user_agent.as_str());
+            }
+            if !self.sec_ch_ua.is_empty() {
+                req = req
+                    .header("sec-ch-ua", self.sec_ch_ua.as_str())
+                    .header("sec-ch-ua-mobile", "?0");
+            }
+            if !self.sec_ch_ua_platform.is_empty() {
+                req = req.header("sec-ch-ua-platform", self.sec_ch_ua_platform.as_str());
+            }
+            if resource_type == ResourceType::Document {
+                req = req
+                    .header("upgrade-insecure-requests", "1")
+                    .header("sec-fetch-user", "?1");
+            }
             if let Some(referrer) = referrer.as_ref() {
                 req = req.header("referer", referrer.as_str());
             }
@@ -346,7 +434,6 @@ impl StealthHttpClient {
                 ObscuraNetError::Network(format!("{}: {} (source: {:?})", current_url, e, e.source()))
             })?;
             self.in_flight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-
             let status = resp.status();
 
             for val in resp.headers().get_all("set-cookie") {
@@ -369,6 +456,16 @@ impl StealthHttpClient {
                     let next_url = current_url.join(location_str).map_err(|e| {
                         ObscuraNetError::Network(format!("Invalid redirect URL: {}", e))
                     })?;
+                    if next_url.scheme() == "file"
+                        && current_url.scheme() != "file"
+                        && resource_type != ResourceType::Document
+                        && referrer.is_some_and(|value| value.scheme() != "file")
+                    {
+                        return Err(ObscuraNetError::Network(
+                            "Cross-scheme redirect to file is not allowed for a subresource"
+                                .into(),
+                        ));
+                    }
                     crate::client::validate_url(&next_url, self.allow_private_network)?;
                     redirects.push(current_url.clone());
                     current_url = next_url;
@@ -433,11 +530,18 @@ impl StealthHttpClient {
             // The emulation profile's defaults describe a top-level document
             // navigation. JS fetch()/XHR has a different Fetch metadata
             // contract, so build that small common browser header set here.
-            .default_headers(false)
-            .header("sec-ch-ua", self.sec_ch_ua.as_str())
-            .header("sec-ch-ua-mobile", "?0")
-            .header("sec-ch-ua-platform", self.sec_ch_ua_platform.as_str())
-            .header("user-agent", self.user_agent.as_str());
+            .default_headers(false);
+        if !self.sec_ch_ua.is_empty() {
+            req = req
+                .header("sec-ch-ua", self.sec_ch_ua.as_str())
+                .header("sec-ch-ua-mobile", "?0");
+        }
+        if !self.sec_ch_ua_platform.is_empty() {
+            req = req.header("sec-ch-ua-platform", self.sec_ch_ua_platform.as_str());
+        }
+        if !self.user_agent.is_empty() {
+            req = req.header("user-agent", self.user_agent.as_str());
+        }
 
         let cookie_header = self.cookie_jar.get_cookie_header(url);
         if !cookie_header.is_empty() {
@@ -459,7 +563,6 @@ impl StealthHttpClient {
             ObscuraNetError::Network(format!("{}: {}", url, e))
         })?;
         self.in_flight.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-
         let status = resp.status();
         for val in resp.headers().get_all("set-cookie") {
             if let Ok(s) = val.to_str() {
@@ -476,7 +579,6 @@ impl StealthHttpClient {
             .await
             .map_err(|e| ObscuraNetError::Network(format!("Failed to read body: {}", e)))?
             .to_vec();
-
         Ok(Response {
             url: url.clone(),
             status: status.as_u16(),
@@ -603,4 +705,5 @@ mod tests {
         assert!(request.contains(&format!("sec-ch-ua: {}\r\n", sec_ch_ua.to_ascii_lowercase())));
         assert!(request.contains(&format!("referer: http://{address}/page\r\n")));
     }
+
 }

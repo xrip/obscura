@@ -106,7 +106,7 @@ pub struct RequestInfo {
     pub resource_type: ResourceType,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResourceType {
     Document,
     Script,
@@ -367,6 +367,50 @@ pub(crate) fn validate_url(url: &Url, allow_private_network: bool) -> Result<(),
     Ok(())
 }
 
+fn referrer_for_target(referrer: &Url, target: &Url) -> Option<Url> {
+    if referrer.scheme() == "https" && target.scheme() == "http" {
+        return None;
+    }
+
+    if referrer.origin().ascii_serialization() == target.origin().ascii_serialization() {
+        let mut value = referrer.clone();
+        value.set_fragment(None);
+        return Some(value);
+    }
+    Url::parse(&referrer.origin().ascii_serialization()).ok()
+}
+
+pub fn resource_request_headers(
+    resource_type: ResourceType,
+) -> (&'static str, &'static str, &'static str) {
+    match resource_type {
+        ResourceType::Document => (
+            "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+            "navigate",
+            "document",
+        ),
+        ResourceType::Script => ("application/javascript, text/javascript, */*", "no-cors", "script"),
+        ResourceType::Stylesheet => ("text/css,*/*;q=0.1", "no-cors", "style"),
+        ResourceType::Image => ("image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8", "no-cors", "image"),
+        ResourceType::Font => ("*/*", "cors", "font"),
+        ResourceType::Xhr | ResourceType::Fetch => ("*/*", "cors", "empty"),
+        ResourceType::Other => ("*/*", "no-cors", "empty"),
+    }
+}
+
+pub(crate) fn fetch_site_for_target(referrer: Option<&Url>, target: &Url) -> &'static str {
+    match referrer {
+        None => "none",
+        Some(referrer)
+            if referrer.origin().ascii_serialization()
+                == target.origin().ascii_serialization() =>
+        {
+            "same-origin"
+        }
+        Some(_) => "cross-site",
+    }
+}
+
 async fn fetch_file_url(url: &Url) -> Result<Response, ObscuraNetError> {
     let path = url
         .to_file_path()
@@ -423,12 +467,14 @@ pub struct ObscuraHttpClient {
 /// the non-stealth HTTP path agrees with navigator.userAgentData instead of
 /// shipping a fixed Linux/Chrome-145 hint that contradicts a Windows profile.
 pub(crate) fn chrome_client_hints(ua: &str) -> (String, String) {
-    let major: usize = ua
+    let Some(major) = ua
         .split("Chrome/")
         .nth(1)
         .and_then(|s| s.split('.').next())
         .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(145);
+    else {
+        return (String::new(), String::new());
+    };
     const GREASE_CHARS: [char; 11] = [' ', '(', ':', '-', '.', '/', ')', ';', '=', '?', '_'];
     const GREASE_VER: [&str; 3] = ["8", "99", "24"];
     const PERMS: [[usize; 3]; 6] = [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]];
@@ -480,9 +526,10 @@ impl ObscuraHttpClient {
             client: tokio::sync::OnceCell::new(),
             proxy_url: proxy_url.map(|s| s.to_string()),
             cookie_jar,
-            user_agent: RwLock::new(
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36".to_string(),
-            ),
+            // BrowserContext replaces this with the selected profile's UA
+            // before the client is used. Keep the transport identity empty
+            // until a profile supplies it rather than inventing one here.
+            user_agent: RwLock::new(String::new()),
             extra_headers: RwLock::new(HashMap::new()),
             interceptor: RwLock::new(None),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -553,6 +600,25 @@ impl ObscuraHttpClient {
         self.fetch_with_method(Method::GET, url, None, callbacks).await
     }
 
+    /// GET with the page subresource context used by modules and workers.
+    pub async fn fetch_with_context(
+        &self,
+        url: &Url,
+        referrer: Option<&Url>,
+        callbacks: Option<&CallbackRegistry>,
+        resource_type: ResourceType,
+    ) -> Result<Response, ObscuraNetError> {
+        self.fetch_with_method_and_context(
+            Method::GET,
+            url,
+            None,
+            referrer,
+            callbacks,
+            resource_type,
+        )
+        .await
+    }
+
     pub async fn post_form(&self, url: &Url, body: &str) -> Result<Response, ObscuraNetError> {
         self.fetch_with_method(Method::POST, url, Some(body.as_bytes().to_vec()), None).await
     }
@@ -574,6 +640,26 @@ impl ObscuraHttpClient {
         url: &Url,
         initial_body: Option<Vec<u8>>,
         callbacks: Option<&CallbackRegistry>,
+    ) -> Result<Response, ObscuraNetError> {
+        self.fetch_with_method_and_context(
+            initial_method,
+            url,
+            initial_body,
+            None,
+            callbacks,
+            ResourceType::Document,
+        )
+        .await
+    }
+
+    async fn fetch_with_method_and_context(
+        &self,
+        initial_method: Method,
+        url: &Url,
+        initial_body: Option<Vec<u8>>,
+        referrer: Option<&Url>,
+        callbacks: Option<&CallbackRegistry>,
+        resource_type: ResourceType,
     ) -> Result<Response, ObscuraNetError> {
         validate_url(url, self.allow_private_network)?;
 
@@ -603,12 +689,18 @@ impl ObscuraHttpClient {
         let max_redirects = 20;
 
         for _redirect_count in 0..max_redirects {
-            let request_info = RequestInfo {
+            let request_referrer = referrer.and_then(|value| referrer_for_target(value, &current_url));
+            let mut request_info = RequestInfo {
                 url: current_url.clone(),
                 method: method.to_string(),
                 headers: self.extra_headers.read().await.clone(),
-                resource_type: ResourceType::Document,
+                resource_type: resource_type.clone(),
             };
+            if let Some(value) = request_referrer.as_ref() {
+                request_info
+                    .headers
+                    .insert("referer".to_string(), value.to_string());
+            }
 
             if let Some(interceptor) = self.interceptor.read().await.as_ref() {
                 match interceptor.intercept(&request_info).await {
@@ -636,29 +728,50 @@ impl ObscuraHttpClient {
             // Chrome's top-level navigation header order. (reqwest appends
             // accept-encoding/host after these, so accept-encoding lands after
             // accept-language rather than before it; the rest matches Chrome.)
+            if let Ok(value) = HeaderValue::from_str(&sec_ch_ua) {
+                if !sec_ch_ua.is_empty() {
+                    headers.insert(HeaderName::from_static("sec-ch-ua"), value);
+                    headers.insert(
+                        HeaderName::from_static("sec-ch-ua-mobile"),
+                        HeaderValue::from_static("?0"),
+                    );
+                }
+            }
+            if let Ok(value) = HeaderValue::from_str(&sec_ch_ua_platform) {
+                if !sec_ch_ua_platform.is_empty() {
+                    headers.insert(HeaderName::from_static("sec-ch-ua-platform"), value);
+                }
+            }
+            let (accept, fetch_mode, fetch_dest) = resource_request_headers(resource_type);
+            if resource_type == ResourceType::Document {
+                headers.insert(HeaderName::from_static("upgrade-insecure-requests"), HeaderValue::from_static("1"));
+            }
+            if let Ok(value) = HeaderValue::from_str(&ua) {
+                if !ua.is_empty() {
+                    headers.insert(USER_AGENT, value);
+                }
+            }
+            headers.insert(reqwest::header::ACCEPT, HeaderValue::from_static(accept));
             headers.insert(
-                HeaderName::from_static("sec-ch-ua"),
-                HeaderValue::from_str(&sec_ch_ua)
-                    .unwrap_or_else(|_| HeaderValue::from_static("\"Not:A-Brand\";v=\"99\", \"Google Chrome\";v=\"145\", \"Chromium\";v=\"145\"")),
+                HeaderName::from_static("sec-fetch-site"),
+                HeaderValue::from_static(fetch_site_for_target(request_referrer.as_ref(), &current_url)),
             );
-            headers.insert(HeaderName::from_static("sec-ch-ua-mobile"), HeaderValue::from_static("?0"));
             headers.insert(
-                HeaderName::from_static("sec-ch-ua-platform"),
-                HeaderValue::from_str(&sec_ch_ua_platform)
-                    .unwrap_or_else(|_| HeaderValue::from_static("\"Windows\"")),
+                HeaderName::from_static("sec-fetch-mode"),
+                HeaderValue::from_static(fetch_mode),
             );
-            headers.insert(HeaderName::from_static("upgrade-insecure-requests"), HeaderValue::from_static("1"));
-            headers.insert(USER_AGENT, HeaderValue::from_str(&ua).unwrap_or_else(|_| {
-                HeaderValue::from_static("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36")
-            }));
+            if resource_type == ResourceType::Document {
+                headers.insert(HeaderName::from_static("sec-fetch-user"), HeaderValue::from_static("?1"));
+            }
             headers.insert(
-                reqwest::header::ACCEPT,
-                HeaderValue::from_static("text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"),
+                HeaderName::from_static("sec-fetch-dest"),
+                HeaderValue::from_static(fetch_dest),
             );
-            headers.insert(HeaderName::from_static("sec-fetch-site"), HeaderValue::from_static("none"));
-            headers.insert(HeaderName::from_static("sec-fetch-mode"), HeaderValue::from_static("navigate"));
-            headers.insert(HeaderName::from_static("sec-fetch-user"), HeaderValue::from_static("?1"));
-            headers.insert(HeaderName::from_static("sec-fetch-dest"), HeaderValue::from_static("document"));
+            if let Some(value) = request_referrer.as_ref() {
+                if let Ok(value) = HeaderValue::from_str(value.as_str()) {
+                    headers.insert(reqwest::header::REFERER, value);
+                }
+            }
             headers.insert(
                 reqwest::header::ACCEPT_LANGUAGE,
                 HeaderValue::from_static("en-US,en;q=0.9"),
@@ -746,6 +859,16 @@ impl ObscuraHttpClient {
                     let next_url = current_url.join(location_str).map_err(|e| {
                         ObscuraNetError::Network(format!("Invalid redirect URL: {}", e))
                     })?;
+                    if next_url.scheme() == "file"
+                        && current_url.scheme() != "file"
+                        && resource_type != ResourceType::Document
+                        && referrer.is_some_and(|value| value.scheme() != "file")
+                    {
+                        return Err(ObscuraNetError::Network(
+                            "Cross-scheme redirect to file is not allowed for a subresource"
+                                .into(),
+                        ));
+                    }
                     validate_url(&next_url, self.allow_private_network)?;
                     redirects.push(current_url.clone());
                     current_url = next_url;
@@ -819,7 +942,10 @@ pub enum ObscuraNetError {
 
 #[cfg(test)]
 mod ssrf_tests {
-    use super::{is_forbidden_ip, validate_url, ObscuraHttpClient, SsrfGuardResolver};
+    use super::{
+        is_forbidden_ip, validate_url, CallbackRegistry, ObscuraHttpClient, ResourceType,
+        SsrfGuardResolver,
+    };
     use crate::cookies::CookieJar;
     use reqwest::dns::{Name, Resolve};
     use std::net::IpAddr;
@@ -883,6 +1009,66 @@ mod ssrf_tests {
         assert!(validate_url(&Url::parse("http://example.com/").unwrap(), false).is_ok());
         // The allow flag bypasses the guard (local-dev escape hatch).
         assert!(validate_url(&Url::parse("http://127.0.0.1/").unwrap(), true).is_ok());
+    }
+
+    #[tokio::test]
+    async fn fetch_with_context_reports_subresource_type_referrer_and_response() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request).await;
+            let body = "module";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/javascript\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+        });
+
+        let callbacks = CallbackRegistry::new();
+        let request_seen = Arc::new(std::sync::Mutex::new(None));
+        let request_seen_clone = request_seen.clone();
+        callbacks.add_request(Arc::new(move |info| {
+            *request_seen_clone.lock().unwrap() = Some((
+                info.resource_type,
+                info.headers.get("referer").cloned(),
+            ));
+        }));
+        let response_seen = Arc::new(AtomicUsize::new(0));
+        let response_seen_clone = response_seen.clone();
+        callbacks.add_response(Arc::new(move |_info, _response| {
+            response_seen_clone.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        let client = ObscuraHttpClient::with_full_options(
+            Arc::new(CookieJar::new()),
+            None,
+            true,
+        );
+        let target = Url::parse(&format!("http://{address}/module.js")).unwrap();
+        let referrer = Url::parse(&format!("http://{address}/index.html")).unwrap();
+        let response = client
+            .fetch_with_context(
+                &target,
+                Some(&referrer),
+                Some(&callbacks),
+                ResourceType::Script,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            *request_seen.lock().unwrap(),
+            Some((ResourceType::Script, Some(referrer.to_string())))
+        );
+        assert_eq!(response_seen.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
