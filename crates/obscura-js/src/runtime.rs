@@ -208,6 +208,32 @@ impl ObscuraJsRuntime {
         }
     }
 
+    /// Hand this runtime's isolate to the current thread.
+    ///
+    /// deno_core never calls `Isolate::enter`/`exit`: it assumes one isolate per
+    /// thread. A child frame realm is a second runtime on the *same* thread, so
+    /// creating it leaves its isolate current and the parent then aborts inside
+    /// V8 scope bookkeeping. Frames therefore park their isolate and only claim
+    /// the thread around their own work.
+    ///
+    /// # Safety
+    ///
+    /// Every `enter_isolate` must be paired with exactly one `exit_isolate`, in
+    /// LIFO order, and no other runtime's JavaScript may run in between. Use
+    /// [`crate::frame::FrameRuntime`] rather than calling this directly.
+    pub(crate) unsafe fn enter_isolate(&mut self) {
+        unsafe { self.runtime.v8_isolate().enter() };
+    }
+
+    /// Give the thread back to whichever isolate was current before.
+    ///
+    /// # Safety
+    ///
+    /// See [`Self::enter_isolate`].
+    pub(crate) unsafe fn exit_isolate(&mut self) {
+        unsafe { self.runtime.v8_isolate().exit() };
+    }
+
     pub fn set_cookie_jar(&self, jar: std::sync::Arc<obscura_net::CookieJar>) {
         self.state.borrow_mut().cookie_jar = Some(jar);
     }

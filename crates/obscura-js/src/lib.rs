@@ -2,6 +2,7 @@
 extern crate html5ever;
 
 pub mod cdp_watchdog;
+pub mod frame;
 pub mod module_loader;
 pub mod runtime;
 pub mod ops;
