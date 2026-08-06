@@ -31,6 +31,12 @@ const CASES: &[ProductCase] = &[
         product_id: "1902651403",
         product_marker: "adblue",
     },
+    ProductCase {
+        name: "avito",
+        url: "https://www.avito.ru/novosibirsk/tovary_dlya_kompyutera/cmp_100hx_cmp_100-100_6gb_hbm2_8226629375",
+        product_id: "8226629375",
+        product_marker: "данные видеокарты это урезки",
+    },
 ];
 
 fn product_eval(product_id: &str, product_marker: &str) -> String {
@@ -69,6 +75,7 @@ fn product_eval(product_id: &str, product_marker: &str) -> String {
             var priceMeta = document.querySelector("meta[property=\"product:price:amount\"]");
             var currencyMeta = document.querySelector("meta[property=\"product:price:currency\"]");
             var body = clean(document.body && document.body.innerText);
+            var blockSurface = clean(document.title) + " " + clean(h1 && h1.innerText);
             return {{
                 url: location.href,
                 title: clean(product.name) || clean(h1 && h1.innerText) || clean(ogTitle && ogTitle.content),
@@ -78,7 +85,7 @@ fn product_eval(product_id: &str, product_marker: &str) -> String {
                 hasExpectedId: body.indexOf(expectedId) >= 0,
                 hasProductMarker: body.toLowerCase().indexOf(expectedMarker) >= 0,
                 hasPurchaseControl: /купить|в корзину|add to cart/i.test(body),
-                blocked: /captcha|robot|доступ ограничен|не робот/i.test(body),
+                blocked: /captcha|robot|доступ ограничен|не робот/i.test(blockSurface),
                 bodySample: body.slice(0, 1200)
             }};
         }})()"#
@@ -104,6 +111,12 @@ fn product_card_error(case: &ProductCase, value: Value) -> Option<String> {
             case.name
         ));
     }
+    if value["blocked"].as_bool().unwrap_or(false) {
+        return Some(format!(
+            "{} returned a challenge or blocked page: {value}",
+            case.name
+        ));
+    }
     if !value["hasExpectedId"].as_bool().unwrap_or(false) {
         return Some(format!(
             "{} product id {} was not found in the rendered card: {value}",
@@ -114,12 +127,6 @@ fn product_card_error(case: &ProductCase, value: Value) -> Option<String> {
         return Some(format!(
             "{} product marker {} was not found in the rendered card: {value}",
             case.name, case.product_marker
-        ));
-    }
-    if value["blocked"].as_bool().unwrap_or(false) {
-        return Some(format!(
-            "{} returned a challenge or blocked page: {value}",
-            case.name
         ));
     }
     None

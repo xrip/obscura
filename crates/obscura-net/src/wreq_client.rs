@@ -140,6 +140,7 @@ pub struct StealthHttpClient {
     user_agent: String,
     sec_ch_ua: String,
     sec_ch_ua_platform: String,
+    accept_encoding: String,
     allow_private_network: bool,
     transport_browser_major: u32,
     pub cookie_jar: Arc<CookieJar>,
@@ -197,6 +198,17 @@ impl StealthHttpClient {
             .profile(transport_profile)
             .platform(wreq_util::Platform::Windows)
             .build();
+        let accept_encoding = {
+            use wreq::IntoEmulation as _;
+            emulation_opts
+                .clone()
+                .into_emulation()
+                .headers
+                .get(wreq::header::ACCEPT_ENCODING)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_owned()
+        };
 
         let mut builder = wreq::Client::builder()
             .no_proxy()
@@ -251,6 +263,7 @@ impl StealthHttpClient {
             user_agent: user_agent.to_owned(),
             sec_ch_ua: sec_ch_ua.to_owned(),
             sec_ch_ua_platform: sec_ch_ua_platform.to_owned(),
+            accept_encoding,
             allow_private_network,
             transport_browser_major,
             cookie_jar,
@@ -369,6 +382,10 @@ impl StealthHttpClient {
                     self.sec_ch_ua_platform.clone(),
                 );
             }
+            if !self.accept_encoding.is_empty() {
+                callback_headers
+                    .insert("accept-encoding".to_string(), self.accept_encoding.clone());
+            }
             if let Some(referrer) = referrer.as_ref() {
                 callback_headers.insert("referer".to_string(), referrer.to_string());
             }
@@ -389,6 +406,9 @@ impl StealthHttpClient {
                 .client
                 .get(current_url.as_str())
                 .default_headers(false);
+            if !self.accept_encoding.is_empty() {
+                req = req.header("accept-encoding", self.accept_encoding.as_str());
+            }
             if !minimal_subresource_headers {
                 let (accept, fetch_mode, fetch_dest) =
                     crate::client::resource_request_headers(resource_type);
@@ -531,6 +551,9 @@ impl StealthHttpClient {
             // navigation. JS fetch()/XHR has a different Fetch metadata
             // contract, so build that small common browser header set here.
             .default_headers(false);
+        if !self.accept_encoding.is_empty() {
+            req = req.header("accept-encoding", self.accept_encoding.as_str());
+        }
         if !self.sec_ch_ua.is_empty() {
             req = req
                 .header("sec-ch-ua", self.sec_ch_ua.as_str())
@@ -644,7 +667,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn profile_headers_referrer_and_callbacks_share_the_stealth_path() {
+    async fn profile_headers_referrer_callbacks_and_compression_share_the_stealth_path() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -658,10 +681,15 @@ mod tests {
                 }
                 request.extend_from_slice(&chunk[..read]);
             }
+            const GZIP_OK: &[u8] = &[
+                0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0a, 0xcb, 0xcf, 0x06, 0x00,
+                0x47, 0xdd, 0xdc, 0x79, 0x02, 0x00, 0x00, 0x00,
+            ];
             stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 22\r\nConnection: close\r\n\r\n")
                 .await
                 .unwrap();
+            stream.write_all(GZIP_OK).await.unwrap();
             String::from_utf8(request).unwrap()
         });
 
@@ -681,7 +709,14 @@ mod tests {
         let request_count_clone = request_count.clone();
         callbacks.add_request(Arc::new(move |info| {
             assert_eq!(info.resource_type, ResourceType::Script);
-            assert_eq!(info.headers.get("sec-ch-ua").map(String::as_str), Some(sec_ch_ua));
+            assert_eq!(
+                info.headers.get("sec-ch-ua").map(String::as_str),
+                Some(sec_ch_ua)
+            );
+            assert_eq!(
+                info.headers.get("accept-encoding").map(String::as_str),
+                Some("gzip, deflate, br, zstd")
+            );
             request_count_clone.fetch_add(1, Ordering::Relaxed);
         }));
         let response_count_clone = response_count.clone();
@@ -697,11 +732,17 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.body, b"ok");
+        assert!(!response.headers.contains_key("content-encoding"));
+        assert!(!response.headers.contains_key("content-length"));
         assert_eq!(request_count.load(Ordering::Relaxed), 1);
         assert_eq!(response_count.load(Ordering::Relaxed), 1);
 
         let request = server.await.unwrap().to_ascii_lowercase();
         assert!(request.contains("user-agent: profile user agent\r\n"));
+        assert!(
+            request.contains("accept-encoding: gzip, deflate, br, zstd\r\n"),
+            "unexpected request headers:\n{request}"
+        );
         assert!(request.contains(&format!("sec-ch-ua: {}\r\n", sec_ch_ua.to_ascii_lowercase())));
         assert!(request.contains(&format!("referer: http://{address}/page\r\n")));
     }

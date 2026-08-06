@@ -974,12 +974,31 @@ impl ObscuraJsRuntime {
         if scope.has_terminated() {
             return Err("JS error: Uncaught Error: execution terminated".to_string());
         }
+        let location = scope.message().map(|message| {
+            let line = message.get_line_number(scope).unwrap_or(0);
+            let column = message.get_start_column();
+            let source_line = message
+                .get_source_line(scope)
+                .map(|value| value.to_rust_string_lossy(scope))
+                .unwrap_or_default();
+            let excerpt_start = column.saturating_sub(80) as usize;
+            let excerpt: String = source_line
+                .chars()
+                .skip(excerpt_start)
+                .take(240)
+                .flat_map(char::escape_default)
+                .collect();
+            format!("{line}:{column}: {excerpt}")
+        });
         let detail = scope
             .stack_trace()
             .or_else(|| scope.exception())
             .map(|value| value.to_rust_string_lossy(scope))
             .unwrap_or_else(|| "unknown JavaScript exception".to_string());
-        Err(format!("JS error: {detail}"))
+        match location {
+            Some(location) => Err(format!("JS error: {detail} [{location}]")),
+            None => Err(format!("JS error: {detail}")),
+        }
     }
 
     pub async fn run_event_loop(&mut self) -> Result<(), String> {
