@@ -1045,8 +1045,20 @@ class Node extends EventTarget {
     return (+_dom("compare_order", _nodeId(this), _nodeId(other)) < 0) ? 4 : 2;
   }
   getRootNode(options) {
-    const shadowRoot = this._obscuraShadowRoot;
-    return shadowRoot && !(options && options.composed) ? shadowRoot : globalThis.document;
+    // Walk the real tree. Inside a shadow tree the root is the shadow root,
+    // unless the caller asked for the composed (shadow-piercing) root.
+    let node = this;
+    while (node) {
+      if (node.nodeType === 11 && node.host) {
+        return (options && options.composed)
+          ? node.host.getRootNode(options)
+          : node;
+      }
+      const parent = node.parentNode;
+      if (!parent) break;
+      node = parent;
+    }
+    return globalThis.document;
   }
   normalize() {
     // Merge adjacent exclusive Text nodes, drop empty ones, recurse. Detached
@@ -1602,6 +1614,13 @@ class Element extends Node {
     const value = String(v);
     _dom("set_attribute", _nodeId(this), n + "\0" + value);
     if (n === "style") _nodeStyle(this)._replaceFromAttribute(value);
+    // An iframe starts loading whichever way its src is set. Only the `src`
+    // property was wired to the loader before, so scripts that go through
+    // setAttribute (Cloudflare's Turnstile widget among them) never loaded
+    // their frame at all.
+    if (n === "src" && this.localName === "iframe" && value && value !== "about:blank") {
+      _loadIframeSrc(this, value);
+    }
     if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev);
     if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('attributes', _nodeId(this), [], [], n);
   }
@@ -2490,7 +2509,10 @@ class Element extends Node {
   get isConnected() {
     var node = this;
     while (node) {
-      if (node.nodeType === 9) return true;
+      if (node.nodeType === 9) return true; // Document node
+      // A node inside a shadow tree is connected when its host is, so step
+      // across the shadow boundary instead of stopping at the fragment.
+      if (node.nodeType === 11 && node.host) { node = node.host; continue; }
       node = node.parentNode;
     }
     return false;
@@ -3261,25 +3283,31 @@ function _loadIframeSrc(el, url) {
   if (!url.includes('://')) {
     try { fullUrl = new URL(url, _domParse('document_url') || 'about:blank').href; } catch (_) {}
   }
+  const blank = '<!DOCTYPE html><html><head></head><body></body></html>';
   fetch(fullUrl, {mode: 'no-cors'}).then(async response => {
     const html = response.ok || response.type === 'opaque'
       ? await response.text()
-      : '<!DOCTYPE html><html><head></head><body></body></html>';
+      : blank;
+    // Record the outcome. A failed frame load used to be indistinguishable from
+    // a successful one, because both ended in an empty document and a `load`
+    // event, which made frame problems invisible when debugging.
+    el._iframeLoadInfo = {
+      ok: true, status: response.status, type: response.type, length: html.length,
+    };
     el._iframeDoc = new _IframeDocument(html, fullUrl, el);
     el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
     el.dispatchEvent(new Event('load'));
-  }).catch(() => {
-    el._iframeDoc = new _IframeDocument('<!DOCTYPE html><html><head></head><body></body></html>', fullUrl, el);
+  }).catch(error => {
+    el._iframeLoadInfo = { ok: false, error: String(error && error.message || error) };
+    el._iframeDoc = new _IframeDocument(blank, fullUrl, el);
     el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
     el.dispatchEvent(new Event('load'));
   });
 }
 function _setElementSrc(value) {
-  const src = String(value);
-  this.setAttribute('src', src);
-  if (this.localName === 'iframe' && src && src !== 'about:blank') {
-    _loadIframeSrc(this, src);
-  }
+  // setAttribute owns the iframe load path now, so both routes behave the same
+  // and a property assignment does not kick off two fetches.
+  this.setAttribute('src', String(value));
 }
 function _installSrcReflection(C) {
   Object.defineProperty(C.prototype, 'src', {
@@ -4758,6 +4786,7 @@ if (!('isConnected' in Node.prototype)) {
       let node = this;
       while (node) {
         if (node.nodeType === 9) return true; // Document node
+        if (node.nodeType === 11 && node.host) { node = node.host; continue; }
         node = node.parentNode;
       }
       return false;
@@ -5116,7 +5145,29 @@ globalThis.__notifyMutation = function(type, target_nid, addedNodes, removedNode
   }
 };
 
-globalThis.ShadowRoot = class ShadowRoot extends DocumentFragment {};
+// A shadow root is a real DocumentFragment node in the backing tree, so its
+// children are ordinary nodes: they have a parent, they answer querySelector,
+// and resource-bearing elements inside them actually load. `host` and `mode`
+// are per-instance and set by Element.prototype.attachShadow.
+globalThis.ShadowRoot = class ShadowRoot extends DocumentFragment {
+  get mode() { return this._mode; }
+  get host() { return this._host || null; }
+  get delegatesFocus() { return this._delegatesFocus === true; }
+  get activeElement() { return null; }
+  get styleSheets() { return []; }
+  // Inside a shadow tree the root is the shadow root, not the document, unless
+  // the caller asks for the composed (shadow-piercing) root.
+  getRootNode(options) {
+    return (options && options.composed && this._host)
+      ? this._host.getRootNode(options)
+      : this;
+  }
+  getHTML() { return this.innerHTML; }
+  setHTMLUnsafe(v) { this.innerHTML = String(v == null ? "" : v); }
+  cloneNode() {
+    throw new DOMException('Failed to execute cloneNode on Node: ShadowRoot nodes are not clonable.', 'NotSupportedError');
+  }
+};
 // Constructible-stylesheet adoption, mirroring Document.adoptedStyleSheets.
 Object.defineProperty(globalThis.ShadowRoot.prototype, 'adoptedStyleSheets', {
   get() { return this._adoptedStyleSheets || []; },
@@ -6516,6 +6567,28 @@ _copyElementReflections(HTMLInputElement, [
   'name', 'placeholder', 'files', 'form',
 ]);
 _copyElementReflections(HTMLIFrameElement, ['contentDocument', 'contentWindow']);
+// Chrome carries these on HTMLIFrameElement.prototype. Scripts feature-detect
+// them with `'allow' in iframe` before configuring a frame, so their absence is
+// itself a signal. Reflection only: it does not change how frame content runs.
+for (const [prop, attr] of [
+  ['allow', 'allow'], ['srcdoc', 'srcdoc'], ['referrerPolicy', 'referrerpolicy'],
+  ['loading', 'loading'], ['csp', 'csp'], ['width', 'width'], ['height', 'height'],
+]) {
+  Object.defineProperty(HTMLIFrameElement.prototype, prop, {
+    get() { return this.getAttribute(attr) || ''; },
+    set(v) { this.setAttribute(attr, String(v)); },
+    enumerable: true, configurable: true,
+  });
+}
+for (const [prop, attr] of [
+  ['allowFullscreen', 'allowfullscreen'], ['credentialless', 'credentialless'],
+]) {
+  Object.defineProperty(HTMLIFrameElement.prototype, prop, {
+    get() { return this.hasAttribute(attr); },
+    set(v) { if (v) this.setAttribute(attr, ''); else this.removeAttribute(attr); },
+    enumerable: true, configurable: true,
+  });
+}
 globalThis.HTMLStyleElement = Element;
 globalThis.HTMLLinkElement = Element;
 globalThis.HTMLMetaElement = Element;
@@ -7520,107 +7593,16 @@ Element.prototype.attachShadow = function attachShadow(opts) {
   if (this._shadowRoot) {
     throw new DOMException('Failed to execute attachShadow on Element: the element already hosts a shadow tree.', 'NotSupportedError');
   }
-  const host = this;
-  const children = [];
-  const shadowNid = +_dom("create_document_fragment");
-  const markShadowTree = (node, root) => {
-    if (!node || typeof node !== 'object') return;
-    Object.defineProperty(node, '_obscuraShadowRoot', {
-      value: root, writable: true, configurable: true,
-    });
-    for (const child of Array.from(node.childNodes || [])) markShadowTree(child, root);
-  };
-  const shadow = {
-    mode: opts.mode,
-    host: host,
-    get innerHTML() { return children.map(c => c.outerHTML || c.textContent || '').join(''); },
-    set innerHTML(v) {
-      children.length = 0;
-      if (v) {
-        const tmp = document.createElement('div');
-        tmp.innerHTML = v;
-        for (let i = 0; i < tmp.childNodes.length; i++) {
-          const child = tmp.childNodes[i];
-          children.push(child);
-          markShadowTree(child, shadow);
-        }
-      }
-    },
-    get childNodes() { return children; },
-    get firstChild() { return children[0] || null; },
-    get lastChild() { return children[children.length - 1] || null; },
-    get firstElementChild() { return children.find(c => c.nodeType === 1) || null; },
-    get children() { return children.filter(c => c.nodeType === 1); },
-    appendChild(c) {
-      if (c) {
-        children.push(c);
-        markShadowTree(c, shadow);
-        try { c.parentNode = shadow; } catch (_) { /* parentNode is getter-only on Node, ignore */ }
-      }
-      return c;
-    },
-    insertBefore(n, ref) {
-      if (!n) return n;
-      if (!ref) { shadow.appendChild(n); return n; }
-      const idx = children.indexOf(ref);
-      if (idx >= 0) {
-        children.splice(idx, 0, n);
-        markShadowTree(n, shadow);
-        try { n.parentNode = shadow; } catch (_) {}
-      }
-      else shadow.appendChild(n);
-      return n;
-    },
-    removeChild(c) { const idx = children.indexOf(c); if (idx >= 0) children.splice(idx, 1); return c; },
-    replaceChild(n, o) {
-      const idx = children.indexOf(o);
-      if (idx >= 0) {
-        children[idx] = n;
-        markShadowTree(n, shadow);
-        try { n.parentNode = shadow; } catch (_) {}
-      }
-      return o;
-    },
-    querySelector(s) {
-      for (const c of children) {
-        if (c.matches && c.matches(s)) return c;
-        if (c.querySelector) { const r = c.querySelector(s); if (r) return r; }
-      }
-      return null;
-    },
-    querySelectorAll(s) {
-      const results = [];
-      for (const c of children) {
-        if (c.matches && c.matches(s)) results.push(c);
-        if (c.querySelectorAll) results.push(...c.querySelectorAll(s));
-      }
-      return results;
-    },
-    getElementById(id) { return shadow.querySelector('#' + id); },
-    contains(n) { return children.includes(n); },
-    getRootNode() { return shadow; },
-    get ownerDocument() { return document; },
-    get nodeType() { return 11; }, // DOCUMENT_FRAGMENT_NODE
-    get nodeName() { return '#document-fragment'; },
-    addEventListener() {}, removeEventListener() {}, dispatchEvent() { return true; },
-    setHTMLUnsafe(v) { this.innerHTML = String(v == null ? "" : v); },
-    getHTML() { return this.innerHTML; },
-    // Own textContent: ShadowRoot now extends DocumentFragment, so without
-    // these the inherited Node accessors run against _nodeId(this). The setter in
-    // particular would target the host document and wipe it. Operate on the
-    // shadow's own `children` store instead.
-    get textContent() { return children.map(c => c.textContent || "").join(""); },
-    set textContent(v) {
-      children.length = 0;
-      if (v != null && v !== "") children.push(document.createTextNode(String(v)));
-    },
-    hasChildNodes() { return children.length > 0; },
-    activeElement: null,
-    get styleSheets() { return []; },
-    cloneNode() { throw new DOMException('Failed to execute cloneNode on Node: ShadowRoot nodes are not clonable.', 'NotSupportedError'); },
-  };
-  _nodeSlots.set(shadow, {nid:shadowNid, style:null});
-  Object.setPrototypeOf(shadow, ShadowRoot.prototype);
+  // The shadow root is a real DocumentFragment node in the backing tree. That
+  // makes its children ordinary nodes: they get a parent, they answer
+  // querySelector, and resource-bearing elements inside them actually load.
+  // Registering it in the wrapper cache keeps identity stable, so a child's
+  // `parentNode` is this exact object rather than a fresh fragment wrapper.
+  const shadow = new ShadowRoot();
+  shadow._mode = _mode;
+  shadow._host = this;
+  shadow._delegatesFocus = !!(opts && opts.delegatesFocus);
+  _cache.set(_nodeId(shadow), shadow);
   this._shadowRoot = shadow;
   return shadow;
 };

@@ -2847,6 +2847,132 @@ mod tests {
         assert_eq!(result, serde_json::json!(["root", true]));
     }
 
+    /// A shadow root is a real node in the backing tree. It used to be a
+    /// detached plain object whose appendChild only pushed into a JS array, so
+    /// anything put inside a shadow root silently vanished: no parent, never
+    /// connected, and resource elements never loaded. Cloudflare's Turnstile
+    /// widget builds its challenge frame inside a closed shadow root, which is
+    /// how the gap was found.
+    #[test]
+    fn shadow_root_children_join_the_real_tree() {
+        let mut rt = setup_runtime(r#"<div id="host"></div>"#);
+        let result = rt
+            .evaluate(
+                r#"
+                const host = document.getElementById('host');
+                const root = host.attachShadow({ mode: 'closed' });
+                const child = document.createElement('span');
+                child.id = 'inside';
+                root.appendChild(child);
+                return {
+                    isShadowRoot: root instanceof ShadowRoot,
+                    nodeType: root.nodeType,
+                    parentIsRoot: child.parentNode === root,
+                    connected: child.isConnected,
+                    rootNodeIsShadow: child.getRootNode() === root,
+                    composedRootIsDocument: child.getRootNode({ composed: true }) === document,
+                    foundInShadow: root.querySelector('#inside') === child,
+                    innerHtml: root.innerHTML,
+                    documentDoesNotPierce: document.querySelectorAll('#inside').length === 0,
+                };
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "isShadowRoot": true,
+                "nodeType": 11,
+                "parentIsRoot": true,
+                "connected": true,
+                "rootNodeIsShadow": true,
+                "composedRootIsDocument": true,
+                "foundInShadow": true,
+                "innerHtml": "<span id=\"inside\"></span>",
+                "documentDoesNotPierce": true,
+            })
+        );
+    }
+
+    /// `mode` decides whether the host exposes the root, and a node only counts
+    /// as connected when the shadow host itself is in the document.
+    #[test]
+    fn shadow_root_mode_and_host_connection_are_honoured() {
+        let mut rt = setup_runtime(r#"<div id="host"></div>"#);
+        let result = rt
+            .evaluate(
+                r#"
+                const attached = document.getElementById('host');
+                const closed = attached.attachShadow({ mode: 'closed' });
+                const detachedHost = document.createElement('div');
+                const open = detachedHost.attachShadow({ mode: 'open' });
+                const orphan = document.createElement('b');
+                open.appendChild(orphan);
+                let cloneError = null;
+                try { closed.cloneNode(true); } catch (e) { cloneError = e.name; }
+                let twiceError = null;
+                try { attached.attachShadow({ mode: 'open' }); } catch (e) { twiceError = e.name; }
+                return {
+                    closedRootHidden: attached.shadowRoot === null,
+                    openRootExposed: detachedHost.shadowRoot === open,
+                    mode: closed.mode,
+                    hostBackReference: closed.host === attached,
+                    orphanConnected: orphan.isConnected,
+                    cloneError,
+                    twiceError,
+                };
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "closedRootHidden": true,
+                "openRootExposed": true,
+                "mode": "closed",
+                "hostBackReference": true,
+                "orphanConnected": false,
+                "cloneError": "NotSupportedError",
+                "twiceError": "NotSupportedError",
+            })
+        );
+    }
+
+    /// Chrome carries these on HTMLIFrameElement.prototype. Scripts feature-test
+    /// them before configuring a frame, so their absence is itself a signal.
+    #[test]
+    fn iframe_exposes_chrome_frame_properties() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"
+                const missing = ['allow', 'allowFullscreen', 'referrerPolicy', 'loading',
+                                 'csp', 'credentialless', 'width', 'height', 'srcdoc']
+                    .filter(name => !(name in HTMLIFrameElement.prototype));
+                const frame = document.createElement('iframe');
+                frame.setAttribute('allow', 'fullscreen');
+                frame.allowFullscreen = true;
+                frame.width = '300';
+                return {
+                    missing,
+                    allow: frame.allow,
+                    allowFullscreen: frame.allowFullscreen,
+                    widthAttribute: frame.getAttribute('width'),
+                };
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "missing": [],
+                "allow": "fullscreen",
+                "allowFullscreen": true,
+                "widthAttribute": "300",
+            })
+        );
+    }
+
     /// Issue #475: parentNode() climbs past a skipped ancestor to the first
     /// accepted one, instead of stopping at the immediate parent.
     #[test]
