@@ -167,6 +167,24 @@ impl ObscuraJsRuntime {
                 ..Default::default()
             });
 
+            // JsRuntime has now loaded V8's ICU data. Apply the process zone to
+            // ICU itself, then clear this isolate's date cache without asking
+            // V8 to replace it with the Windows host zone again.
+            if let Some(timezone) = std::env::var("TZ")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+            {
+                if let Err(error) = crate::timezone::set_default_timezone(&timezone) {
+                    tracing::warn!(%error, "failed to set the native V8 timezone");
+                } else {
+                    runtime
+                        .v8_isolate()
+                        .date_time_configuration_change_notification(
+                            deno_core::v8::TimeZoneDetection::Skip,
+                        );
+                }
+            }
+
             runtime.op_state().borrow_mut().put(state_clone);
 
             runtime
@@ -1492,6 +1510,21 @@ mod tests {
         rt.set_title("Test Page");
         rt.run_page_init();
         rt
+    }
+
+    #[test]
+    fn native_date_and_intl_use_process_timezone() {
+        // SAFETY: nextest gives this test its own process and no runtime or
+        // worker thread exists before this point.
+        unsafe { std::env::set_var("TZ", "Europe/Istanbul"); }
+        let mut rt = ObscuraJsRuntime::new();
+        let value = rt
+            .evaluate(
+                "({zone:Intl.DateTimeFormat().resolvedOptions().timeZone,offset:new Date().getTimezoneOffset()})",
+            )
+            .unwrap();
+        assert_eq!(value["zone"], "Europe/Istanbul");
+        assert_eq!(value["offset"], -180);
     }
 
     fn setup_runtime_with_storage(

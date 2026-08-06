@@ -7,6 +7,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command as TokioCommand;
 use tokio::time::{timeout, Duration};
 
+mod geoip;
+
 #[derive(Parser)]
 #[command(
     name = "obscura",
@@ -25,6 +27,12 @@ struct Args {
 
     #[arg(long, global = true)]
     proxy: Option<String>,
+
+    /// BotBrowser GeoIP database used to align timezone and location with the
+    /// configured proxy exit IP. When omitted, Obscura looks next to the
+    /// executable and then in the current directory.
+    #[arg(long, global = true, value_name = "PATH")]
+    geoip_db: Option<std::path::PathBuf>,
 
     /// Enable stealth mode (consistent browser fingerprint, and with the
     /// `stealth` build feature, TLS impersonation plus tracker blocking).
@@ -343,23 +351,72 @@ fn effective_v8_flags(user: Option<&str>) -> String {
     }
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
-
-    // Pin the process timezone before V8/ICU reads it. V8 sources the zone for
-    // both Date (getTimezoneOffset, toString) and Intl.DateTimeFormat from TZ; left
-    // unset it defaults to UTC for Date while the page layer advertised a different
-    // zone, a cross-surface mismatch fingerprinting scripts flag. Default to
-    // Europe/Berlin; set OBSCURA_TIMEZONE to match the exit IP's region. An existing
-    // TZ from the host is respected.
-    // SAFETY: runs before any V8 isolate or worker thread starts, so the env is
-    // effectively single threaded here.
-    if let Some(tz) = std::env::var("OBSCURA_TIMEZONE").ok().filter(|s| !s.trim().is_empty()) {
-        unsafe { std::env::set_var("TZ", tz); }
-    } else if std::env::var_os("TZ").is_none() {
-        unsafe { std::env::set_var("TZ", "Europe/Berlin"); }
+fn startup_proxy(args: &Args) -> Option<String> {
+    match &args.command {
+        Some(Command::Profiles { .. }) => None,
+        Some(Command::Serve { proxy, .. }) => merge_proxy(args.proxy.clone(), proxy.clone())
+            .or_else(|| std::env::var("OBSCURA_PROXY").ok().filter(|s| !s.is_empty())),
+        Some(Command::Mcp { proxy, .. }) => merge_proxy(args.proxy.clone(), proxy.clone()),
+        _ => args.proxy.clone(),
     }
+}
+
+fn configure_geo_environment(identity: Option<&geoip::GeoIdentity>) {
+    // Keep manual settings above GeoIP, then use the host or the old
+    // Europe/Berlin fallback when no lookup was made.
+    let manual_timezone = std::env::var("OBSCURA_TIMEZONE")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let timezone = if let Some(timezone) = manual_timezone {
+        timezone
+    } else if let Some(identity) = identity {
+        identity.timezone.clone()
+    } else {
+        std::env::var("TZ")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "Europe/Berlin".to_string())
+    };
+    // SAFETY: main calls this before its Tokio runtime or any V8 isolate is
+    // created. The temporary blocking HTTP client has already been dropped.
+    unsafe { std::env::set_var("TZ", &timezone); }
+
+    if std::env::var_os("OBSCURA_GEOLOCATION").is_none() {
+        if let Some(identity) = identity {
+            // SAFETY: see above. Worker processes inherit this value.
+            unsafe {
+                std::env::set_var(
+                    "OBSCURA_GEOLOCATION",
+                    format!("{},{}", identity.latitude, identity.longitude),
+                );
+            }
+        }
+    }
+}
+
+fn main() -> anyhow::Result<()> {
+    let args = Args::parse();
+    let geo_result = startup_proxy(&args)
+        .as_deref()
+        .map(|proxy| geoip::resolve(proxy, args.geoip_db.as_deref()))
+        .transpose();
+    let (geo_identity, geo_error) = match geo_result {
+        Ok(value) => (value.flatten(), None),
+        Err(error) => (None, Some(error)),
+    };
+    configure_geo_environment(geo_identity.as_ref());
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(run(args, geo_identity, geo_error))
+}
+
+async fn run(
+    args: Args,
+    geo_identity: Option<geoip::GeoIdentity>,
+    geo_error: Option<anyhow::Error>,
+) -> anyhow::Result<()> {
 
     let quiet = is_quiet_command(&args.command);
     let filter = select_log_filter(args.verbose, quiet);
@@ -370,6 +427,21 @@ async fn main() -> anyhow::Result<()> {
         )
         .with_writer(std::io::stderr)
         .init();
+
+    if let Some(identity) = geo_identity {
+        tracing::info!(
+            exit_ip = %identity.ip,
+            country = identity.country_code,
+            timezone = identity.timezone,
+            latitude = identity.latitude,
+            longitude = identity.longitude,
+            database = %identity.database.display(),
+            "GeoIP identity applied"
+        );
+    }
+    if let Some(error) = geo_error {
+        tracing::warn!(%error, "GeoIP lookup failed; using manual or default location settings");
+    }
 
     let v8_flags = effective_v8_flags(args.v8_flags.as_deref());
     tracing::debug!("V8 flags: {}", v8_flags);
