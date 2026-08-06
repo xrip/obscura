@@ -17,6 +17,7 @@ const ROUTE_PREFIX: &str = "/obscura/profiles";
 const MAX_HEADER_BYTES: usize = 32 * 1024;
 const MAX_CAPTURE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_SOURCE_BYTES: u64 = 512 * 1024 * 1024;
+const RUNTIME_DIR: &str = ".obscura-runtime";
 
 #[derive(Clone)]
 pub(crate) struct ProfileWorkbench {
@@ -35,6 +36,12 @@ impl ProfileWorkbench {
                 "profile workbench path is not a directory: {}",
                 root.display()
             );
+        }
+        let runtime_dir = root.join(RUNTIME_DIR);
+        match obscura_browser::profiles::load_runtime_profiles(&runtime_dir) {
+            Ok(loaded) if loaded > 0 => tracing::info!(loaded, path = %runtime_dir.display(), "loaded saved runtime profiles"),
+            Ok(_) => {}
+            Err(error) => tracing::warn!(%error, path = %runtime_dir.display(), "saved runtime profiles were not loaded"),
         }
         Ok(Self { root })
     }
@@ -103,7 +110,7 @@ pub(crate) fn handle(
             PROFILE_ID_JS.as_bytes(),
         ),
         ("GET", "/obscura/profiles/catalog") => {
-            let body = obscura_browser::profiles::catalog()?.index_json()?;
+            let body = obscura_browser::profiles::catalog()?.index_json_with_runtime()?;
             write_response(
                 &mut stream,
                 200,
@@ -294,6 +301,9 @@ fn is_loopback_host(host: &str, port: u16) -> bool {
 struct SavedCapture {
     profile: String,
     window_rows: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    profile_id: Option<String>,
+    catalog_updated: bool,
 }
 
 fn save_capture(root: &Path, body: &Value) -> anyhow::Result<SavedCapture> {
@@ -313,10 +323,28 @@ fn save_capture(root: &Path, body: &Value) -> anyhow::Result<SavedCapture> {
 
     let profile_bytes = pretty_json(profile)?;
     let profile_path = next_profile_path(&root.join("profiles"), &profile_bytes)?;
-    let files = [PendingFile::new(
+    let mut files = vec![PendingFile::new(
         windows_path,
         pretty_json(&Value::Array(windows))?,
     )];
+    let runtime_id = body
+        .get("runtime")
+        .map(obscura_browser::profiles::register_runtime_profile)
+        .transpose()
+        .map_err(|error| anyhow!(error.to_string()))?;
+    if let (Some(runtime), Some(profile_id)) = (body.get("runtime"), runtime_id.as_deref()) {
+        let runtime_dir = root.join(RUNTIME_DIR);
+        fs::create_dir_all(&runtime_dir)?;
+        let runtime_path = runtime_dir.join(format!("runtime-{}.json", &hex_digest(profile_id)[..16]));
+        let runtime_bytes = pretty_json(runtime)?;
+        if runtime_path.exists() {
+            if fs::read(&runtime_path)? != runtime_bytes {
+                bail!("runtime profile ID already has different saved data: {profile_id}");
+            }
+        } else {
+            files.push(PendingFile::new(runtime_path, runtime_bytes));
+        }
+    }
     for (index, file) in files.iter().enumerate() {
         if let Err(error) = file.prepare() {
             let _ = fs::remove_file(&file.next);
@@ -344,7 +372,13 @@ fn save_capture(root: &Path, body: &Value) -> anyhow::Result<SavedCapture> {
             .to_string_lossy()
             .replace('\\', "/"),
         window_rows,
+        profile_id: runtime_id,
+        catalog_updated: body.get("runtime").is_some(),
     })
+}
+
+fn hex_digest(value: &str) -> String {
+    format!("{:x}", Sha256::digest(value.as_bytes()))
 }
 
 fn check_capture(profile: &Value, windows: &Value) -> anyhow::Result<()> {
@@ -599,6 +633,39 @@ mod tests {
         })
     }
 
+    fn runtime() -> Value {
+        let id = "c150w1:77777777777777777777777777777777:88888888888888888888888888888888:99999999999999999999999999999999";
+        let mut seed_hasher = Sha256::new();
+        seed_hasher.update(b"graphics-render-v1");
+        seed_hasher.update(id.as_bytes());
+        let render_seed = format!("{:x}", seed_hasher.finalize());
+        json!({
+            "id": id, "catalogId": "chrome-windows-v1", "renderSeed": render_seed,
+            "browser": { "major": 150, "version": "150.0.1.1", "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36" },
+            "navigator": {
+                "platform": "Win32", "uaPlatform": "Windows", "uaPlatformVersion": "19.0.0",
+                "architecture": "x86", "bitness": "64", "brands": [], "fullVersionList": [],
+                "languages": ["en-US"], "hardwareConcurrency": 8, "deviceMemory": 8.0, "maxTouchPoints": 0
+            },
+            "network": { "downlink": 1.7, "rtt": 75, "effectiveType": "4g", "saveData": false },
+            "screen": {
+                "id": "99999999999999999999999999999999", "width": 1920, "height": 1080,
+                "availWidth": 1920, "availHeight": 1040, "availLeft": 0, "availTop": 0,
+                "colorDepth": 24, "pixelDepth": 24, "devicePixelRatio": 1.0,
+                "innerWidth": 1200, "innerHeight": 800, "outerWidth": 1200, "outerHeight": 900,
+                "screenX": 0, "screenY": 0, "weight": 1
+            },
+            "graphics": {
+                "id": "88888888888888888888888888888888", "maskedVendor": "WebKit", "maskedRenderer": "WebKit WebGL",
+                "unmaskedVendor": "Google Inc. (NVIDIA)", "unmaskedRenderer": "ANGLE (NVIDIA, Test Direct3D11, D3D11)",
+                "webgl1Id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "webgl2Id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "webgpuId": "cccccccccccccccccccccccccccccccc",
+                "preferredCanvasFormat": "bgra8unorm", "wgslLanguageFeatures": [],
+                "observationsByBrowserVersion": { "150.0.1.1": 1 }, "weight": 1,
+                "webgl1": {}, "webgl2": {}, "webgpu": { "adapters": { "default": {} } }
+            }
+        })
+    }
+
     fn temp_root() -> PathBuf {
         let number = NEXT_TEST.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!(
@@ -629,12 +696,17 @@ mod tests {
     fn save_appends_rows_and_never_overwrites_a_profile() {
         let root = temp_root();
         fs::create_dir_all(&root).unwrap();
-        let body = capture();
+        let mut body = capture();
+        body["runtime"] = runtime();
         let first = save_capture(&root, &body).unwrap();
         let second = save_capture(&root, &body).unwrap();
         assert_eq!(second.window_rows, 2);
         assert_ne!(first.profile, second.profile);
+        assert!(first.catalog_updated);
+        assert_eq!(first.profile_id, second.profile_id);
         assert_eq!(fs::read_dir(root.join("profiles")).unwrap().count(), 2);
+        assert_eq!(fs::read_dir(root.join(RUNTIME_DIR)).unwrap().count(), 1);
+        assert_eq!(obscura_browser::profiles::load_runtime_profiles(&root.join(RUNTIME_DIR)).unwrap(), 1);
         assert!(!root.join("window.json.obscura-new").exists());
         assert!(!root.join("window.json.obscura-backup").exists());
         fs::remove_dir_all(root).unwrap();

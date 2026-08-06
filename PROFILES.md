@@ -706,8 +706,8 @@ WebGPU. Stop `serve` with `Ctrl+C` after the work is complete.
 
 ### Make an ID from existing rows
 
-The page loads the compact catalog built into the running binary and gives
-three select boxes:
+The page loads the compact catalog built into the running binary plus any
+profiles already saved by this workbench, then gives three select boxes:
 
 - Base: Chrome, Windows platform version, CPU, memory, and languages.
 - Graphics: one whole GPU, WebGL 1, WebGL 2, and WebGPU row.
@@ -759,10 +759,8 @@ screen IDs in the three boxes. The final versioned ID is visible and can be
 copied. This is true even when the browser needs an API or transport warning.
 
 If an ID is already in the tracked catalog, the select option is the existing
-row. If it is new, the option begins with `[new capture]`. A new composed ID is
-the ID that generation will make, but Obscura cannot use it until the capture
-has been imported, the catalog has been generated, and the binary has been
-rebuilt.
+row. If it is new, the option begins with `[new capture]`. The new ID is still
+valid: the workbench registers it when the save request succeeds.
 
 ### Save the source files
 
@@ -776,9 +774,13 @@ capture. It then makes these changes under the directory from
   `profiles/capture-<digest>-001.json`.
 - Uses `.obscura-new` and `.obscura-backup` files while it replaces the screen
   source array.
-- Leaves the tracked compact catalog unchanged. Generation is a separate step.
+- Registers the normalized runtime profile in the running `serve` process.
+- Writes a private `.obscura-runtime/` sidecar so the next workbench server can
+  load the same profile without another capture.
+- Makes the new base, graphics, and screen rows visible from the workbench
+  `/catalog` endpoint.
 
-The page gives the new profile path and the new window row count.
+The page gives the new profile path, composed profile ID, and window row count.
 If an old `.obscura-backup` file is present, save stops so that the old data can
 be checked and recovered by hand. It does not remove an old backup silently.
 
@@ -839,13 +841,23 @@ observation. Do not import a file twice by mistake.
 The helper rewrites the local screen JSON array in a stable pretty form. The
 built-in save button and this helper have the same source-file result.
 
-### Generate, build, and confirm the captured ID
+### Use the captured ID in the running workbench
 
-Stop the old `serve`, run the normal generator command from the next section,
-and rebuild Obscura. Start the new binary with the workbench flag again. Then
-refresh the
-workbench. The `[new capture]` mark must be gone and the same three IDs must
-now be normal catalog options.
+No catalog generation is needed for the running workbench. After the save
+request returns, use the printed ID through `Obscura.setProfile` on a new root
+CDP connection. The profile must still be selected before the first page or
+browser context is created.
+
+The sidecar is local to the workbench source directory and is ignored by Git.
+It does not change the fixed catalog default or weighted rotation.
+
+### Promote the capture into the embedded catalog
+
+To make the profile available to a binary that is not started with the
+workbench directory, stop `serve`, run the normal generator command from the
+next section, and rebuild Obscura. Start the new binary with the workbench flag
+again. Then refresh the workbench. The `[new capture]` mark must be gone and
+the same three IDs must now be normal embedded catalog options.
 
 Build Obscura and check the exact ID printed by the capture page:
 
@@ -999,11 +1011,12 @@ Start the HTTP server from the repository root and open
 `http://127.0.0.1:8765/webgl/capture/`. Serving only the capture directory does
 not make the tracked catalog URL available.
 
-### The workbench rejects the browser version
+### The workbench warns about the browser version
 
-New capture is fixed to Chrome major 145. A later or earlier Chrome build has a
-different public surface and cannot enter this catalog. Existing catalog row
-selection still works.
+The catalog accepts captured Chrome Windows majors that pass the identity and
+graphics checks. A major other than 145 gets a warning because the JavaScript
+graphics API shape is pinned to Chrome 145. A missing exact transport profile
+gets a second warning and uses the nearest supported transport profile.
 
 ### The workbench reports no WebGPU adapter
 
@@ -1019,10 +1032,11 @@ capture into this D3D11 catalog.
 
 ### A captured ID is marked as new
 
-The page has made the final stable content ID, but the current embedded catalog
-does not have that row. Save the capture, stop `serve`, generate the catalog,
-rebuild Obscura, start `serve` again, and refresh the page. Until then, using
-the new ID in `OBSCURA_PROFILE` gives the fixed default with a warning.
+The page has made the final stable content ID, but the embedded catalog does
+not have that row yet. Press **Save capture to source files**. The running
+workbench then registers the ID and returns it in the save result. Only a
+binary that is not using `--profile-workbench-dir` needs catalog generation and
+a rebuild before it can use that ID.
 
 ### Chrome blocks more than one download
 

@@ -260,10 +260,113 @@
     };
   }
 
+  function runtimeValue(value) {
+    if (value && typeof value === 'object' && value[FLOAT64] !== undefined) {
+      return value[FLOAT64];
+    }
+    if (Array.isArray(value)) return value.map(runtimeValue);
+    if (value && typeof value === 'object') {
+      const out = {};
+      for (const key of Object.keys(value)) out[key] = runtimeValue(value[key]);
+      return out;
+    }
+    return value;
+  }
+
+  async function digestText(text) {
+    const bytes = new TextEncoder().encode(text);
+    const digest = new Uint8Array(await cryptoApi().subtle.digest('SHA-256', bytes));
+    return Array.from(digest, byte => byte.toString(16).padStart(2, '0')).join('');
+  }
+
+  async function runtimeFromProfile(profile, ids) {
+    const fingerprints = profile.fingerprints;
+    const browser = fingerprints.browser;
+    const navigator = browser.navigator;
+    const ua = browser.userAgentData;
+    const hardware = fingerprints.hardware;
+    const webgl1 = runtimeValue(normalizeWebGl(browser.webglContext, false));
+    const webgl2 = runtimeValue(normalizeWebGl(browser.webgl2Context, true));
+    const webgpu = runtimeValue(normalizeWebGpu(hardware.gpu.adapter));
+    const browserMajor = Number(browser.version.split('.')[0]);
+    const screen = hardware.screen;
+    const windowData = browser.window;
+    const screenProfile = {
+      id: ids.screenId,
+      width: Number(screen.width),
+      height: Number(screen.height),
+      availWidth: Number(screen.availWidth),
+      availHeight: Number(screen.availHeight),
+      availLeft: Number(screen.availLeft),
+      availTop: Number(screen.availTop),
+      colorDepth: Number(screen.colorDepth),
+      pixelDepth: Number(screen.pixelDepth),
+      devicePixelRatio: Number(windowData.devicePixelRatio),
+      innerWidth: Number(windowData.innerWidth),
+      innerHeight: Number(windowData.innerHeight),
+      outerWidth: Number(windowData.outerWidth),
+      outerHeight: Number(windowData.outerHeight),
+      screenX: Number(windowData.screenX),
+      screenY: Number(windowData.screenY),
+      weight: 1,
+    };
+    const graphics = {
+      id: ids.graphicsId,
+      maskedVendor: 'WebKit',
+      maskedRenderer: 'WebKit WebGL',
+      unmaskedVendor: String(hardware.gpu.unmaskedVendor),
+      unmaskedRenderer: String(hardware.gpu.unmaskedRenderer),
+      webgl1Id: ids.webgl1Id,
+      webgl2Id: ids.webgl2Id,
+      webgpuId: ids.webgpuId,
+      preferredCanvasFormat: String(hardware.gpu.preferredCanvasFormat),
+      wgslLanguageFeatures: uniqueStrings(hardware.gpu.wgslLanguageFeatures),
+      observationsByBrowserVersion: { [String(browser.version)]: 1 },
+      weight: 1,
+      webgl1,
+      webgl2,
+      webgpu,
+    };
+    const networkDigest = await digestText(`network-profile-v1${ids.baseId}`);
+    const renderSeed = await digestText(`graphics-render-v1${ids.composedId}`);
+    return {
+      id: ids.composedId,
+      catalogId: 'chrome-windows-v1',
+      renderSeed,
+      browser: {
+        major: browserMajor,
+        version: String(browser.version),
+        userAgent: String(browser.userAgent),
+      },
+      navigator: {
+        platform: 'Win32',
+        uaPlatform: String(ua.platform),
+        uaPlatformVersion: String(ua.platformVersion),
+        architecture: String(ua.architecture),
+        bitness: String(ua.bitness),
+        brands: Array.from(ua.brands, item => ({ brand: String(item.brand), version: String(item.version) })),
+        fullVersionList: Array.from(ua.fullVersionList, item => ({ brand: String(item.brand), version: String(item.version) })),
+        languages: Array.from(navigator.languages, String),
+        hardwareConcurrency: Number(navigator.hardwareConcurrency),
+        deviceMemory: Number(navigator.deviceMemory),
+        maxTouchPoints: Number(navigator.maxTouchPoints),
+      },
+      network: {
+        downlink: (26 + parseInt(networkDigest.slice(0, 2), 16) % 9) / 20,
+        rtt: 50 + (parseInt(networkDigest.slice(2, 4), 16) % 5) * 25,
+        effectiveType: '4g',
+        saveData: false,
+      },
+      screen: screenProfile,
+      graphics,
+    };
+  }
+
   return {
     canonicalJson,
     contentId,
     idsFromProfile,
+    runtimeFromProfile,
     normalizeBase,
     normalizeScreen,
     normalizeWebGl,

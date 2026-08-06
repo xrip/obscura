@@ -2,5 +2,6 @@ target/
 .DS_Store
 /webgl/window.json
 /webgl/profiles/
+/webgl/.obscura-runtime/
 /webgl/window.json.obscura-new
 /webgl/window.json.obscura-backup

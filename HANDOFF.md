@@ -70,7 +70,9 @@ function handling.
 - `collector.js`, `profile-id.js`, and `import-capture.js` produce the capture
   data and stable IDs.
 - `crates/obscura-cdp/src/profile_workbench.rs` serves the catalog and saves
-  accepted capture data through the same local `serve` process.
+  accepted capture data through the same local `serve` process. A saved capture
+  is registered at once and kept in a private `.obscura-runtime/` sidecar for
+  the next workbench server.
 - Start it with:
 
   ```powershell

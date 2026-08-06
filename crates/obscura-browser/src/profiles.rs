@@ -1,6 +1,7 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Read;
-use std::sync::{Arc, OnceLock};
+use std::path::Path;
+use std::sync::{Arc, OnceLock, RwLock};
 
 use flate2::read::GzDecoder;
 use serde::{Deserialize, Serialize};
@@ -11,6 +12,8 @@ use thiserror::Error;
 const CATALOG_GZIP: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/chrome-windows-v1.json.gz"));
 const DEFAULT_CATALOG_JSON: &str = include_str!(concat!(env!("OUT_DIR"), "/chrome-windows-v1.default.json"));
 const CATALOG_ID: &str = "chrome-windows-v1";
+const MAX_RUNTIME_PROFILES: usize = 256;
+const MAX_RUNTIME_PROFILE_BYTES: usize = 16 * 1024 * 1024;
 pub const GRAPHICS_API_BROWSER_MAJOR: u32 = 145;
 
 #[derive(Debug, Clone, Error)]
@@ -179,7 +182,7 @@ struct DefaultCatalog {
     webgpu_limits: Vec<CatalogWebGpuLimitsComponent>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BrowserIdentity {
     pub major: u32,
@@ -187,7 +190,7 @@ pub struct BrowserIdentity {
     pub user_agent: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NetworkIdentity {
     pub downlink: f64,
@@ -196,7 +199,7 @@ pub struct NetworkIdentity {
     pub save_data: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NavigatorIdentity {
     pub platform: String,
@@ -258,6 +261,39 @@ struct RuntimeFingerprint<'a> {
     network: &'a NetworkIdentity,
     screen: &'a ScreenWindowProfile,
     graphics: RuntimeGraphics<'a>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeGraphicsCapture {
+    id: String,
+    masked_vendor: String,
+    masked_renderer: String,
+    unmasked_vendor: String,
+    unmasked_renderer: String,
+    webgl1_id: String,
+    webgl2_id: String,
+    webgpu_id: String,
+    preferred_canvas_format: String,
+    wgsl_language_features: Vec<String>,
+    observations_by_browser_version: BTreeMap<String, u64>,
+    weight: u64,
+    webgl1: Value,
+    webgl2: Value,
+    webgpu: Value,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RuntimeFingerprintCapture {
+    id: String,
+    catalog_id: String,
+    render_seed: String,
+    browser: BrowserIdentity,
+    navigator: NavigatorIdentity,
+    network: NetworkIdentity,
+    screen: ScreenWindowProfile,
+    graphics: RuntimeGraphicsCapture,
 }
 
 #[derive(Debug, Clone)]
@@ -368,11 +404,262 @@ impl FingerprintCatalog {
         })
         .map_err(|error| ProfileError::Serialization(error.to_string()))
     }
+
+    pub fn index_json_with_runtime(&self) -> Result<String, ProfileError> {
+        let mut index: Value = serde_json::from_str(&self.index_json()?)
+            .map_err(|error| ProfileError::Serialization(error.to_string()))?;
+        let mut runtime = runtime_profiles()
+            .read()
+            .map_err(|_| ProfileError::Catalog("runtime profile registry is poisoned".to_string()))?
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        runtime.sort_by(|left, right| left.id.cmp(&right.id));
+        for profile in runtime {
+            let (_, base_id, graphics_id, screen_id) = parse_runtime_id(&profile.id)?;
+            let base_rows = index["baseProfiles"]
+                .as_array_mut()
+                .ok_or_else(|| ProfileError::Catalog("catalog baseProfiles is not an array".to_string()))?;
+            if !base_rows.iter().any(|row| row["id"] == base_id) {
+                base_rows.push(serde_json::json!({
+                    "id": base_id,
+                    "browserVersion": profile.browser.version,
+                    "userAgent": profile.browser.user_agent,
+                    "brands": profile.navigator.brands,
+                    "fullVersionList": profile.navigator.full_version_list,
+                    "platform": profile.navigator.ua_platform,
+                    "platformVersion": profile.navigator.ua_platform_version,
+                    "architecture": profile.navigator.architecture,
+                    "bitness": profile.navigator.bitness,
+                    "languages": profile.navigator.languages,
+                    "hardwareConcurrency": profile.navigator.hardware_concurrency,
+                    "deviceMemory": profile.navigator.device_memory,
+                    "maxTouchPoints": profile.navigator.max_touch_points,
+                    "weight": 1,
+                }));
+            }
+            let graphics_rows = index["graphicsProfiles"]
+                .as_array_mut()
+                .ok_or_else(|| ProfileError::Catalog("catalog graphicsProfiles is not an array".to_string()))?;
+            if !graphics_rows.iter().any(|row| row["id"] == graphics_id) {
+                graphics_rows.push(serde_json::to_value(&profile.graphics)
+                    .map_err(|error| ProfileError::Serialization(error.to_string()))?);
+            }
+            let screen_rows = index["screenProfiles"]
+                .as_array_mut()
+                .ok_or_else(|| ProfileError::Catalog("catalog screenProfiles is not an array".to_string()))?;
+            if !screen_rows.iter().any(|row| row["id"] == screen_id) {
+                screen_rows.push(serde_json::to_value(&profile.screen)
+                    .map_err(|error| ProfileError::Serialization(error.to_string()))?);
+            }
+        }
+        serde_json::to_string_pretty(&index)
+            .map_err(|error| ProfileError::Serialization(error.to_string()))
+    }
 }
 
 static CATALOG: OnceLock<Result<FingerprintCatalog, ProfileError>> = OnceLock::new();
 static DEFAULT_PROFILE: OnceLock<Result<Arc<ResolvedFingerprintProfile>, ProfileError>> = OnceLock::new();
 static WARNED_INVALID_SELECTOR: OnceLock<()> = OnceLock::new();
+static RUNTIME_PROFILES: OnceLock<RwLock<HashMap<String, Arc<ResolvedFingerprintProfile>>>> = OnceLock::new();
+
+fn runtime_profiles() -> &'static RwLock<HashMap<String, Arc<ResolvedFingerprintProfile>>> {
+    RUNTIME_PROFILES.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+fn runtime_profile_from_value(value: &Value) -> Result<Arc<ResolvedFingerprintProfile>, ProfileError> {
+    let capture: RuntimeFingerprintCapture = serde_json::from_value(value.clone())
+        .map_err(|error| ProfileError::Catalog(format!("invalid runtime profile: {error}")))?;
+    if capture.catalog_id != CATALOG_ID {
+        return Err(ProfileError::Catalog(
+            "runtime profile has an unsupported catalog ID".to_string(),
+        ));
+    }
+    let (major, _base_id, graphics_id, screen_id) = parse_runtime_id(&capture.id)?;
+    if capture.browser.major != major || browser_major(&capture.browser.version)? != major {
+        return Err(ProfileError::Catalog(
+            "runtime profile browser major does not match its ID".to_string(),
+        ));
+    }
+    if capture.navigator.ua_platform != "Windows"
+        || capture.navigator.architecture != "x86"
+        || capture.navigator.bitness != "64"
+    {
+        return Err(ProfileError::Catalog(
+            "runtime profile is not a Chrome Windows x86-64 profile".to_string(),
+        ));
+    }
+    if capture.screen.id != screen_id || capture.graphics.id != graphics_id {
+        return Err(ProfileError::Catalog(
+            "runtime profile component IDs do not match its composed ID".to_string(),
+        ));
+    }
+    if capture.screen.width == 0
+        || capture.screen.height == 0
+        || !capture.screen.device_pixel_ratio.is_finite()
+        || capture.screen.device_pixel_ratio <= 0.0
+        || capture.graphics.weight == 0
+        || capture.graphics.observations_by_browser_version.is_empty()
+        || capture.graphics.webgl1.is_null()
+        || capture.graphics.webgl2.is_null()
+        || capture.graphics.webgpu.get("adapters").and_then(Value::as_object).and_then(|adapters| adapters.get("default")).is_none()
+    {
+        return Err(ProfileError::Catalog(
+            "runtime profile has incomplete graphics or screen data".to_string(),
+        ));
+    }
+    if !capture.graphics.unmasked_renderer.contains("D3D11")
+        || !matches!(capture.graphics.preferred_canvas_format.as_str(), "bgra8unorm" | "rgba8unorm")
+    {
+        return Err(ProfileError::Catalog(
+            "runtime profile is not an ANGLE/D3D11 profile".to_string(),
+        ));
+    }
+    let mut seed_hasher = Sha256::new();
+    seed_hasher.update(b"graphics-render-v1");
+    seed_hasher.update(capture.id.as_bytes());
+    if capture.render_seed != hex(&seed_hasher.finalize()) {
+        return Err(ProfileError::Catalog(
+            "runtime profile render seed does not match its ID".to_string(),
+        ));
+    }
+    let graphics = GraphicsProfile {
+        id: capture.graphics.id.clone(),
+        masked_vendor: capture.graphics.masked_vendor.clone(),
+        masked_renderer: capture.graphics.masked_renderer.clone(),
+        unmasked_vendor: capture.graphics.unmasked_vendor.clone(),
+        unmasked_renderer: capture.graphics.unmasked_renderer.clone(),
+        webgl1_id: capture.graphics.webgl1_id.clone(),
+        webgl2_id: capture.graphics.webgl2_id.clone(),
+        webgpu_id: capture.graphics.webgpu_id.clone(),
+        preferred_canvas_format: capture.graphics.preferred_canvas_format.clone(),
+        wgsl_language_features: capture.graphics.wgsl_language_features.clone(),
+        observations_by_browser_version: capture.graphics.observations_by_browser_version.clone(),
+        weight: capture.graphics.weight,
+    };
+    let runtime = RuntimeFingerprint {
+        id: &capture.id,
+        catalog_id: &capture.catalog_id,
+        render_seed: &capture.render_seed,
+        browser: &capture.browser,
+        navigator: &capture.navigator,
+        network: &capture.network,
+        screen: &capture.screen,
+        graphics: RuntimeGraphics {
+            id: &graphics.id,
+            masked_vendor: &graphics.masked_vendor,
+            masked_renderer: &graphics.masked_renderer,
+            unmasked_vendor: &graphics.unmasked_vendor,
+            unmasked_renderer: &graphics.unmasked_renderer,
+            preferred_canvas_format: &graphics.preferred_canvas_format,
+            wgsl_language_features: &graphics.wgsl_language_features,
+            webgl1: &capture.graphics.webgl1,
+            webgl2: &capture.graphics.webgl2,
+            webgpu: &capture.graphics.webgpu,
+        },
+    };
+    let runtime_json = serde_json::to_string(&runtime)
+        .map_err(|error| ProfileError::Serialization(error.to_string()))?;
+    Ok(Arc::new(ResolvedFingerprintProfile {
+        id: capture.id,
+        browser: capture.browser,
+        navigator: capture.navigator,
+        network: capture.network,
+        screen: capture.screen,
+        graphics,
+        webgl1: capture.graphics.webgl1,
+        webgl2: capture.graphics.webgl2,
+        webgpu: capture.graphics.webgpu,
+        render_seed: capture.render_seed,
+        runtime_json,
+    }))
+}
+
+fn parse_runtime_id(id: &str) -> Result<(u32, String, String, String), ProfileError> {
+    let parts: Vec<&str> = id.split(':').collect();
+    if parts.len() != 4 || !parts[0].starts_with('c') || !parts[0].ends_with("w1") {
+        return Err(ProfileError::Selector(id.to_string()));
+    }
+    let major = parts[0][1..parts[0].len() - 2]
+        .parse::<u32>()
+        .map_err(|_| ProfileError::Selector(id.to_string()))?;
+    for component in &parts[1..] {
+        if component.len() != 32
+            || !component
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err(ProfileError::Selector(id.to_string()));
+        }
+    }
+    Ok((
+        major,
+        parts[1].to_string(),
+        parts[2].to_string(),
+        parts[3].to_string(),
+    ))
+}
+
+pub fn register_runtime_profile(value: &Value) -> Result<String, ProfileError> {
+    let profile = runtime_profile_from_value(value)?;
+    let id = profile.id.clone();
+    let mut profiles = runtime_profiles()
+        .write()
+        .map_err(|_| ProfileError::Catalog("runtime profile registry is poisoned".to_string()))?;
+    if let Some(existing) = profiles.get(&id) {
+        if existing.runtime_json() != profile.runtime_json() {
+            return Err(ProfileError::Catalog(
+                "runtime profile ID is already registered with different data".to_string(),
+            ));
+        }
+    } else {
+        if profiles.len() >= MAX_RUNTIME_PROFILES {
+            return Err(ProfileError::Catalog(format!(
+                "runtime profile limit of {MAX_RUNTIME_PROFILES} was reached"
+            )));
+        }
+        profiles.insert(id.clone(), profile);
+    }
+    Ok(id)
+}
+
+pub fn load_runtime_profiles(directory: &Path) -> Result<usize, ProfileError> {
+    if !directory.exists() {
+        return Ok(0);
+    }
+    let mut paths = std::fs::read_dir(directory)
+        .map_err(|error| ProfileError::Catalog(format!("cannot read runtime profile directory: {error}")))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+        .collect::<Vec<_>>();
+    paths.sort();
+    let mut loaded = 0;
+    for path in paths {
+        let bytes = std::fs::read(&path).map_err(|error| {
+            ProfileError::Catalog(format!("cannot read runtime profile {}: {error}", path.display()))
+        })?;
+        if bytes.len() > MAX_RUNTIME_PROFILE_BYTES {
+            return Err(ProfileError::Catalog(format!(
+                "runtime profile {} is too large",
+                path.display()
+            )));
+        }
+        let value: Value = serde_json::from_slice(&bytes).map_err(|error| {
+            ProfileError::Catalog(format!("invalid runtime profile {}: {error}", path.display()))
+        })?;
+        register_runtime_profile(&value)?;
+        loaded += 1;
+    }
+    Ok(loaded)
+}
+
+fn runtime_profile(id: &str) -> Option<Arc<ResolvedFingerprintProfile>> {
+    runtime_profiles()
+        .read()
+        .ok()
+        .and_then(|profiles| profiles.get(id).cloned())
+}
 
 pub fn catalog() -> Result<&'static FingerprintCatalog, ProfileError> {
     match CATALOG.get_or_init(load_catalog) {
@@ -599,6 +886,11 @@ fn load_default_profile() -> Result<Arc<ResolvedFingerprintProfile>, ProfileErro
 
 pub fn resolve_profile() -> Result<Arc<ResolvedFingerprintProfile>, ProfileError> {
     let selector = std::env::var("OBSCURA_PROFILE").ok();
+    if let Some(selector) = selector.as_deref().map(str::trim) {
+        if let Some(profile) = runtime_profile(selector) {
+            return Ok(profile);
+        }
+    }
     let rotate = selector.is_none() && env_enabled("OBSCURA_ROTATE_PROFILE");
     if !rotate && selector.as_deref().map(str::trim).map_or(true, |value| value == "0") {
         return default_profile();
@@ -629,6 +921,9 @@ pub fn resolve_profile() -> Result<Arc<ResolvedFingerprintProfile>, ProfileError
 }
 
 pub fn resolve_profile_id(id: &str) -> Result<Arc<ResolvedFingerprintProfile>, ProfileError> {
+    if let Some(profile) = runtime_profile(id) {
+        return Ok(profile);
+    }
     let catalog = catalog()?;
     let (base_id, graphics_id, screen_id) = parse_composed_selector(catalog, id)
         .ok_or_else(|| ProfileError::Selector(id.to_string()))?;
@@ -983,6 +1278,7 @@ fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn embedded_catalog_is_valid_and_bounded() {
@@ -1105,5 +1401,44 @@ mod tests {
         let low = resolve_with_options(catalog, None, true, Some([0; 24])).unwrap().0;
         let high = resolve_with_options(catalog, None, true, Some([255; 24])).unwrap().0;
         assert_ne!(low.id, high.id);
+    }
+
+    #[test]
+    fn runtime_profile_is_registered_and_listed() {
+        let id = "c150w1:11111111111111111111111111111111:22222222222222222222222222222222:33333333333333333333333333333333";
+        let mut seed_hasher = Sha256::new();
+        seed_hasher.update(b"graphics-render-v1");
+        seed_hasher.update(id.as_bytes());
+        let value = json!({
+            "id": id,
+            "catalogId": CATALOG_ID,
+            "renderSeed": hex(&seed_hasher.finalize()),
+            "browser": { "major": 150, "version": "150.0.1.1", "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36" },
+            "navigator": {
+                "platform": "Win32", "uaPlatform": "Windows", "uaPlatformVersion": "19.0.0",
+                "architecture": "x86", "bitness": "64", "brands": [], "fullVersionList": [],
+                "languages": ["en-US"], "hardwareConcurrency": 8, "deviceMemory": 8.0, "maxTouchPoints": 0
+            },
+            "network": { "downlink": 1.7, "rtt": 75, "effectiveType": "4g", "saveData": false },
+            "screen": {
+                "id": "33333333333333333333333333333333", "width": 1920, "height": 1080,
+                "availWidth": 1920, "availHeight": 1040, "availLeft": 0, "availTop": 0,
+                "colorDepth": 24, "pixelDepth": 24, "devicePixelRatio": 1.0,
+                "innerWidth": 1200, "innerHeight": 800, "outerWidth": 1200, "outerHeight": 900,
+                "screenX": 0, "screenY": 0, "weight": 1
+            },
+            "graphics": {
+                "id": "22222222222222222222222222222222", "maskedVendor": "WebKit", "maskedRenderer": "WebKit WebGL",
+                "unmaskedVendor": "Google Inc. (NVIDIA)", "unmaskedRenderer": "ANGLE (NVIDIA, Test Direct3D11, D3D11)",
+                "webgl1Id": "44444444444444444444444444444444", "webgl2Id": "55555555555555555555555555555555", "webgpuId": "66666666666666666666666666666666",
+                "preferredCanvasFormat": "bgra8unorm", "wgslLanguageFeatures": [],
+                "observationsByBrowserVersion": { "150.0.1.1": 1 }, "weight": 1,
+                "webgl1": {}, "webgl2": {}, "webgpu": { "adapters": { "default": {} } }
+            }
+        });
+        assert_eq!(register_runtime_profile(&value).unwrap(), id);
+        assert_eq!(resolve_profile_id(id).unwrap().id, id);
+        let index: Value = serde_json::from_str(&catalog().unwrap().index_json_with_runtime().unwrap()).unwrap();
+        assert!(index["graphicsProfiles"].as_array().unwrap().iter().any(|row| row["id"] == "22222222222222222222222222222222"));
     }
 }

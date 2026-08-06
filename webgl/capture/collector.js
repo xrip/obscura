@@ -678,11 +678,14 @@
         body: JSON.stringify({
           profile: result.profile,
           windows: result.windows,
+          runtime: await ObscuraProfileIds.runtimeFromProfile(result.profile, result.ids),
         }),
       });
       const answer = await response.json();
       if (!response.ok || !answer.ok) throw new Error(answer.error || `save returned HTTP ${response.status}`);
-      state.textContent = `Saved ${answer.saved.profile}; window rows ${answer.saved.windowRows}.`;
+      state.textContent = answer.saved.catalogUpdated
+        ? `Saved ${answer.saved.profile}; profile ${answer.saved.profileId} is ready now.`
+        : `Saved ${answer.saved.profile}; window rows ${answer.saved.windowRows}.`;
     } catch (error) {
       state.textContent = 'Save failed.';
       errorBox.textContent = error && error.stack ? error.stack : String(error);
