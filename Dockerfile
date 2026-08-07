@@ -5,7 +5,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates \
         perl \
         make \
-        gzip \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
@@ -34,9 +33,6 @@ ARG OBSCURA_VERSION
 
 # Copy real sources and build
 COPY crates/ crates/
-COPY tools/ tools/
-# Fetch the DB-IP GeoIP database (git-ignored; see tools/fetch-geoip.sh).
-RUN ./tools/fetch-geoip.sh
 RUN echo "Building Obscura version ${OBSCURA_VERSION:-from Cargo.toml}" && \
     touch crates/*/src/*.rs && cargo build --release --bin obscura --bin obscura-worker
 
@@ -47,7 +43,6 @@ FROM gcr.io/distroless/cc-debian12
 
 COPY --from=builder /build/target/release/obscura /obscura
 COPY --from=builder /build/target/release/obscura-worker /obscura-worker
-COPY --from=builder /build/geoip.mmdb /geoip.mmdb
 
 EXPOSE 9222
 
