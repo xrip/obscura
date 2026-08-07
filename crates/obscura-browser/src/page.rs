@@ -293,8 +293,9 @@ impl Page {
         }
 
         for frame in pending {
+            let started = std::time::Instant::now();
             let realm = match self.js.as_mut().and_then(|js| {
-                FrameRealm::new(js, frame.frame_id, &frame.url, &frame.html)
+                FrameRealm::new(js, frame.frame_id, frame.parent_frame_id, &frame.url, &frame.html)
             }) {
                 Some(realm) => realm,
                 None => {
@@ -332,11 +333,84 @@ impl Page {
             }
 
             if let Some(js) = self.js.as_mut() {
+                // A frame that ran nothing and a frame that ran everything both
+                // finish silently, which has repeatedly been mistaken for the
+                // frame working. Say what was actually there.
+                tracing::debug!(
+                    "frame {} got a realm in {}ms: {} bytes, {} script(s), {} external",
+                    frame.url,
+                    started.elapsed().as_millis(),
+                    frame.html.len(),
+                    realm
+                        .evaluate(js, "document.querySelectorAll('script').length")
+                        .map(|count| count.to_string())
+                        .unwrap_or_else(|_| "?".into()),
+                    sources.len(),
+                );
                 for problem in realm.run_document_scripts(js, |url| sources.get(url).cloned()) {
                     tracing::debug!("frame {}: {}", frame.url, problem);
                 }
+                // The frame's scripts have run, so its document is loaded. Say
+                // so: everything a widget defers to DOMContentLoaded or load
+                // hangs on this, which is most of its interface.
+                if let Err(error) = realm.dispatch_load_events(js) {
+                    tracing::debug!("frame {} load events failed: {error}", frame.url);
+                }
             }
             self.frames.push(realm);
+        }
+        true
+    }
+
+    /// Hands each queued `postMessage` to the realm it was addressed to.
+    ///
+    /// Reports whether anything was delivered, because a message usually causes
+    /// a reply: a widget posts its result, the page answers, and the exchange
+    /// only finishes if the caller settles and drains again.
+    fn deliver_frame_messages(&mut self) -> bool {
+        let pending = match self.js.as_ref() {
+            Some(js) => js.take_pending_frame_messages(),
+            None => return false,
+        };
+        if pending.is_empty() {
+            return false;
+        }
+
+        for message in pending {
+            if message.target_frame_id == 0 {
+                let script = format!(
+                    "globalThis.__obscura_deliverMessage({}, {}, {});",
+                    serde_json::to_string(&message.data_json).unwrap_or_else(|_| "\"\"".into()),
+                    serde_json::to_string(&message.origin).unwrap_or_else(|_| "\"\"".into()),
+                    message.source_frame_id,
+                );
+                if let Some(js) = self.js.as_mut() {
+                    if let Err(error) = js.execute_script("<frame-message>", &script) {
+                        tracing::debug!("delivering a message to the page failed: {error}");
+                    }
+                }
+                continue;
+            }
+
+            let Some(index) = self
+                .frames
+                .iter()
+                .position(|frame| frame.frame_id() == message.target_frame_id)
+            else {
+                // The frame was torn down between the send and the drain. A
+                // browser drops the message too, so this is not an error.
+                tracing::debug!("message for frame {} which is gone", message.target_frame_id);
+                continue;
+            };
+            let Some(js) = self.js.as_mut() else { continue };
+            if let Err(error) = self.frames[index].deliver_message(
+                js,
+                &message.data_json,
+                &message.origin,
+                message.source_frame_id,
+            ) {
+                tracing::debug!("delivering a message to a frame failed: {error}");
+            }
         }
         true
     }
@@ -867,7 +941,7 @@ impl Page {
                  try { window.dispatchEvent(new Event('load', {bubbles:false,cancelable:false})); } catch(e) {}");
         }
 
-        if let Some(js) = &mut self.js {
+        {
             let dynamic_settle_ms = std::env::var("OBSCURA_DYNAMIC_SCRIPT_SETTLE_MS")
                 .ok()
                 .and_then(|s| s.parse::<u64>().ok())
@@ -876,7 +950,9 @@ impl Page {
             // Give post-load challenge and application work time to start, then
             // keep pumping until it has been idle for a full grace period. The
             // wall-clock limit remains the hard backstop for busy pages.
-            let settle_wd = js.arm_watchdog(std::time::Duration::from_millis(dynamic_settle_ms + 250));
+            let settle_wd = self.js.as_mut().map(|js| {
+                js.arm_watchdog(std::time::Duration::from_millis(dynamic_settle_ms + 250))
+            });
             let started = tokio::time::Instant::now();
             let deadline = started + tokio::time::Duration::from_millis(500);
             let dynamic_deadline = started + tokio::time::Duration::from_millis(dynamic_settle_ms);
@@ -888,17 +964,41 @@ impl Page {
                 // Let navigate_with_wait_post_inner follow the pending URL now
                 // instead of spending the settle budget on work that is about
                 // to be discarded.
-                if js.has_pending_navigation() {
-                    break;
+                match self.js.as_ref() {
+                    Some(js) if js.has_pending_navigation() => break,
+                    Some(_) => {}
+                    None => break,
                 }
                 let now = tokio::time::Instant::now();
                 if now >= dynamic_deadline {
                     break;
                 }
-                let result = tokio::time::timeout(
-                    tokio::time::Duration::from_millis(10),
-                    js.run_event_loop(),
-                ).await;
+                let result = match self.js.as_mut() {
+                    Some(js) => {
+                        tokio::time::timeout(
+                            tokio::time::Duration::from_millis(10),
+                            js.run_event_loop(),
+                        ).await
+                    }
+                    None => break,
+                };
+
+                // A frame fetched during this loop has to be given its realm
+                // here, not after the loop ends. This is where a page waits out
+                // its post-load work, so "after" can be ten seconds later — long
+                // enough that a challenge frame's first message arrived after
+                // the page had given up on it. The borrow of `js` is re-taken
+                // each turn for exactly this reason.
+                let attached = self.attach_pending_frames().await;
+                let delivered = self.deliver_frame_messages();
+                if attached || delivered {
+                    // A frame that just started is async work, whatever the
+                    // request counters say; treat it as such so the loop does
+                    // not decide the page went idle while a frame is talking.
+                    saw_async_work = true;
+                    idle_since = None;
+                    idle_count = 0;
+                }
 
                 match result {
                     Ok(Ok(())) => {
@@ -914,7 +1014,11 @@ impl Page {
                                 self.http_client.active_requests()
                             }
                         };
-                        if active_requests == 0 && !js.has_pending_dynamic_scripts() {
+                        let pending_scripts = self
+                            .js
+                            .as_mut()
+                            .is_some_and(|js| js.has_pending_dynamic_scripts());
+                        if active_requests == 0 && !pending_scripts && !attached && !delivered {
                             if saw_async_work {
                                 let idle_start = idle_since.get_or_insert(now);
                                 if now.duration_since(*idle_start)
@@ -940,7 +1044,11 @@ impl Page {
                     Err(_) => idle_count = 0,
                 }
             }
-            js.disarm_watchdog(settle_wd);
+            if let Some(token) = settle_wd {
+                if let Some(js) = self.js.as_mut() {
+                    js.disarm_watchdog(token);
+                }
+            }
         }
         if let Some(token) = exec_wd {
             if let Some(js) = self.js.as_mut() {
@@ -948,12 +1056,16 @@ impl Page {
             }
         }
 
-        // Frames whose documents arrived during the settle above. Each round
-        // may reveal more, because a frame's own scripts can add frames; three
-        // rounds is deep enough for real nesting without letting a page that
-        // adds a frame per load event spin here forever.
+        // Frames whose documents arrived during the settle above, and the
+        // messages they and the page have for each other. Each round may reveal
+        // more, because a frame's own scripts can add frames and a delivered
+        // message can produce a reply; three rounds is deep enough for real
+        // nesting and for a handshake, without letting a page that adds a frame
+        // per load event spin here forever.
         for _ in 0..3 {
-            if !self.attach_pending_frames().await {
+            let attached = self.attach_pending_frames().await;
+            let delivered = self.deliver_frame_messages();
+            if !attached && !delivered {
                 break;
             }
             self.settle(500).await;
@@ -1024,12 +1136,43 @@ impl Page {
         if max_ms == 0 {
             return;
         }
-        if let Some(js) = &mut self.js {
+        // How long a frame may wait for the host to notice it. A frame is a
+        // live participant, not a resource: it and the page run a sequenced
+        // handshake, and each expects an answer within about a second.
+        //
+        // Attaching frames only after a whole settle had finished meant a
+        // challenge frame did not start until nine seconds in, by which point
+        // the page had sent ten heartbeats into a frame that did not exist yet
+        // and would not answer the reply it was waiting for. The loop still
+        // stops the moment there is nothing left to do, so a page without
+        // frames settles exactly as quickly as before.
+        const FRAME_ATTENTION_MS: u64 = 100;
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(max_ms);
+        loop {
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let remaining = (deadline - now).as_millis() as u64;
             // Bounded against both async idle and synchronous microtask storms:
             // a plain tokio timeout cannot preempt a page that pins the thread
             // inside V8 (the real-world SPA hang), so settle drives the loop
             // through the watchdog-guarded path.
-            let _ = js.run_event_loop_bounded(max_ms).await;
+            let idle = match self.js.as_mut() {
+                Some(js) => js
+                    .run_event_loop_slice(remaining.min(FRAME_ATTENTION_MS))
+                    .await
+                    .unwrap_or(true),
+                None => break,
+            };
+            let attached = self.attach_pending_frames().await;
+            let delivered = self.deliver_frame_messages();
+            // Nothing still running, and nothing handed over that could start
+            // something: waiting out the rest of the budget would only wait.
+            if idle && !attached && !delivered {
+                break;
+            }
         }
     }
 
@@ -1507,6 +1650,22 @@ impl Page {
         } else {
             self.evaluate(expression)
         }
+    }
+
+    /// The URL of every live child frame, in creation order.
+    pub fn frame_urls(&self) -> Vec<String> {
+        self.frames.iter().map(|frame| frame.url().to_string()).collect()
+    }
+
+    /// Evaluates an expression inside a child frame's own realm.
+    ///
+    /// Without this a frame is a black box: its scripts run, and the only
+    /// evidence of what they did is whatever they choose to send out. That has
+    /// twice been mistaken for a frame not running at all.
+    pub fn evaluate_in_frame(&mut self, index: usize, expression: &str) -> serde_json::Value {
+        let Some(js) = self.js.as_mut() else { return serde_json::Value::Null };
+        let Some(frame) = self.frames.get(index) else { return serde_json::Value::Null };
+        frame.evaluate(js, expression).unwrap_or(serde_json::Value::Null)
     }
 
     pub fn evaluate(&mut self, expression: &str) -> serde_json::Value {

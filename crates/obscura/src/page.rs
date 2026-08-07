@@ -39,6 +39,17 @@ impl Page {
         self.inner.evaluate(expression)
     }
 
+    /// The URL of every live child frame, in creation order.
+    pub fn frame_urls(&self) -> Vec<String> {
+        self.inner.frame_urls()
+    }
+
+    /// Execute JS inside a child frame's own realm, addressed by its position
+    /// in [`Self::frame_urls`]. Returns null if there is no such frame.
+    pub fn evaluate_in_frame(&mut self, index: usize, expression: &str) -> Value {
+        self.inner.evaluate_in_frame(index, expression)
+    }
+
     /// Get page HTML content.
     pub fn content(&mut self) -> String {
         let val = self.evaluate("document.documentElement.outerHTML");

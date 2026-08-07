@@ -3589,24 +3589,143 @@ function _activateScriptSrc(el) {
   _activateInsertedNode(el);
 }
 
+// ===== postMessage between browsing contexts =====
+//
+// A frame and the page holding it are separate v8 contexts, so neither side can
+// reach the other's listeners on its own. Both hand the message to the host,
+// which dispatches it into the target realm. This is the only route a
+// cross-origin frame has for reporting anything, so without it a widget runs
+// perfectly and its answer goes nowhere — indistinguishable, from the page, from
+// the widget never having started.
+//
+// Declared here rather than assigned by the host so that the snapshot-time hide
+// list picks them up; a global the host adds later would stay enumerable and be
+// visible on `window`.
+globalThis.__obscura_frameId = 0;        // 0 is the page's own realm
+globalThis.__obscura_parentFrameId = 0;
+globalThis.__obscura_frameWindows = Object.create(null); // frame id -> its window
+
+function _realmOrigin() {
+  try { return new URL(_documentUrl()).origin; } catch (_) { return 'null'; }
+}
+
+function _sendRealmMessage(targetFrameId, data) {
+  let json;
+  // Structured clone cannot cross realms here. JSON carries what postMessage is
+  // actually used for; anything else throws the same DataCloneError a browser
+  // throws for an unclonable value, rather than arriving silently as null.
+  try {
+    json = JSON.stringify({ v: data === undefined ? null : data });
+  } catch (_) {
+    throw new DOMException('The object could not be cloned.', 'DataCloneError');
+  }
+  if (json === undefined) json = '{"v":null}';
+  _denoCore.ops.op_post_frame_message(
+    targetFrameId >>> 0, globalThis.__obscura_frameId >>> 0, _realmOrigin(), json);
+}
+
+// The host calls this inside the target realm.
+globalThis.__obscura_deliverMessage = function(dataJson, origin, sourceFrameId) {
+  let data = null;
+  try { data = JSON.parse(dataJson).v; } catch (_) {}
+  // Who to reply to: the frame above, or one of the frames below.
+  const source = (globalThis.__obscura_frameId !== 0
+                  && sourceFrameId === globalThis.__obscura_parentFrameId)
+    ? globalThis.parent
+    : (globalThis.__obscura_frameWindows[sourceFrameId] || null);
+  try {
+    globalThis.dispatchEvent(new MessageEvent('message', { data, origin, source }));
+  } catch (error) {
+    console.error('message listener failed:', error && error.message || error);
+  }
+};
+
+// A window in another browsing context, as seen from this one.
+//
+// Only the cross-origin surface is exposed: reaching synchronously into another
+// realm's DOM is not something this engine does, and a browser forbids it across
+// origins anyway. Widgets use postMessage regardless — it is what it is for.
+class _RemoteWindow {
+  constructor(frameId) {
+    Object.defineProperty(this, '_frameId', { value: frameId, enumerable: false });
+  }
+  postMessage(data, _targetOrigin, _transfer) { _sendRealmMessage(this._frameId, data); }
+  get self() { return this; }
+  get window() { return this; }
+  get frames() { return this; }
+  get parent() { return this; }
+  get top() { return this; }
+  get opener() { return null; }
+  get closed() { return false; }
+  get length() { return 0; }
+  focus() {}
+  blur() {}
+  close() {}
+}
+_markNative(_RemoteWindow.prototype.postMessage);
+
+const _remoteWindows = new Map();
+function _remoteWindow(frameId) {
+  let win = _remoteWindows.get(frameId);
+  if (!win) {
+    win = new _RemoteWindow(frameId);
+    _remoteWindows.set(frameId, win);
+  }
+  return win;
+}
+
+// Installs `parent` and `top` for a framed document. Called from
+// __obscura_init, before any of the document's own scripts run: `parent ===
+// window` is how a document decides it is top-level, and one script taking that
+// branch wrongly is enough to change everything after it.
+function _installFramingRelationships() {
+  if (!globalThis.__obscura_frameId) return; // the page really is the top
+  for (const [name, frameId] of [
+    ['parent', globalThis.__obscura_parentFrameId],
+    ['top', 0], // the top browsing context is always the page's realm
+  ]) {
+    try {
+      Object.defineProperty(globalThis, name, {
+        value: _remoteWindow(frameId),
+        writable: false,
+        enumerable: true,
+        configurable: true,
+      });
+    } catch (_) {}
+  }
+}
+
 function _loadIframeSrc(el, url) {
   let fullUrl = url;
   if (!url.includes('://')) {
     try { fullUrl = new URL(url, _domParse('document_url') || 'about:blank').href; } catch (_) {}
   }
+  const _frameFetchStarted = Date.now();
   _fetchFrameDocument(fullUrl).then(result => {
     // Record the outcome. A failed frame load used to be indistinguishable from
     // a successful one, because both ended in an empty document and a `load`
     // event, which made frame problems invisible when debugging.
     el._iframeLoadInfo = {
       ok: true, status: result.status, url: result.url, length: result.html.length,
+      fetchMs: Date.now() - _frameFetchStarted,
     };
     // Hand the document to the host, which gives this frame a realm of its own
     // and runs the scripts that came with it. The shim document below stays for
     // now: it is what the parent still reads through contentDocument.
     el._frameId = _denoCore.ops.op_frame_document_ready(result.url, result.html);
     el._iframeDoc = new _IframeDocument(result.html, result.url, el);
-    el._iframeWin = new _IframeWindow(el._iframeDoc, result.url);
+    // Reuse the window object if the page already took one, so a reference
+    // captured before the load still identifies this frame. Binding it to the
+    // realm the host just queued is what makes posting into the frame reach the
+    // frame's own listeners, and makes a message coming back out arrive with
+    // this window as its `source`.
+    if (el._iframeWin) {
+      el._iframeWin._adopt(el._iframeDoc, result.url, el._frameId);
+    } else {
+      el._iframeWin = new _IframeWindow(el._iframeDoc, result.url);
+      el._iframeWin._frameId = el._frameId;
+    }
+    globalThis.__obscura_frameWindows[el._frameId] = el._iframeWin;
     el.dispatchEvent(new Event('load'));
   }).catch(error => {
     el._iframeLoadInfo = { ok: false, error: String(error && error.message || error) };
@@ -5972,7 +6091,27 @@ globalThis.PopStateEvent = class extends Event {
   }
 };
 globalThis.HashChangeEvent = class extends Event {};
-globalThis.MessageEvent = class extends Event { constructor(t,o={}) { super(t,o);this.data=o.data; } };
+// `data` alone is not enough to act on a message. A listener that accepts
+// anything from anywhere is the bug every embedding guide warns about, so real
+// handlers check `origin` first and reply through `source` — and a handler that
+// finds both undefined drops the message rather than trusting it.
+globalThis.MessageEvent = class MessageEvent extends Event {
+  constructor(type, init = {}) {
+    super(type, init);
+    this.data = 'data' in init ? init.data : null;
+    this.origin = init.origin || '';
+    this.lastEventId = init.lastEventId || '';
+    this.source = init.source || null;
+    this.ports = Object.freeze(init.ports ? [...init.ports] : []);
+  }
+  initMessageEvent(type, bubbles, cancelable, data, origin, lastEventId, source, ports) {
+    this.data = data;
+    this.origin = origin || '';
+    this.lastEventId = lastEventId || '';
+    this.source = source || null;
+    this.ports = Object.freeze(ports ? [...ports] : []);
+  }
+};
 globalThis.ProgressEvent = class ProgressEvent extends Event {
   constructor(type, init) {
     super(type, init || {});
@@ -7602,15 +7741,35 @@ class _IframeWindow {
     }
   }
 
-  postMessage(data, origin) {
-    const event = new MessageEvent('message', {
-      data: data,
-      origin: this.location.origin,
-      source: this,
-    });
-    Promise.resolve().then(() => {
-      globalThis.dispatchEvent?.(event);
-    });
+  // Into the frame, not back into the page. This used to dispatch the message
+  // on the parent's own window, so a page configuring a widget was only ever
+  // talking to itself and the frame heard nothing.
+  postMessage(data, _targetOrigin, _transfer) {
+    if (this._frameId) _sendRealmMessage(this._frameId, data);
+  }
+
+  // Point this window at the document that has just finished loading, keeping
+  // the window object itself.
+  //
+  // A browser's `contentWindow` is the same WindowProxy before and after a
+  // frame navigates. Scripts rely on that: an embedder takes `contentWindow`
+  // the moment it creates the iframe, and later compares it against
+  // `event.source` to decide whether a message really came from its own frame.
+  // Handing out a fresh object on load makes that comparison fail, and the
+  // symptom is not an error — the embedder simply ignores its frame.
+  _adopt(doc, url, frameId) {
+    this.document = doc;
+    this._url = url;
+    this._frameId = frameId;
+    try {
+      const u = new URL(url);
+      this.location = {
+        href: url, origin: u.origin, protocol: u.protocol,
+        host: u.host, hostname: u.hostname, port: u.port,
+        pathname: u.pathname, search: u.search, hash: u.hash,
+        toString() { return url; }, assign(){}, reload(){}, replace(){},
+      };
+    } catch (_) { /* keep whatever location it had */ }
   }
 
   setTimeout(fn, ms) { return globalThis.setTimeout(fn, ms); }
@@ -8592,7 +8751,19 @@ globalThis.prompt = function() { return null; }; _markNative(globalThis.prompt);
 globalThis.open = function() { return null; }; _markNative(globalThis.open);
 globalThis.close = function() {}; _markNative(globalThis.close);
 globalThis.stop = function() {}; _markNative(globalThis.stop);
-globalThis.postMessage = function() {}; _markNative(globalThis.postMessage);
+// window.postMessage to one's own window is a real delivery, not a no-op: it is
+// a common way to schedule a task that yields to the event loop, and code that
+// waits for the echo hangs forever if it never arrives. Asynchronous, as the
+// spec requires — a listener must not run before the caller returns.
+globalThis.postMessage = function(data, _targetOrigin, _transfer) {
+  const origin = _realmOrigin();
+  setTimeout(() => {
+    globalThis.dispatchEvent(new MessageEvent('message', {
+      data, origin, source: globalThis,
+    }));
+  }, 0);
+};
+_markNative(globalThis.postMessage);
 globalThis.requestIdleCallback = globalThis.requestIdleCallback || function(cb) { return setTimeout(cb, 0); };
 globalThis.cancelIdleCallback = globalThis.cancelIdleCallback || function(id) { clearTimeout(id); };
 if (typeof ReadableStream === 'undefined') {
@@ -9409,6 +9580,10 @@ globalThis.__obscura_init = function() {
     usedJSHeapSize: Math.floor(_totalHeap * (0.3 + _fpRand(621) * 0.5)),
   };
   globalThis.Notification.permission = "default";
+
+  // Before anything else in this document runs: a framed document must not
+  // spend even one script believing it is the top browsing context.
+  _installFramingRelationships();
 
   // An <iframe src> that came from the parsed document never went through
   // setAttribute, so nothing would ever start its load. The parser is what

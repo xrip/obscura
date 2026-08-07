@@ -56,6 +56,7 @@ impl FrameRealm {
     pub fn new(
         parent: &mut ObscuraJsRuntime,
         frame_id: u32,
+        parent_frame_id: u32,
         url: &str,
         html: &str,
     ) -> Option<Self> {
@@ -68,6 +69,7 @@ impl FrameRealm {
         let mut state = ObscuraState::new();
         state.dom = Some(parse_html(html));
         state.url = url.to_string();
+        state.frame_id = frame_id;
         parent.share_resources_with(&mut state);
 
         let realms = parent.realm_states();
@@ -82,9 +84,61 @@ impl FrameRealm {
             url: url.to_string(),
             origin: origin_of(url),
         };
-        // Registered first, so this already builds the frame's own document.
-        realm.run(parent, "globalThis.__obscura_init();").ok()?;
+        // Both ids before init, not after: init is what installs `parent` and
+        // `top`, and a document that runs even one script believing it is
+        // top-level has already taken the wrong branch.
+        realm
+            .run(
+                parent,
+                &format!(
+                    "globalThis.__obscura_frameId = {frame_id};\
+                     globalThis.__obscura_parentFrameId = {parent_frame_id};\
+                     globalThis.__obscura_init();"
+                ),
+            )
+            .ok()?;
         Some(realm)
+    }
+
+    /// Fires the frame document's lifecycle events, in spec order.
+    ///
+    /// The page's own document gets these; a frame's did not, and a document
+    /// that is never told it finished loading will not run any of the work
+    /// scripts defer until then. That is most of what a widget does — a frame
+    /// can talk to its parent perfectly and still never build its interface,
+    /// which looks like a rendering problem and is a lifecycle one.
+    pub fn dispatch_load_events(&self, parent: &mut ObscuraJsRuntime) -> Result<(), String> {
+        self.execute_script(
+            parent,
+            "globalThis.__documentReadyState__ = 'interactive';\
+             try { document.dispatchEvent(new Event('DOMContentLoaded', \
+                 { bubbles: false, cancelable: false })); } catch (_) {}\
+             try { window.dispatchEvent(new Event('DOMContentLoaded', \
+                 { bubbles: false, cancelable: false })); } catch (_) {}\
+             globalThis.__documentReadyState__ = 'complete';\
+             try { document.dispatchEvent(new Event('readystatechange')); } catch (_) {}\
+             if (typeof window.onload === 'function') { try { window.onload(); } catch (_) {} }\
+             try { window.dispatchEvent(new Event('load', \
+                 { bubbles: false, cancelable: false })); } catch (_) {}",
+        )
+    }
+
+    /// Delivers a `postMessage` that another realm sent to this one.
+    pub fn deliver_message(
+        &self,
+        parent: &mut ObscuraJsRuntime,
+        data_json: &str,
+        origin: &str,
+        source_frame_id: u32,
+    ) -> Result<(), String> {
+        self.execute_script(
+            parent,
+            &format!(
+                "globalThis.__obscura_deliverMessage({}, {}, {source_frame_id});",
+                encode_json_argument(data_json),
+                encode_json_argument(origin),
+            ),
+        )
     }
 
     pub fn frame_id(&self) -> u32 {
@@ -244,6 +298,12 @@ impl DocumentScript {
     }
 }
 
+/// Embeds a string in JavaScript source as a literal, so a payload holding
+/// quotes or newlines cannot end the literal and be read as code.
+fn encode_json_argument(value: &str) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string())
+}
+
 /// Serializes an origin the way `location.origin` does, using `"null"` for
 /// schemes that have no tuple origin.
 fn origin_of(url: &str) -> String {
@@ -283,9 +343,10 @@ mod tests {
             .unwrap();
 
         let frame = FrameRealm::new(
-            &mut parent,
-            1,
-            "https://child.example/frame",
+                    &mut parent,
+                    1,
+                    0,
+                    "https://child.example/frame",
             "<html><body><h1>Child</h1></body></html>",
         )
         .expect("frame realm");
@@ -341,9 +402,10 @@ mod tests {
         parent.run_page_init();
 
         let frame = FrameRealm::new(
-            &mut parent,
-            1,
-            "https://child.example/f",
+                    &mut parent,
+                    1,
+                    0,
+                    "https://child.example/f",
             "<html><body></body></html>",
         )
         .expect("frame realm");
@@ -371,9 +433,10 @@ mod tests {
     fn frame_runs_its_document_scripts_in_order() {
         let mut parent = page("https://parent.example/", "<html><body></body></html>");
         let frame = FrameRealm::new(
-            &mut parent,
-            1,
-            "https://child.example/dir/page",
+                    &mut parent,
+                    1,
+                    0,
+                    "https://child.example/dir/page",
             r#"<html><body><div id="out"></div>
                <script>window.log = ['inline1'];</script>
                <script src="first.js"></script>
@@ -421,9 +484,10 @@ mod tests {
     fn one_bad_frame_script_does_not_stop_the_rest() {
         let mut parent = page("https://parent.example/", "<html><body></body></html>");
         let frame = FrameRealm::new(
-            &mut parent,
-            1,
-            "https://child.example/",
+                    &mut parent,
+                    1,
+                    0,
+                    "https://child.example/",
             r#"<html><body>
                <script>window.log = ['a'];</script>
                <script>throw new Error('boom');</script>
@@ -457,6 +521,7 @@ mod tests {
                 FrameRealm::new(
                     &mut parent,
                     index,
+                    0,
                     &format!("https://f{index}.example/"),
                     &format!("<html><body><h1>{index}</h1></body></html>"),
                 )
@@ -492,9 +557,10 @@ mod tests {
     async fn a_frames_deferred_work_still_sees_the_frames_document() {
         let mut parent = page("https://parent.example/", "<html><body></body></html>");
         let frame = FrameRealm::new(
-            &mut parent,
-            1,
-            "https://child.example/",
+                    &mut parent,
+                    1,
+                    0,
+                    "https://child.example/",
             "<html><body></body></html>",
         )
         .expect("frame realm");
@@ -528,7 +594,11 @@ mod tests {
     #[test]
     fn opaque_origin_frames_are_never_same_origin() {
         let mut parent = page("https://parent.example/", "<html><body></body></html>");
-        let frame = FrameRealm::new(&mut parent, 1, "about:blank", "<html><body></body></html>")
+        let frame = FrameRealm::new(
+                    &mut parent,
+                    1,
+                    0,
+                    "about:blank", "<html><body></body></html>")
             .expect("frame realm");
         assert_eq!(frame.origin(), "null");
         assert!(!frame.is_same_origin_as("null"));

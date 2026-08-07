@@ -226,6 +226,14 @@ pub struct ObscuraState {
     // event loop turns. Same shape as `pending_binding_calls`.
     pub pending_frames: Vec<PendingFrame>,
     pub frame_id_counter: u32,
+    /// Which frame this state belongs to; 0 is the page's own realm.
+    pub frame_id: u32,
+    // postMessage traffic between realms, waiting to be delivered. A realm
+    // cannot reach another realm's context on its own, so the message is queued
+    // here and the Page dispatches it, the same way frames themselves are
+    // built. Queued on the *page's* state whichever realm sent it, so one drain
+    // sees the traffic of the whole tree.
+    pub pending_frame_messages: Vec<PendingFrameMessage>,
 }
 
 /// A frame document waiting to be given a realm.
@@ -233,6 +241,23 @@ pub struct PendingFrame {
     pub frame_id: u32,
     pub url: String,
     pub html: String,
+    /// The frame that holds this one; 0 when the page does.
+    pub parent_frame_id: u32,
+}
+
+/// One `postMessage` in flight between two realms.
+pub struct PendingFrameMessage {
+    /// Where it is going. 0 is the page's realm.
+    pub target_frame_id: u32,
+    /// Where it came from, so the receiver can reply through `event.source`.
+    pub source_frame_id: u32,
+    /// The sender's origin, for `event.origin`.
+    pub origin: String,
+    /// The payload, JSON encoded. Structured clone is not available across
+    /// realms here, and JSON covers what postMessage is used for in practice:
+    /// a widget reporting a result. Anything it cannot encode is dropped by the
+    /// sender rather than silently arriving as null.
+    pub data_json: String,
 }
 
 impl ObscuraState {
@@ -261,6 +286,8 @@ impl ObscuraState {
             js_network_events: Vec::new(),
             pending_frames: Vec::new(),
             frame_id_counter: 0,
+            frame_id: 0,
+            pending_frame_messages: Vec::new(),
         }
     }
 }
@@ -1908,10 +1935,15 @@ async fn op_sleep(#[number] millis: u64) {
 // have. The realm itself is built later, by whoever owns the runtime.
 #[op2(fast)]
 fn op_frame_document_ready(
+    scope: &mut v8::HandleScope,
     state: &OpState,
     #[string] url: &str,
     #[string] html: &str,
 ) -> u32 {
+    // Whoever called this is the new frame's parent, which is how a frame
+    // nested two deep gets `parent` pointing at the frame above it rather than
+    // at the page.
+    let parent_frame_id = realm_state(scope, state).borrow().frame_id;
     let gs = state.borrow::<SharedState>().clone();
     let mut gs = gs.borrow_mut();
     gs.frame_id_counter += 1;
@@ -1920,8 +1952,37 @@ fn op_frame_document_ready(
         frame_id,
         url: url.to_string(),
         html: html.to_string(),
+        parent_frame_id,
     });
     frame_id
+}
+
+// Queues one postMessage for another realm. Always on the page's state, never
+// the caller's: the Page drains a single queue, and a message sent by a nested
+// frame would otherwise sit in that frame's own state and never be looked at.
+#[op2(fast)]
+fn op_post_frame_message(
+    state: &OpState,
+    target_frame_id: u32,
+    source_frame_id: u32,
+    #[string] origin: &str,
+    #[string] data_json: &str,
+) {
+    tracing::debug!(
+        "postMessage {} -> {}: {}",
+        source_frame_id,
+        target_frame_id,
+        &data_json[..data_json.len().min(120)],
+    );
+    let gs = state.borrow::<SharedState>().clone();
+    gs.borrow_mut()
+        .pending_frame_messages
+        .push(PendingFrameMessage {
+            target_frame_id,
+            source_frame_id,
+            origin: origin.to_string(),
+            data_json: data_json.to_string(),
+        });
 }
 
 // Records a binding call from page JS. The CDP layer drains this queue
@@ -2407,6 +2468,7 @@ pub fn build_extension() -> Extension {
             op_sleep(),
             op_binding_called(),
             op_frame_document_ready(),
+            op_post_frame_message(),
             op_subtle_digest(),
             op_subtle_hmac(),
             op_subtle_aes_gcm(),

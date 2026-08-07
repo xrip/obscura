@@ -537,11 +537,16 @@ impl ObscuraJsRuntime {
         std::mem::take(&mut self.state.borrow_mut().pending_binding_calls)
     }
 
-    /// Frame documents fetched by the page that still need a realm. Only the
-    /// page's own state is drained here, so a frame inside a frame stays queued
-    /// until nested frames are wired up.
+    /// Frame documents fetched by any realm that still need one of their own.
+    /// The op queues onto the page's state whichever frame asked, so a frame
+    /// nested inside a frame is drained here too.
     pub fn take_pending_frames(&self) -> Vec<crate::ops::PendingFrame> {
         std::mem::take(&mut self.state.borrow_mut().pending_frames)
+    }
+
+    /// postMessage traffic waiting to be delivered to another realm.
+    pub fn take_pending_frame_messages(&self) -> Vec<crate::ops::PendingFrameMessage> {
+        std::mem::take(&mut self.state.borrow_mut().pending_frame_messages)
     }
 
     pub fn get_network_response_body(&self, request_id: &str) -> Option<StoredNetworkResponseBody> {
@@ -1333,20 +1338,37 @@ impl ObscuraJsRuntime {
     /// storm that pins the thread is terminated ~500ms past the budget; a
     /// well-behaved page returns as soon as the loop goes idle.
     pub async fn run_event_loop_bounded(&mut self, budget_ms: u64) -> Result<(), String> {
+        self.run_event_loop_slice(budget_ms).await.map(|_| ())
+    }
+
+    /// Like [`Self::run_event_loop_bounded`], but reports whether the loop ran
+    /// out of work (`true`) or the budget ran out first (`false`).
+    ///
+    /// The bounded form answers `Ok` either way, which is fine for a caller
+    /// that only wants to wait, and useless for one that drives the loop in
+    /// slices: it needs to tell "there is nothing left to do" from "come back
+    /// in a moment", and stopping on the wrong one either hangs or truncates.
+    pub async fn run_event_loop_slice(&mut self, budget_ms: u64) -> Result<bool, String> {
         if budget_ms == 0 {
-            return self.run_event_loop().await;
+            return self.run_event_loop().await.map(|_| true);
         }
         let budget = std::time::Duration::from_millis(budget_ms);
         let token = self.arm_watchdog(budget + std::time::Duration::from_millis(500));
         let result = tokio::time::timeout(budget, self.run_event_loop()).await;
         self.disarm_watchdog(token);
         match result {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) if e.contains("execution terminated") => Ok(()),
+            Ok(Ok(())) => Ok(true),
+            Ok(Err(e)) if e.contains("execution terminated") => Ok(true),
             Ok(Err(e)) => Err(e),
             // tokio idle-timeout is the normal "settled" exit, not an error.
-            Err(_) => Ok(()),
+            Err(_) => Ok(false),
         }
+    }
+
+    /// Whether any frame document or cross-realm message is waiting on the host.
+    pub fn has_frame_work(&self) -> bool {
+        let state = self.state.borrow();
+        !state.pending_frames.is_empty() || !state.pending_frame_messages.is_empty()
     }
 
     /// Like [`Self::evaluate`] but bounded by a V8 watchdog, so a `--eval`
