@@ -624,6 +624,69 @@ mod tests {
         }
     }
 
+    /// The click point Playwright uses comes from DOM.getContentQuads. If it
+    /// disagrees with the rect the page reports, every click lands somewhere
+    /// else, the hit test rejects it, and actionability spins until it times
+    /// out — with nothing in the page to show for it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn content_quads_match_the_rect_the_page_reports() {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session = Some("session-quads".to_string());
+        ctx.sessions.insert("session-quads".to_string(), page_id);
+        {
+            let page = ctx.get_session_page_mut(&session).unwrap();
+            page.navigate("about:blank").await.unwrap();
+            page.evaluate(
+                "document.body.innerHTML = '<a id=\"t\" href=\"/x\">card</a><a id=\"u\">other</a>'",
+            );
+        }
+
+        let node_id = ctx
+            .get_session_page_mut(&session)
+            .unwrap()
+            .evaluate("globalThis.__obscura_nodeId(document.getElementById('t'))")
+            .as_f64()
+            .map(|n| n as u64)
+            .expect("node id");
+
+        let quads = handle("getContentQuads", &json!({ "nodeId": node_id }), &mut ctx, &session)
+            .await
+            .expect("getContentQuads");
+        let quad = quads["quads"][0].as_array().expect("a quad").clone();
+        let corners = (
+            quad[0].as_f64().unwrap(),
+            quad[1].as_f64().unwrap(),
+            quad[4].as_f64().unwrap(),
+            quad[5].as_f64().unwrap(),
+        );
+
+        let rect = ctx.get_session_page_mut(&session).unwrap().evaluate(
+            "(function() { const r = document.getElementById('t').getBoundingClientRect();
+              return [r.left, r.top, r.right, r.bottom]; })()",
+        );
+        let rect = rect.as_array().expect("rect").clone();
+        assert_eq!(
+            corners,
+            (
+                rect[0].as_f64().unwrap(),
+                rect[1].as_f64().unwrap(),
+                rect[2].as_f64().unwrap(),
+                rect[3].as_f64().unwrap(),
+            ),
+            "the quad and the page disagree about where the element is"
+        );
+
+        // And the centre of that quad has to hit the element itself.
+        let hit = ctx.get_session_page_mut(&session).unwrap().evaluate(&format!(
+            "(function() {{ const h = document.elementFromPoint({}, {});
+              return h ? (h.id || h.tagName) : 'null'; }})()",
+            (corners.0 + corners.2) / 2.0,
+            (corners.1 + corners.3) / 2.0,
+        ));
+        assert_eq!(hit, json!("t"), "the quad's centre does not hit the element");
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn scroll_into_view_if_needed_requires_a_node_identifier() {
         let mut ctx = CdpContext::new();

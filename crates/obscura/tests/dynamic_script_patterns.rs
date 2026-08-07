@@ -258,3 +258,51 @@ async fn every_element_is_found_at_its_own_centre() {
         "elements not found at their own centre: {report}"
     );
 }
+
+/// What does a card anchor inside real markup report? A stylesheet, wrappers,
+/// and an image inside the link, which is the shape every product grid uses.
+#[tokio::test(flavor = "current_thread")]
+async fn a_card_anchor_in_realistic_markup_is_clickable() {
+    let browser = Browser::new().unwrap();
+    let mut page = browser.new_page().await.unwrap();
+    page.goto("about:blank").await.unwrap();
+    let report = page.evaluate(
+        r#"(function() {
+            document.head.innerHTML =
+                '<style>.card{position:relative}.card img{width:100%}.hid{display:none}</style>';
+            document.body.innerHTML =
+                '<div class="feed">' +
+                '<article class="card"><a href="/catalog/1/detail.aspx" id="c1">' +
+                '<img src="/x.webp"><span>Product one</span></a></article>' +
+                '<article class="card"><a href="/catalog/2/detail.aspx" id="c2">' +
+                '<img src="/y.webp"><span>Product two</span></a></article>' +
+                '<article class="card hid"><a href="/catalog/3/detail.aspx" id="c3">gone</a></article>' +
+                '</div>';
+            const a = document.getElementById('c1');
+            a.scrollIntoView();
+            const r = a.getBoundingClientRect();
+            const style = getComputedStyle(a);
+            const hit = document.elementFromPoint(
+                Math.round(r.left + r.width / 2), Math.round(r.top + r.height / 2));
+            let inTarget = false;
+            for (let n = hit; n; n = n.parentElement) if (n === a) { inTarget = true; break; }
+            return JSON.stringify({
+                width: r.width, height: r.height,
+                display: style.display, visibility: style.visibility,
+                hit: hit ? (hit.id || hit.tagName) : 'null',
+                inTarget,
+            });
+        })()"#,
+    );
+    let report: serde_json::Value =
+        serde_json::from_str(report.as_str().expect("report")).unwrap();
+    assert!(
+        report["width"].as_f64().unwrap_or(0.0) > 0.0
+            && report["height"].as_f64().unwrap_or(0.0) > 0.0,
+        "a card anchor has no box, so nothing can click it: {report}"
+    );
+    assert_eq!(
+        report["inTarget"], serde_json::json!(true),
+        "the anchor is not what is found at its own centre: {report}"
+    );
+}
