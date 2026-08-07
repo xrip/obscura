@@ -214,3 +214,36 @@ async fn a_click_arrives_with_the_events_a_real_one_would() {
         assert_eq!(point, centre, "{event} did not land on the element's centre");
     }
 }
+
+/// The invariant every click depends on: an element is found at its own centre.
+#[tokio::test(flavor = "current_thread")]
+async fn every_element_is_found_at_its_own_centre() {
+    let browser = Browser::new().unwrap();
+    let mut page = browser.new_page().await.unwrap();
+    page.goto("about:blank").await.unwrap();
+    let report = page.evaluate(
+        r#"(function() {
+            const parts = [];
+            for (let i = 0; i < 400; i++) parts.push('<a href="/p' + i + '" id="a' + i + '">card ' + i + '</a>');
+            document.body.innerHTML = parts.join('');
+            const bad = [];
+            for (let i = 0; i < 400; i++) {
+                const el = document.getElementById('a' + i);
+                el.scrollIntoView();
+                const r = el.getBoundingClientRect();
+                const hit = document.elementFromPoint(
+                    Math.round(r.left + r.width / 2), Math.round(r.top + r.height / 2));
+                if (hit !== el) {
+                    bad.push('a' + i + ' -> ' + (hit ? (hit.id || hit.tagName) : 'null'));
+                }
+            }
+            return JSON.stringify({ bad: bad.length, first: bad.slice(0, 5) });
+        })()"#,
+    );
+    let report: serde_json::Value =
+        serde_json::from_str(report.as_str().expect("report")).unwrap();
+    assert_eq!(
+        report["bad"], serde_json::json!(0),
+        "elements not found at their own centre: {report}"
+    );
+}
