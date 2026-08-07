@@ -7,7 +7,7 @@ use anyhow::{bail, Context, Result};
 use reqwest::header::ACCEPT;
 use serde::Deserialize;
 
-const DATABASE_NAME: &str = "BotBrowser-GeoIP.mmdb";
+const DATABASE_NAME: &str = "geoip.mmdb";
 const EXIT_IP_URL: &str = "http://ifconfig.io/ip";
 const EXIT_IP_LIMIT: u64 = 128;
 
