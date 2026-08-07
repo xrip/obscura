@@ -1972,7 +1972,7 @@ fn op_post_frame_message(
         "postMessage {} -> {}: {}",
         source_frame_id,
         target_frame_id,
-        &data_json[..data_json.len().min(120)],
+        &data_json[..data_json.len().min(200)],
     );
     let gs = state.borrow::<SharedState>().clone();
     gs.borrow_mut()
