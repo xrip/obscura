@@ -6,6 +6,7 @@
 //     --only <engine>    "chrome" or "obscura"
 //     --proxy <url>      send both engines through the same proxy
 //     --wait <seconds>   how long to wait for a card to render (default 20)
+//     --goto             navigate by URL instead of clicking the card
 //     --headed           show the Chrome window
 //
 // Open the home page, pick N product links at random, and visit each one.
@@ -15,6 +16,11 @@
 // rate limited — which then looks exactly like a fingerprinting failure. A card
 // reached from the home page also has a referer, a warm connection and the
 // cookies the site just set, so a failure here is much more likely to be ours.
+//
+// Cards are reached by clicking them, not by navigating to their URL. A click
+// runs the site's own router and fires the pointer events a behavioural
+// detector watches; a goto skips all of it and tests much less than it looks
+// like it does. --goto keeps the weaker path for comparison.
 //
 // A card counts as opened only if its own id appears in the rendered text. That
 // is the field that fails when the page hydrates but the card does not, and it
@@ -40,6 +46,7 @@ function parseArgs(argv) {
     else if (arg === '--only') opts.only = argv[++i];
     else if (arg === '--proxy') opts.proxy = argv[++i];
     else if (arg === '--wait') opts.wait = Number(argv[++i]);
+    else if (arg === '--goto') opts.goto = true;
   }
   return opts;
 }
@@ -96,8 +103,31 @@ async function journey(page, log) {
     let opened = null;
     let bodyLength = 0;
     let failure = null;
+    let how = opts.goto ? 'goto' : 'click';
     try {
-      await page.goto(url, { waitUntil: 'load', timeout: 90000 });
+      if (opts.goto) {
+        await page.goto(url, { waitUntil: 'load', timeout: 90000 });
+      } else {
+        // Back to the page holding the card, then click the real anchor.
+        if (!page.url().startsWith(HOME) || !(await page.$(`a[href*="/catalog/${id}/"]`))) {
+          await page.goto(HOME, { waitUntil: 'load', timeout: 90000 });
+          await new Promise(done => setTimeout(done, 2000));
+        }
+        const card = page.locator(`a[href*="/catalog/${id}/"]`).first();
+        await card.scrollIntoViewIfNeeded({ timeout: 15000 });
+        await new Promise(done => setTimeout(done, 400 + Math.random() * 600));
+        await card.click({ timeout: 15000 });
+        // The site may route client side or navigate; either way the URL has
+        // to end up on this card.
+        for (let tick = 0; tick < 40; tick++) {
+          if (page.url().includes(`/catalog/${id}/`)) break;
+          await new Promise(done => setTimeout(done, 500));
+        }
+        if (!page.url().includes(`/catalog/${id}/`)) {
+          how = 'click(no-nav)';
+          throw new Error(`click did not reach the card, still at ${page.url().slice(0, 80)}`);
+        }
+      }
       for (let second = 1; second <= opts.wait; second++) {
         await new Promise(done => setTimeout(done, 1000));
         const found = await tryEvaluate(page, needle =>
@@ -109,8 +139,8 @@ async function journey(page, log) {
     } catch (error) {
       failure = String(error).split('\n')[0].slice(0, 160);
     }
-    steps.push({ step: 'card', id, opened, bodyLength, failure, ok: opened !== null });
-    log(`card ${id}: ${failure ? `FAILED ${failure}` : opened !== null
+    steps.push({ step: 'card', id, how, opened, bodyLength, failure, ok: opened !== null });
+    log(`card ${id} via ${how}: ${failure ? `FAILED ${failure}` : opened !== null
       ? `opened after ${opened}s (${bodyLength} chars)` : `NEVER rendered (${bodyLength} chars)`}`);
   }
   return steps;
