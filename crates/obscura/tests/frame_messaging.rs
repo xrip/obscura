@@ -229,6 +229,45 @@ async fn a_frames_window_is_the_same_object_before_and_after_it_loads() {
     );
 }
 
+/// A delivered message must be trusted, and a page-built one must not be.
+///
+/// `isTrusted` says the user agent produced the event rather than script. A
+/// postMessage arrives that way, and real embedders check: Cloudflare's
+/// Turnstile drops every message from its own frame unless the flag is set, so
+/// an untrusted one is not merely suspicious, it is discarded in silence and
+/// the widget waits forever. Answering `true` for everything would be just as
+/// wrong — a trivial bot tell — so the negative half is checked too.
+#[tokio::test(flavor = "current_thread")]
+async fn a_delivered_message_is_trusted_and_a_forged_one_is_not() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let base = spawn_server("<script>parent.postMessage({ real: true }, '*');</script>");
+
+    let browser = Browser::new().unwrap();
+    let mut page = browser.new_page().await.unwrap();
+    page.goto(&base).await.unwrap();
+
+    let trusted = settle_for(
+        &mut page,
+        "(window.fromFrame || []).some(e => e.data && e.data.real) \
+         ? (window.fromFrame.find(e => e.data && e.data.real).isTrusted ? 'yes' : 'no') \
+         : null",
+    )
+    .await;
+    assert_eq!(
+        trusted,
+        serde_json::json!("yes"),
+        "a message delivered from a frame was not trusted, so an embedder that \
+         checks isTrusted will drop it"
+    );
+
+    // The same event type, built by page script, must still report false.
+    assert_eq!(
+        page.evaluate("new MessageEvent('message', { data: 1 }).isTrusted"),
+        serde_json::json!(false),
+        "a script-built event claims to be trusted, which is a bot tell"
+    );
+}
+
 /// The reverse direction, as a full round trip. A parent configures a widget by
 /// posting into it, so a one-way bridge only solves half the problem.
 ///

@@ -3634,7 +3634,13 @@ globalThis.__obscura_deliverMessage = function(dataJson, origin, sourceFrameId) 
     ? globalThis.parent
     : (globalThis.__obscura_frameWindows[sourceFrameId] || null);
   try {
-    globalThis.dispatchEvent(new MessageEvent('message', { data, origin, source }));
+    // Trusted, because the user agent delivers this event — the sender called
+    // postMessage, it did not dispatch this. Real embedders check the flag and
+    // drop anything untrusted: Turnstile gates every message from its own frame
+    // on `event.isTrusted`, so an untrusted one is not merely suspicious, it is
+    // silently discarded and the widget waits forever.
+    globalThis.dispatchEvent(globalThis.__obscura_markTrusted(
+      new MessageEvent('message', { data, origin, source })));
   } catch (error) {
     console.error('message listener failed:', error && error.message || error);
   }
@@ -8758,9 +8764,8 @@ globalThis.stop = function() {}; _markNative(globalThis.stop);
 globalThis.postMessage = function(data, _targetOrigin, _transfer) {
   const origin = _realmOrigin();
   setTimeout(() => {
-    globalThis.dispatchEvent(new MessageEvent('message', {
-      data, origin, source: globalThis,
-    }));
+    globalThis.dispatchEvent(globalThis.__obscura_markTrusted(
+      new MessageEvent('message', { data, origin, source: globalThis })));
   }, 0);
 };
 _markNative(globalThis.postMessage);
