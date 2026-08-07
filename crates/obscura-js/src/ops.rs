@@ -219,6 +219,19 @@ pub struct ObscuraState {
     // drained by the Page into its network_events so the CDP layer emits
     // Network.requestWillBeSent / responseReceived for them (issue #406).
     pub js_network_events: Vec<JsNetworkEvent>,
+    // Frame documents that have been fetched and are waiting for a realm.
+    // Building one needs the whole runtime, which an op cannot reach, so
+    // `op_frame_document_ready` queues here and the Page drains it between
+    // event loop turns. Same shape as `pending_binding_calls`.
+    pub pending_frames: Vec<PendingFrame>,
+    pub frame_id_counter: u32,
+}
+
+/// A frame document waiting to be given a realm.
+pub struct PendingFrame {
+    pub frame_id: u32,
+    pub url: String,
+    pub html: String,
 }
 
 impl ObscuraState {
@@ -245,6 +258,8 @@ impl ObscuraState {
             network_response_body_counter: 0,
             fetched_urls: Vec::new(),
             js_network_events: Vec::new(),
+            pending_frames: Vec::new(),
+            frame_id_counter: 0,
         }
     }
 }
@@ -1781,6 +1796,26 @@ async fn op_sleep(#[number] millis: u64) {
     tokio::time::sleep(std::time::Duration::from_millis(millis)).await;
 }
 
+// Hands a fetched frame document to the host and returns the id the frame will
+// have. The realm itself is built later, by whoever owns the runtime.
+#[op2(fast)]
+fn op_frame_document_ready(
+    state: &OpState,
+    #[string] url: &str,
+    #[string] html: &str,
+) -> u32 {
+    let gs = state.borrow::<SharedState>().clone();
+    let mut gs = gs.borrow_mut();
+    gs.frame_id_counter += 1;
+    let frame_id = gs.frame_id_counter;
+    gs.pending_frames.push(PendingFrame {
+        frame_id,
+        url: url.to_string(),
+        html: html.to_string(),
+    });
+    frame_id
+}
+
 // Records a binding call from page JS. The CDP layer drains this queue
 // after every dispatch and emits one `Runtime.bindingCalled` event per
 // entry, that's how puppeteer's `page.exposeFunction` callbacks fire.
@@ -2263,6 +2298,7 @@ pub fn build_extension() -> Extension {
             op_navigate(),
             op_sleep(),
             op_binding_called(),
+            op_frame_document_ready(),
             op_subtle_digest(),
             op_subtle_hmac(),
             op_subtle_aes_gcm(),

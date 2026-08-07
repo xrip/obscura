@@ -137,30 +137,15 @@ impl FrameRealm {
         parent: &mut ObscuraJsRuntime,
         load_external: impl Fn(&str) -> Option<String>,
     ) -> Vec<String> {
-        let listed = self.evaluate(
-            parent,
-            r#"[...document.querySelectorAll('script')].map(node => ({
-                src: node.getAttribute('src') || '',
-                type: (node.getAttribute('type') || '').toLowerCase(),
-                text: node.textContent || '',
-            }))"#,
-        );
-        let scripts: Vec<DocumentScript> = match listed {
-            Ok(value) => serde_json::from_value(value).unwrap_or_default(),
-            Err(error) => return vec![format!("could not list frame scripts: {error}")],
+        let scripts = match self.list_scripts(parent) {
+            Ok(scripts) => scripts,
+            Err(error) => return vec![error],
         };
 
         let base = url::Url::parse(&self.url).ok();
         let mut problems = Vec::new();
         for (index, script) in scripts.iter().enumerate() {
-            // An empty type, or a JavaScript MIME type, is a classic script.
-            // Anything else is data or a module.
-            let classic = script.type_attribute.is_empty()
-                || matches!(
-                    script.type_attribute.as_str(),
-                    "text/javascript" | "application/javascript" | "text/ecmascript"
-                );
-            if !classic {
+            if !script.is_classic() {
                 if script.type_attribute == "module" {
                     problems.push(format!("frame module script {index} skipped: not supported"));
                 }
@@ -192,6 +177,40 @@ impl FrameRealm {
         }
         problems
     }
+
+    /// Absolute URLs of the frame's `src=` classic scripts, in document order.
+    ///
+    /// A caller that fetches over the network needs the list before running
+    /// anything, because `run_document_scripts` resolves sources synchronously.
+    pub fn external_script_urls(&self, parent: &mut ObscuraJsRuntime) -> Vec<String> {
+        let base = url::Url::parse(&self.url).ok();
+        self.list_scripts(parent)
+            .unwrap_or_default()
+            .iter()
+            .filter(|script| script.is_classic() && !script.src.is_empty())
+            .map(|script| {
+                base.as_ref()
+                    .and_then(|base| base.join(&script.src).ok())
+                    .map(|url| url.to_string())
+                    .unwrap_or_else(|| script.src.clone())
+            })
+            .collect()
+    }
+
+    fn list_scripts(&self, parent: &mut ObscuraJsRuntime) -> Result<Vec<DocumentScript>, String> {
+        let listed = self.evaluate(
+            parent,
+            r#"[...document.querySelectorAll('script')].map(node => ({
+                src: node.getAttribute('src') || '',
+                type: (node.getAttribute('type') || '').toLowerCase(),
+                text: node.textContent || '',
+            }))"#,
+        );
+        match listed {
+            Ok(value) => Ok(serde_json::from_value(value).unwrap_or_default()),
+            Err(error) => Err(format!("could not list frame scripts: {error}")),
+        }
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -200,6 +219,18 @@ struct DocumentScript {
     #[serde(rename = "type")]
     type_attribute: String,
     text: String,
+}
+
+impl DocumentScript {
+    /// An empty type, or a JavaScript MIME type, is a classic script. Anything
+    /// else is data or a module.
+    fn is_classic(&self) -> bool {
+        self.type_attribute.is_empty()
+            || matches!(
+                self.type_attribute.as_str(),
+                "text/javascript" | "application/javascript" | "text/ecmascript"
+            )
+    }
 }
 
 /// Serializes an origin the way `location.origin` does, using `"null"` for

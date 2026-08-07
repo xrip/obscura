@@ -532,6 +532,13 @@ impl ObscuraJsRuntime {
         std::mem::take(&mut self.state.borrow_mut().pending_binding_calls)
     }
 
+    /// Frame documents fetched by the page that still need a realm. Only the
+    /// page's own state is drained here, so a frame inside a frame stays queued
+    /// until nested frames are wired up.
+    pub fn take_pending_frames(&self) -> Vec<crate::ops::PendingFrame> {
+        std::mem::take(&mut self.state.borrow_mut().pending_frames)
+    }
+
     pub fn get_network_response_body(&self, request_id: &str) -> Option<StoredNetworkResponseBody> {
         self.state.borrow().network_response_bodies.get(request_id).cloned()
     }

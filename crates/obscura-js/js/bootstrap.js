@@ -3324,6 +3324,10 @@ function _loadIframeSrc(el, url) {
     el._iframeLoadInfo = {
       ok: true, status: result.status, url: result.url, length: result.html.length,
     };
+    // Hand the document to the host, which gives this frame a realm of its own
+    // and runs the scripts that came with it. The shim document below stays for
+    // now: it is what the parent still reads through contentDocument.
+    el._frameId = _denoCore.ops.op_frame_document_ready(result.url, result.html);
     el._iframeDoc = new _IframeDocument(result.html, result.url, el);
     el._iframeWin = new _IframeWindow(el._iframeDoc, result.url);
     el.dispatchEvent(new Event('load'));
@@ -9095,6 +9099,17 @@ globalThis.__obscura_init = function() {
     usedJSHeapSize: Math.floor(_totalHeap * (0.3 + _fpRand(621) * 0.5)),
   };
   globalThis.Notification.permission = "default";
+
+  // An <iframe src> that came from the parsed document never went through
+  // setAttribute, so nothing would ever start its load. The parser is what
+  // starts it in a browser; this is the closest point we have to that.
+  try {
+    const frames = document.querySelectorAll('iframe[src]');
+    for (let i = 0; i < frames.length; i++) {
+      const src = frames[i].getAttribute('src');
+      if (src && src !== 'about:blank') _loadIframeSrc(frames[i], src);
+    }
+  } catch (_) {}
 
   // Hide internals (_*, obscura, Obscura). The set of keys is static at
   // snapshot-build time, so we precompute it ONCE below (after this

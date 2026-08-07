@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use obscura_dom::{parse_html, DomTree};
+use obscura_js::frame::FrameRealm;
 use obscura_js::runtime::ObscuraJsRuntime;
 use obscura_net::{CallbackRegistry, ObscuraHttpClient, ObscuraNetError, RequestCallback, ResourceType, Response, ResponseCallback};
 use url::Url;
@@ -166,6 +167,10 @@ pub struct Page {
     pub frame_id: String,
     pub url: Option<Url>,
     pub dom: Option<DomTree>,
+    /// Live child frame realms, in creation order. Declared before `js` on
+    /// purpose: each holds a V8 handle into that runtime's isolate, and struct
+    /// fields drop in declaration order, so the handles must go first.
+    pub frames: Vec<FrameRealm>,
     pub js: Option<ObscuraJsRuntime>,
     pub lifecycle: LifecycleState,
     pub http_client: Arc<ObscuraHttpClient>,
@@ -231,6 +236,7 @@ impl Page {
             frame_id,
             url: None,
             dom: None,
+            frames: Vec::new(),
             js: None,
             lifecycle: LifecycleState::Idle,
             http_client,
@@ -268,6 +274,71 @@ impl Page {
             }
         }
         false
+    }
+
+    /// Gives every frame document the page has fetched a realm of its own, and
+    /// runs the scripts that came with it.
+    ///
+    /// Building a realm needs the whole runtime, which an op cannot reach, so
+    /// the JS side queues the fetched document and this drains the queue between
+    /// event loop turns. Reports whether anything was attached, so a caller can
+    /// settle and come back for frames that these frames created.
+    async fn attach_pending_frames(&mut self) -> bool {
+        let pending = match self.js.as_ref() {
+            Some(js) => js.take_pending_frames(),
+            None => return false,
+        };
+        if pending.is_empty() {
+            return false;
+        }
+
+        for frame in pending {
+            let realm = match self.js.as_mut().and_then(|js| {
+                FrameRealm::new(js, frame.frame_id, &frame.url, &frame.html)
+            }) {
+                Some(realm) => realm,
+                None => {
+                    tracing::warn!("could not build a realm for frame {}", frame.url);
+                    continue;
+                }
+            };
+
+            // A frame's scripts resolve and are fetched against the frame's own
+            // URL, so they need fetching before run_document_scripts, which
+            // resolves sources synchronously.
+            let wanted = match self.js.as_mut() {
+                Some(js) => realm.external_script_urls(js),
+                None => Vec::new(),
+            };
+            let referrer = Url::parse(&frame.url).ok();
+            let mut sources: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            for url in wanted {
+                let Ok(parsed) = Url::parse(&url) else { continue };
+                if self.should_block_url(&url) {
+                    continue;
+                }
+                match self
+                    .do_fetch_with_referrer(&parsed, referrer.as_ref(), ResourceType::Script)
+                    .await
+                {
+                    Ok(response) => {
+                        sources.insert(url, String::from_utf8_lossy(&response.body).into_owned());
+                    }
+                    Err(error) => {
+                        tracing::warn!("frame script {} failed: {}", url, error);
+                    }
+                }
+            }
+
+            if let Some(js) = self.js.as_mut() {
+                for problem in realm.run_document_scripts(js, |url| sources.get(url).cloned()) {
+                    tracing::debug!("frame {}: {}", frame.url, problem);
+                }
+            }
+            self.frames.push(realm);
+        }
+        true
     }
 
     async fn do_fetch(
@@ -336,6 +407,8 @@ impl Page {
         // attacker-controlled state, trigger a navigation, and then
         // run code in the next document's context.
         if self.js.is_some() {
+            // Frames first: they hold handles into the isolate this drops.
+            self.frames.clear();
             let _ = self.js.take();
         }
 
@@ -874,6 +947,17 @@ impl Page {
                 js.disarm_watchdog(token);
             }
         }
+
+        // Frames whose documents arrived during the settle above. Each round
+        // may reveal more, because a frame's own scripts can add frames; three
+        // rounds is deep enough for real nesting without letting a page that
+        // adds a frame per load event spin here forever.
+        for _ in 0..3 {
+            if !self.attach_pending_frames().await {
+                break;
+            }
+            self.settle(500).await;
+        }
     }
 
     pub async fn navigate(&mut self, url_str: &str) -> Result<(), PageError> {
@@ -1330,6 +1414,7 @@ impl Page {
     }
 
     pub fn navigate_blank(&mut self) {
+        self.frames.clear();
         self.js = None;
         self.url = Some(Url::parse("about:blank").unwrap());
         self.dom = Some(parse_html("<!DOCTYPE html><html><head></head><body></body></html>"));
@@ -1688,6 +1773,7 @@ impl Page {
                 self.dom = Some(dom);
             }
         }
+        self.frames.clear();
         self.js = None;
     }
 
