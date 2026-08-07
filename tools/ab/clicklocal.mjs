@@ -107,6 +107,10 @@ try {
       await new Promise(r => setTimeout(r, 300));
     }
     console.log('spa route    :', page.url().includes('/catalog/999/') ? 'OK ' + page.url() : 'FAILED, still at ' + page.url());
+    let after;
+    try { after = await page.evaluate(() => String(document.body.innerText.length)); }
+    catch (e) { after = 'THREW ' + String(e).split(String.fromCharCode(10))[0].slice(0,80); }
+    console.log('evaluate after spa route:', typeof after, JSON.stringify(after));
   } catch (e) {
     console.log('LOG:', JSON.stringify(e.log || e.message, null, 1).slice(0, 2000));
     console.log('click        : FAILED', String(e).split('\n')[0].slice(0, 140));

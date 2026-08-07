@@ -91,23 +91,26 @@ pub async fn handle(
                     // no document fetch. The client still has to be told the
                     // frame moved, or the click looks like it did nothing.
                     if moved {
+                        // The document has been replaced, so every execution
+                        // context id the client is holding is stale. Emitting
+                        // frameNavigated alone left Playwright evaluating
+                        // against a dead context, where every expression came
+                        // back as an empty object — including `() => 42`.
                         let url = page.url_string();
                         let frame_id = page.frame_id.clone();
-                        ctx.pending_events.push(crate::types::CdpEvent {
-                            method: "Page.frameNavigated".into(),
-                            params: json!({
-                                "frame": {
-                                    "id": frame_id,
-                                    "url": url,
-                                    "domainAndRegistry": "",
-                                    "securityOrigin": "",
-                                    "mimeType": "text/html",
-                                    "adFrameStatus": { "adFrameType": "none" },
-                                },
-                                "type": "Navigation",
-                            }),
-                            session_id: Some(session_id.clone().unwrap_or_default()),
-                        });
+                        let page_id = page.id.clone();
+                        let network_events: Vec<_> = page.network_events.drain(..).collect();
+                        crate::domains::page::emit_navigation_events(
+                            ctx,
+                            session_id,
+                            &frame_id,
+                            &format!("loader-click-{page_id}"),
+                            &url,
+                            &page_id,
+                            &network_events,
+                            obscura_browser::WaitUntil::Load,
+                            true,
+                        );
                     }
                 }
             }

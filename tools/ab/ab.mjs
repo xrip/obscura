@@ -147,13 +147,19 @@ async function withObscura() {
   const port = await freePort();
   const child = spawn(obscuraBin, ['--stealth', 'serve', '--port', String(port)], {
     cwd: root,
-    // Explicit, not inherited. OBSCURA_PROXY sitting in the shell would send a
-    // run through a proxy it never asked for, and the result would read as the
-    // site treating this machine differently rather than as a different exit.
+    // Explicit, not inherited. A proxy sitting in the shell sends a run through
+    // an exit it never asked for, and the result then reads as the site
+    // treating this machine differently rather than as a different IP.
+    // HTTPS_PROXY is the one that actually bit: it was set here, only some
+    // request paths honoured it, and runs silently disagreed about their own
+    // exit address.
     env: (() => {
       const env = { ...process.env, OBSCURA_NAV_TIMEOUT_MS: '90000' };
+      for (const name of ['OBSCURA_PROXY', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY',
+                          'http_proxy', 'https_proxy', 'all_proxy']) {
+        delete env[name];
+      }
       if (opts.proxy) env.OBSCURA_PROXY = opts.proxy;
-      else delete env.OBSCURA_PROXY;
       return env;
     })(),
     stdio: ['ignore', 'pipe', 'pipe'],

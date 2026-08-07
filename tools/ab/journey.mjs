@@ -92,17 +92,25 @@ const { chromium } = await import(pathToFileURL(playwrightPath).href);
 
 // A navigation part way through an evaluate destroys the execution context.
 // Ordinary on a site that redirects itself, so retry rather than lose the step.
+// Returns { value } on success, or { gaveUp: true } when the page kept
+// navigating out from under it. A bare null could not be told apart from a
+// legitimately null result, and typeof null === 'object' made a give-up look
+// like an unserialisable value — which sent me chasing a serialisation bug that
+// does not exist.
 async function tryEvaluate(page, fn, arg) {
   for (let attempt = 0; attempt < 5; attempt++) {
     try {
-      return await page.evaluate(fn, arg);
+      return { value: await page.evaluate(fn, arg) };
     } catch (error) {
       if (!String(error).includes('Execution context was destroyed')) throw error;
       await new Promise(done => setTimeout(done, 500));
     }
   }
-  return null;
+  return { gaveUp: true };
 }
+
+// For the callers that only want the value and treat a give-up as "nothing".
+const evaluated = result => (result && 'value' in result ? result.value : undefined);
 
 const productId = url => site.idFrom(url);
 
@@ -116,7 +124,7 @@ async function journey(page, log) {
   // time than asking.
   try {
     await page.goto('https://api.ipify.org/?format=json', { waitUntil: 'load', timeout: 30000 });
-    const seen = await tryEvaluate(page, () => document.body.innerText.trim().slice(0, 80));
+    const seen = evaluated(await tryEvaluate(page, () => document.body.innerText.trim().slice(0, 80)));
     log(`exit ip: ${seen}`);
   } catch (error) {
     log(`exit ip: unavailable (${String(error).split('\n')[0].slice(0, 60)})`);
@@ -129,8 +137,8 @@ async function journey(page, log) {
   let links = [];
   for (let second = 1; second <= opts.wait; second++) {
     await new Promise(done => setTimeout(done, 1000));
-    links = await tryEvaluate(page, selector =>
-      [...document.querySelectorAll(selector)].map(a => a.href), site.cardLink) || [];
+    links = evaluated(await tryEvaluate(page, selector =>
+      [...document.querySelectorAll(selector)].map(a => a.href), site.cardLink)) || [];
     if (links.length >= 3) break;
   }
   const unique = [...new Set(links.filter(productId))];
@@ -149,13 +157,13 @@ async function journey(page, log) {
     }
 
     // Only cards the page currently shows, and only ones we have not used.
-    const candidates = (await tryEvaluate(page, selector =>
+    const candidates = (evaluated(await tryEvaluate(page, selector =>
       [...document.querySelectorAll(selector)]
         .filter(a => {
           const r = a.getBoundingClientRect();
           return r.width > 0 && r.height > 0;
         })
-        .map(a => a.href), site.cardLink) || [])
+        .map(a => a.href), site.cardLink)) || [])
       .filter(u => productId(u));
     const fresh = candidates.filter(u => !visited.has(productId(u)));
     if (!fresh.length) {
@@ -200,17 +208,27 @@ async function journey(page, log) {
       }
       for (let second = 1; second <= opts.wait; second++) {
         await new Promise(done => setTimeout(done, 1000));
-        const found = await tryEvaluate(page, needle =>
-          (document.body ? document.body.innerText : '').includes(needle), id);
+        const found = evaluated(await tryEvaluate(page, needle =>
+          (document.body ? document.body.innerText : '').includes(needle), id));
         if (found) { opened = second; break; }
       }
-      // Ask for the number as a string. Obscura's Runtime.evaluate has been
-      // seen returning something unserialisable for a bare numeric expression
-      // here, which printed as [object Object] and hid whether the card had
-      // rendered anything at all.
+      if (process.env.JOURNEY_LADDER) {
+        for (const [name, fn] of [
+          ['42', () => 42],
+          ['"x"', () => 'x'],
+          ['true', () => true],
+          ['body?', () => !!document.body],
+          ['innerText.length', () => document.body.innerText.length],
+          ['String(len)', () => String(document.body.innerText.length)],
+          ['replace().length', () => document.body.innerText.replace(/\s+/g, ' ').length],
+        ]) {
+          const r = await tryEvaluate(page, fn);
+          log(`  ladder ${name.padEnd(18)} ${typeof evaluated(r)} ${JSON.stringify(evaluated(r))?.slice(0, 40)}`);
+        }
+      }
       const measured = await tryEvaluate(page, () =>
-        String((document.body ? document.body.innerText.replace(/\s+/g, ' ') : '').length));
-      bodyLength = Number.isFinite(Number(measured)) ? Number(measured) : `unreadable(${typeof measured})`;
+        (document.body ? document.body.innerText.replace(/\s+/g, ' ') : '').length);
+      bodyLength = measured.gaveUp ? 'still navigating' : measured.value;
     } catch (error) {
       failure = String(error).split('\n')[0].slice(0, 140);
     }
@@ -260,13 +278,19 @@ async function withObscura(log) {
   const port = await freePort();
   const child = spawn(obscuraBin, ['--stealth', 'serve', '--port', String(port)], {
     cwd: root,
-    // Explicit, not inherited. OBSCURA_PROXY sitting in the shell would send a
-    // run through a proxy it never asked for, and the result would read as the
-    // site treating this machine differently rather than as a different exit.
+    // Explicit, not inherited. A proxy sitting in the shell sends a run through
+    // an exit it never asked for, and the result then reads as the site
+    // treating this machine differently rather than as a different IP.
+    // HTTPS_PROXY is the one that actually bit: it was set here, only some
+    // request paths honoured it, and runs silently disagreed about their own
+    // exit address.
     env: (() => {
       const env = { ...process.env, OBSCURA_NAV_TIMEOUT_MS: '90000' };
+      for (const name of ['OBSCURA_PROXY', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY',
+                          'http_proxy', 'https_proxy', 'all_proxy']) {
+        delete env[name];
+      }
       if (opts.proxy) env.OBSCURA_PROXY = opts.proxy;
-      else delete env.OBSCURA_PROXY;
       return env;
     })(),
     stdio: ['ignore', 'pipe', 'pipe'],
