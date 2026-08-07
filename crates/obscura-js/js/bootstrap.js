@@ -3219,6 +3219,11 @@ function _gridColumns() {
 
 // Explicit reasons an element cannot be hit. Nothing is computed or measured:
 // if the page has not said an element is hidden, it is clickable.
+// Only signals the page authored directly. Computed style is deliberately not
+// consulted: our cascade is an approximation, and a single wrong `display:none`
+// out of it zeroes an element's box, which reads to a client as "element is not
+// visible" and stalls every click on the page with no way to see why. An
+// element the page has not explicitly hidden is clickable.
 function _isHitTestable(el) {
   if (!el || el.nodeType !== 1) return false;
   if (!el.isConnected) return false;
@@ -3226,12 +3231,6 @@ function _isHitTestable(el) {
   const inline = el.style;
   if (inline && (inline.display === 'none' || inline.visibility === 'hidden' ||
                  inline.pointerEvents === 'none')) return false;
-  try {
-    const computed = globalThis.getComputedStyle && globalThis.getComputedStyle(el);
-    if (computed && (computed.display === 'none' || computed.visibility === 'hidden')) {
-      return false;
-    }
-  } catch (_) { /* no computed style is not a reason to hide it */ }
   return true;
 }
 
@@ -5309,7 +5308,16 @@ globalThis.getComputedStyle = (el) => {
   return new Proxy(style, {
     get(_, prop) {
       if (prop === Symbol.toPrimitive || prop === Symbol.toStringTag) return undefined;
-      if (prop in target) return target[prop];
+      // A CSSStyleDeclaration answers to every property name, so `prop in
+      // target` is true even when nothing was authored — and returning that
+      // empty string short circuited the defaults below. Computed style then
+      // reported visibility as "" where Chrome reports "visible", and a client
+      // testing `style.visibility !== 'visible'` concluded every element on the
+      // page was invisible. Only a value that is actually set wins here.
+      if (prop in target) {
+        const own = target[prop];
+        if (typeof own === 'function' || (own !== '' && own != null)) return own;
+      }
       if (prop === 'getPropertyValue') return (name) => lookup(name);
       if (prop === 'getPropertyPriority') return () => '';
       if (prop === 'item') return (i) => '';
