@@ -37,6 +37,7 @@ pub struct FrameRealm {
     /// Held so the frame's entry can be taken out again when the frame dies.
     realms: Rc<RefCell<RealmStates>>,
     frame_id: u32,
+    parent_frame_id: u32,
     url: String,
     origin: String,
 }
@@ -81,6 +82,7 @@ impl FrameRealm {
             context,
             realms,
             frame_id,
+            parent_frame_id,
             url: url.to_string(),
             origin: origin_of(url),
         };
@@ -143,6 +145,31 @@ impl FrameRealm {
 
     pub fn frame_id(&self) -> u32 {
         self.frame_id
+    }
+
+    /// Sets the frame document's viewport before any of its scripts run.
+    pub fn set_viewport(
+        &self,
+        parent: &mut ObscuraJsRuntime,
+        width: f64,
+        height: f64,
+    ) -> Result<(), String> {
+        let width = if width.is_finite() && width > 0.0 { width } else { 300.0 };
+        let height = if height.is_finite() && height > 0.0 { height } else { 150.0 };
+        self.execute_script(
+            parent,
+            &format!(
+                "globalThis.innerWidth={width};globalThis.innerHeight={height};\
+                 if(globalThis.visualViewport){{\
+                   globalThis.visualViewport.width={width};\
+                   globalThis.visualViewport.height={height};\
+                 }}"
+            ),
+        )
+    }
+
+    pub fn parent_frame_id(&self) -> u32 {
+        self.parent_frame_id
     }
 
     pub fn url(&self) -> &str {
@@ -278,6 +305,201 @@ impl FrameRealm {
     }
 }
 
+#[allow(dead_code)]
+fn trace_vm_property_call(mut source: String) -> String {
+    fn is_ident(byte: u8) -> bool {
+        byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$'
+    }
+
+    fn closing_bracket(bytes: &[u8], open: usize) -> Option<usize> {
+        let mut depth = 0usize;
+        for (index, byte) in bytes.iter().enumerate().skip(open) {
+            match byte {
+                b'[' => depth += 1,
+                b']' => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 { return Some(index) }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    let bytes = source.as_bytes();
+    let mut property_reads = Vec::new();
+    let mut cursor = 0usize;
+    while cursor < bytes.len() {
+        let start = cursor;
+        let first = bytes[start];
+        if !(first.is_ascii_alphabetic() || first == b'_' || first == b'$')
+            || (start > 0 && is_ident(bytes[start - 1]))
+        {
+            cursor += 1;
+            continue;
+        }
+        let mut ident_end = start + 1;
+        while ident_end < bytes.len() && is_ident(bytes[ident_end]) { ident_end += 1 }
+        if bytes.get(ident_end) != Some(&b'[') {
+            cursor = ident_end;
+            continue;
+        }
+        let Some(lhs_close) = closing_bracket(bytes, ident_end) else { break };
+        if bytes.get(lhs_close + 1) != Some(&b'=') {
+            cursor = lhs_close + 1;
+            continue;
+        }
+        let rhs = lhs_close + 2;
+        let ident = &source[start..ident_end];
+        if !source[rhs..].starts_with(ident) || bytes.get(rhs + ident.len()) != Some(&b'[') {
+            cursor = rhs;
+            continue;
+        }
+        let owner_open = rhs + ident.len();
+        let Some(owner_close) = closing_bracket(bytes, owner_open) else { break };
+        let property_open = owner_close + 1;
+        if bytes.get(property_open) != Some(&b'[') {
+            cursor = property_open;
+            continue;
+        }
+        let Some(property_close) = closing_bracket(bytes, property_open) else { break };
+        if bytes.get(property_close + 1).is_some_and(|byte| !matches!(byte, b',' | b';' | b')' | b'}' | b':')) {
+            cursor = property_close + 1;
+            continue;
+        }
+        let value = &source[start..=lhs_close];
+        let owner = &source[rhs..=owner_close];
+        let property = &source[property_open + 1..property_close];
+        property_reads.push((
+            property_close + 1,
+            format!(
+                ",((a)=>(a.length<5000&&a.push({{property:typeof {property}==='string'?{property}:typeof {property},ownerType:typeof {owner},ownerTag:Object.prototype.toString.call({owner}),valueType:typeof {value}}})))(globalThis.__vmReads||(globalThis.__vmReads=[]))"
+            ),
+        ));
+        cursor = property_close + 1;
+    }
+    for (position, insertion) in property_reads.into_iter().rev() {
+        source.insert_str(position, &insertion);
+    }
+
+    let bytes = source.as_bytes();
+    let marker = b"===void 0?";
+    let mut search = 0;
+    let mut insertions = Vec::new();
+    while search + marker.len() <= bytes.len() {
+        let Some(offset) = bytes[search..]
+            .windows(marker.len())
+            .position(|window| window == marker)
+        else {
+            break;
+        };
+        let marker_start = search + offset;
+        let mut owner_start = marker_start;
+        while owner_start > 0 && is_ident(bytes[owner_start - 1]) {
+            owner_start -= 1;
+        }
+        let owner = &source[owner_start..marker_start];
+
+        let mut value_end = owner_start.saturating_sub(1);
+        if bytes.get(value_end) != Some(&b'=') || owner.is_empty() {
+            search = marker_start + marker.len();
+            continue;
+        }
+        while value_end > 0 && bytes[value_end - 1].is_ascii_whitespace() {
+            value_end -= 1;
+        }
+        let mut value_start = value_end;
+        while value_start > 0 && is_ident(bytes[value_start - 1]) {
+            value_start -= 1;
+        }
+        let value = &source[value_start..value_end];
+
+        let property_start = marker_start + marker.len();
+        let mut property_end = property_start;
+        while property_end < bytes.len() && is_ident(bytes[property_end]) {
+            property_end += 1;
+        }
+        let property = &source[property_start..property_end];
+        let expected = format!(":{owner}[{property}]");
+        if value.is_empty() || property.is_empty() || !source[property_end..].starts_with(&expected) {
+            search = marker_start + marker.len();
+            continue;
+        }
+        let comma = property_end + expected.len();
+        if bytes.get(comma) != Some(&b',') {
+            search = marker_start + marker.len();
+            continue;
+        }
+        insertions.push((
+            comma + 1,
+            format!(
+                "globalThis.__vmTrace={{property:{property},ownerType:typeof {owner},valueType:typeof {value},ownerIsWindow:{owner}===globalThis,ownerIsDocument:{owner}===globalThis.document,ownerIsNavigator:{owner}===globalThis.navigator}},typeof {value}==='function'||(globalThis.__vmMissing||(globalThis.__vmMissing=[])).length>=200||globalThis.__vmMissing.push(globalThis.__vmTrace),"
+            ),
+        ));
+        search = marker_start + marker.len();
+    }
+    for (position, insertion) in insertions.into_iter().rev() {
+        source.insert_str(position, &insertion);
+    }
+    if let Some(start) = source.find("this[`g`]=") {
+        if let Some(relative_end) = source[start..].find(",this[`h`]=") {
+            let position = start + relative_end + 1;
+            source.insert_str(
+                position,
+                "this[`g`]=new Proxy(this[`g`],{get(t,p,r){const v=Reflect.get(t,p,r);if(v===void 0&&Number.isInteger(+p)){const a=globalThis.__vmUndefined||(globalThis.__vmUndefined=[]);if(a.length<200)a.push({kind:'get',slot:String(p),stack:String(new Error().stack||'')})}return v},set(t,p,v,r){if(v===void 0&&Number.isInteger(+p)){const a=globalThis.__vmUndefined||(globalThis.__vmUndefined=[]);if(a.length<200)a.push({kind:'set',slot:String(p),stack:String(new Error().stack||'')})}return Reflect.set(t,p,v,r)}}),",
+            );
+        }
+    }
+    for (read, value, property, owner) in [
+        ("rP[rR],", "rB", "rR", "rP"),
+        ("yZ[yn],", "yd", "yn", "yZ"),
+    ] {
+        if let Some(offset) = source.find(read) {
+            let position = offset + read.len();
+            source.insert_str(
+                position,
+                &format!(
+                    "globalThis.__vmTrace={{property:{property},ownerType:typeof {owner},valueType:typeof {value},ownerIsWindow:{owner}===globalThis,ownerIsDocument:{owner}===globalThis.document,ownerIsNavigator:{owner}===globalThis.navigator}},typeof {value}==='function'||(globalThis.__vmMissing||(globalThis.__vmMissing=[])).push(globalThis.__vmTrace),"
+                ),
+            );
+        }
+    }
+    for (read, value, property, owner) in [
+        ("j[rz]=j[rR][j[rM]]", "j[rz]", "j[rM]", "j[rR]"),
+        ("j[rD]=j[rR][j[rl]]", "j[rD]", "j[rl]", "j[rR]"),
+        ("R[yn]=R[yl][R[Y]]", "R[yn]", "R[Y]", "R[yl]"),
+        ("R[yd]=R[yl][R[yS]]", "R[yd]", "R[yS]", "R[yl]"),
+    ] {
+        if let Some(offset) = source.find(read) {
+            let position = offset + read.len();
+            source.insert_str(
+                position,
+                &format!(
+                    ",(globalThis.__vmGets||(globalThis.__vmGets=[])).push({{property:typeof {property}==='string'?{property}:typeof {property},ownerType:typeof {owner},valueType:typeof {value},ownerIsWindow:{owner}===globalThis,ownerIsDocument:{owner}===globalThis.document,ownerIsNavigator:{owner}===globalThis.navigator}})"
+                ),
+            );
+        }
+    }
+    for (read, value, property, owner) in [
+        ("P[i]=P[yl][yN]", "P[i]", "yN", "P[yl]"),
+        ("j[rD]=j[rR][j[rl]]", "j[rD]", "j[rl]", "j[rR]"),
+        ("R[Y]=R[yn][yl]", "R[Y]", "yl", "R[yn]"),
+        ("R[yl]=R[Y][R[yd]]", "R[yl]", "R[yd]", "R[Y]"),
+        ("R[yl]=R[yd][R[yn]]", "R[yl]", "R[yn]", "R[yd]"),
+    ] {
+        if let Some(offset) = source.find(read) {
+            let position = offset + read.len();
+            source.insert_str(
+                position,
+                &format!(
+                    ",((a)=>(a.length<5000&&a.push({{property:{property},ownerType:typeof {owner},ownerTag:Object.prototype.toString.call({owner}),valueType:typeof {value}}})))(globalThis.__vmReads||(globalThis.__vmReads=[]))"
+                ),
+            );
+        }
+    }
+    source
+}
+
 #[derive(serde::Deserialize)]
 struct DocumentScript {
     src: String,
@@ -387,6 +609,33 @@ mod tests {
         assert_eq!(frame.frame_id(), 1);
         assert!(!frame.is_same_origin_as("https://parent.example"));
         assert!(frame.is_same_origin_as("https://child.example"));
+    }
+
+    #[test]
+    fn frame_uses_its_embedding_viewport() {
+        let mut parent = page(
+            "https://parent.example/page",
+            "<html><body><iframe style='width:300px;height:65px'></iframe></body></html>",
+        );
+        let frame = FrameRealm::new(
+            &mut parent,
+            1,
+            0,
+            "https://child.example/frame",
+            "<html><body></body></html>",
+        )
+        .expect("frame realm");
+
+        frame.set_viewport(&mut parent, 300.0, 65.0).unwrap();
+        assert_eq!(
+            frame
+                .evaluate(
+                    &mut parent,
+                    "[innerWidth,innerHeight,visualViewport.width,visualViewport.height]",
+                )
+                .unwrap(),
+            serde_json::json!([300, 65, 300, 65]),
+        );
     }
 
     /// A frame must not look like a different browser than its parent. Anti-bot

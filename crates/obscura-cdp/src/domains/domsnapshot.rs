@@ -7,9 +7,10 @@
 //! sees zero elements.
 //!
 //! Obscura has no layout/paint engine, so there is no real geometry to report.
-//! We synthesize it: every node gets a distinct, on-screen, non-icon-sized box
-//! (a simple vertical stack) plus plausible computed styles (visible, opaque,
-//! pointer cursor on interactive tags). That is enough for the element
+//! We synthesize it: every layout node gets a distinct, on-screen,
+//! non-icon-sized box (a simple vertical stack) plus plausible computed styles.
+//! Nodes hidden by authored state and HTML nodes that never make a layout box
+//! stay in the DOM arrays but do not enter the layout arrays. That is enough for the element
 //! detection path, which keys off tag name / ARIA / accessibility role and does
 //! not need true geometry. Clicking still falls back to JS `.click()` since the
 //! coordinates are synthetic. `backendNodeId == nid`, matching `DOM.getDocument`.
@@ -37,6 +38,11 @@ const REQUIRED_STYLES: &[&str] = &[
 /// Cap the synthesized snapshot so a pathologically large DOM cannot produce a
 /// runaway payload. Matches the spirit of the descendants() length cap.
 const MAX_NODES: usize = 20_000;
+
+const NON_RENDERED_HTML_TAGS: &[&str] = &[
+    "base", "datalist", "head", "link", "meta", "noframes", "noscript", "param", "rp",
+    "script", "style", "template", "title",
+];
 
 pub async fn handle(
     method: &str,
@@ -113,6 +119,30 @@ fn walk(
     }
 }
 
+fn attr_value<'a>(attrs: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    attrs
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+}
+
+fn has_attr(attrs: &[(String, String)], name: &str) -> bool {
+    attrs.iter().any(|(key, _)| key.eq_ignore_ascii_case(name))
+}
+
+fn inline_style_value<'a>(attrs: &'a [(String, String)], property: &str) -> Option<&'a str> {
+    attr_value(attrs, "style")?
+        .split(';')
+        .filter_map(|declaration| {
+            let (name, value) = declaration.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case(property)
+                .then(|| value.trim().split_ascii_whitespace().next())
+                .flatten()
+        })
+        .last()
+}
+
 fn build_capture_snapshot(dom: &DomTree, url: &str, title: &str) -> Value {
     let mut order: Vec<NodeId> = Vec::new();
     let mut parent_idx: Vec<i64> = Vec::new();
@@ -130,30 +160,25 @@ fn build_capture_snapshot(dom: &DomTree, url: &str, title: &str) -> Value {
     let mut attributes: Vec<Value> = Vec::with_capacity(n);
     let mut clickable: Vec<i64> = Vec::new();
 
-    // Layout arrays are 1:1 with nodes (nodeIndex[i] == i).
     let mut layout_node_index: Vec<i64> = Vec::with_capacity(n);
     let mut bounds: Vec<Value> = Vec::with_capacity(n);
     let mut styles: Vec<Value> = Vec::with_capacity(n);
     let mut paint_orders: Vec<i64> = Vec::with_capacity(n);
     let mut client_rects: Vec<Value> = Vec::with_capacity(n);
     let mut layout_text: Vec<i64> = Vec::with_capacity(n);
+    let mut subtree_suppressed: Vec<bool> = Vec::with_capacity(n);
 
     for (i, &nid) in order.iter().enumerate() {
         let node = match dom.get_node(nid) {
             Some(node) => node,
             None => {
-                // Keep arrays aligned even for a vanished node.
+                // Keep DOM arrays aligned even for a vanished node.
                 node_type.push(0);
                 node_name.push(0);
                 node_value.push(0);
                 backend_ids.push(nid.index() as i64);
                 attributes.push(json!([]));
-                layout_node_index.push(i as i64);
-                bounds.push(json!([0.0, 0.0, 0.0, 0.0]));
-                styles.push(json!([]));
-                paint_orders.push(i as i64);
-                client_rects.push(json!([0.0, 0.0, 0.0, 0.0]));
-                layout_text.push(-1);
+                subtree_suppressed.push(true);
                 continue;
             }
         };
@@ -195,26 +220,52 @@ fn build_capture_snapshot(dom: &DomTree, url: &str, title: &str) -> Value {
         }
         attributes.push(json!(attr_idx));
 
+        let parent_suppressed = parent_idx[i]
+            .try_into()
+            .ok()
+            .and_then(|parent: usize| subtree_suppressed.get(parent).copied())
+            .unwrap_or(false);
+        let authored_display = inline_style_value(&attrs, "display");
+        let ua_hidden = NON_RENDERED_HTML_TAGS.contains(&tag.as_str())
+            || (tag == "input"
+                && attr_value(&attrs, "type").is_some_and(|value| value.eq_ignore_ascii_case("hidden")))
+            || (tag == "dialog" && !has_attr(&attrs, "open"));
+        let own_suppresses_subtree = ntype == 1
+            && (ua_hidden
+                || has_attr(&attrs, "hidden")
+                || authored_display.is_some_and(|value| value.eq_ignore_ascii_case("none")));
+        let suppresses_subtree = parent_suppressed || own_suppresses_subtree;
+        subtree_suppressed.push(suppresses_subtree);
+
+        let display_contents = ntype == 1
+            && (tag == "slot"
+                || authored_display.is_some_and(|value| value.eq_ignore_ascii_case("contents")));
+        let has_layout_box = match ntype {
+            9 => true,
+            1 => !suppresses_subtree && !display_contents,
+            3 => !parent_suppressed,
+            _ => false,
+        };
+
         let interactive = matches!(
             tag.as_str(),
             "a" | "button" | "input" | "select" | "textarea" | "summary" | "details" | "option" | "label"
         );
         let has_onclick = attrs.iter().any(|(k, _)| k.eq_ignore_ascii_case("onclick"));
-        if interactive || has_onclick {
+        if has_layout_box && (interactive || has_onclick) {
             clickable.push(i as i64);
         }
 
-        // Tags that never render box content; report display:none so the agent
-        // does not treat them as visible.
-        let hidden = matches!(
-            tag.as_str(),
-            "head" | "meta" | "title" | "script" | "style" | "link" | "noscript" | "base"
-        );
-        let display = if ntype == 1 && hidden { "none" } else { "block" };
+        if !has_layout_box {
+            continue;
+        }
+
+        let display = authored_display.unwrap_or("block");
+        let visibility = inline_style_value(&attrs, "visibility").unwrap_or("visible");
         let cursor = if interactive { "pointer" } else { "auto" };
         let style_vals = [
             display,
-            "visible",
+            visibility,
             "1",
             "visible",
             "visible",
@@ -231,15 +282,16 @@ fn build_capture_snapshot(dom: &DomTree, url: &str, title: &str) -> Value {
         // Synthetic geometry: a vertical stack, full-width, 18px tall. Distinct
         // and non-icon-sized so visibility/size heuristics include the element;
         // the coordinates are not real (no layout engine).
-        let y = (i as f64) * 18.0;
+        let layout_index = layout_node_index.len() as i64;
+        let y = (layout_index as f64) * 18.0;
         bounds.push(json!([0.0, y, 1280.0, 18.0]));
         client_rects.push(json!([0.0, y, 1280.0, 18.0]));
-        paint_orders.push(i as i64);
+        paint_orders.push(layout_index);
         layout_node_index.push(i as i64);
         layout_text.push(-1);
     }
 
-    let content_height = (n as i64) * 18;
+    let content_height = (layout_node_index.len() as i64) * 18;
     json!({
         "documents": [{
             "documentURL": doc_url_idx,
@@ -368,12 +420,14 @@ mod tests {
             "string table should be populated"
         );
 
-        // Layout arrays are aligned 1:1 with nodes and carry bounds + the 10
-        // computed styles browser-use reads back positionally.
+        // Layout arrays are aligned with each other and carry bounds + the 10
+        // computed styles browser-use reads back positionally. They are a
+        // subset of DOM nodes, like Blink's layout tree.
         let n = snap_ids.len();
-        assert_eq!(layout["nodeIndex"].as_array().unwrap().len(), n);
-        assert_eq!(layout["bounds"].as_array().unwrap().len(), n);
-        assert_eq!(layout["styles"].as_array().unwrap().len(), n);
+        let layout_len = layout["nodeIndex"].as_array().unwrap().len();
+        assert!(layout_len > 0 && layout_len <= n);
+        assert_eq!(layout["bounds"].as_array().unwrap().len(), layout_len);
+        assert_eq!(layout["styles"].as_array().unwrap().len(), layout_len);
         assert_eq!(
             layout["bounds"][0].as_array().unwrap().len(),
             4,
@@ -400,7 +454,63 @@ mod tests {
                 .position(|&id| id == bid)
                 .unwrap_or_else(|| panic!("{tag} should be in the snapshot")) as i64;
             assert!(clickable.contains(&idx), "{tag} must be flagged isClickable");
+            assert!(
+                layout["nodeIndex"].as_array().unwrap().contains(&json!(idx)),
+                "{tag} must have a layout box"
+            );
         }
+    }
+
+    #[tokio::test]
+    async fn hidden_and_technical_nodes_do_not_enter_layout_arrays() {
+        let mut ctx = CdpContext::new();
+        let session = navigate(
+            &mut ctx,
+            "<style>main{display:block}</style><template>data</template>\
+             <datalist></datalist><param><rp></rp><noframes></noframes>\
+             <aside hidden><button>no</button></aside><main>yes</main>",
+        )
+        .await;
+        let doc = crate::domains::dom::handle(
+            "getDocument",
+            &json!({ "depth": -1 }),
+            &mut ctx,
+            &Some(session.clone()),
+        )
+        .await
+        .expect("getDocument should succeed");
+        let snap = handle("captureSnapshot", &json!({}), &mut ctx, &Some(session))
+            .await
+            .expect("captureSnapshot should succeed");
+        let nodes = &snap["documents"][0]["nodes"];
+        let layout = &snap["documents"][0]["layout"];
+        let backend_ids: Vec<i64> = nodes["backendNodeId"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_i64().unwrap())
+            .collect();
+        let layout_indices = layout["nodeIndex"].as_array().unwrap();
+
+        for tag in [
+            "STYLE", "TEMPLATE", "DATALIST", "PARAM", "RP", "NOFRAMES", "ASIDE", "BUTTON",
+        ] {
+            let backend_id = find_backend_id_by_name(&doc["root"], tag)
+                .unwrap_or_else(|| panic!("{tag} should stay in the DOM snapshot"));
+            let node_index = backend_ids.iter().position(|id| *id == backend_id).unwrap() as i64;
+            assert!(
+                !layout_indices.contains(&json!(node_index)),
+                "{tag} must not consume a synthetic layout row"
+            );
+        }
+
+        let main_id = find_backend_id_by_name(&doc["root"], "MAIN").unwrap();
+        let main_index = backend_ids.iter().position(|id| *id == main_id).unwrap() as i64;
+        assert!(layout_indices.contains(&json!(main_index)), "MAIN must keep a layout box");
+        assert_eq!(
+            snap["documents"][0]["contentHeight"].as_i64(),
+            Some(layout_indices.len() as i64 * 18)
+        );
     }
 
     #[tokio::test]

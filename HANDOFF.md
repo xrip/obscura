@@ -1,6 +1,6 @@
 # Handoff
 
-Branch `webgl+webgpu`, at `cb869cb`. Working tree clean.
+Branch `webgl+webgpu`, at `6a02338`, with local child-frame CDP changes.
 
 ## What this project is
 
@@ -101,6 +101,10 @@ delivery.
 - `parent` / `top` in a framed document; the page still reports itself as top.
 - Nested frames drain (the op queues onto the page's state whichever realm
   called it).
+- `Page.getFrameTree` now includes the live child-frame hierarchy, and
+  navigation emits `Page.frameAttached`, `Page.frameNavigated` and
+  `Page.frameStoppedLoading` for each child. A local Playwright 1.62.1 check
+  sees both the main page and its iframe through `page.frames()`.
 - Turnstile end to end.
 
 ## What does not work, and what is unproven
@@ -118,7 +122,10 @@ delivery.
   Chrome emits `interactiveBegin`. **Real headless Chrome gets no token there
   either** — it waits for a human click. Next lead: `api.js` reports one caught
   error from `runImplicitRender`, driven by our `<load-events>` script.
-- **CDP frame events are missing.** Playwright cannot see `page.frames()`.
+- **CDP frame use is not complete.** Playwright can now see `page.frames()`,
+  but CDP execution context ids are not mapped to frame realms, so evaluation
+  through a child `Frame` still runs in the main realm. A later main-frame
+  navigation also does not emit `Page.frameDetached` for removed children.
 - **`_IframeDocument` is still what a parent reads through `contentDocument`** —
   a regex-built shim, not the frame's real document.
 - **No same-origin synchronous DOM access between realms**, and no `frames[]`
@@ -173,6 +180,18 @@ Recorded results at `cb869cb`:
 | `--features stealth` | **541 tests, 538 passed, 3 failed, 3 skipped** |
 | plain | **534 tests, 532 passed, 2 failed, 3 skipped** |
 
+Current local child-frame CDP change, after `cargo clean`:
+
+- `cargo build --release -p obscura-cli`: exit 0.
+- `cargo nextest run --workspace --no-fail-fast`: **536 tests, 534 passed,
+  2 failed, 3 skipped**. The two failures are the same CDP failures below.
+- The two new CDP frame-tree/event tests and all six `frame_messaging` tests
+  pass.
+- A local Playwright 1.62.1 check against one page with one iframe reports both
+  URLs from `page.frames()`.
+- The obstacle course was not run because the companion `obscura-benchmark`
+  checkout is not present beside this repository.
+
 The three failures, all pre-existing and none caused by this work:
 
 - `obscura-cdp::max_connections_cap max_connections_refuses_then_recovers`
@@ -216,9 +235,9 @@ Do not read it as a stealth regression. Measured this session:
 
 ## Next, by priority
 
-1. **CDP frame events.** Playwright cannot see frames at all, so no user can
-   drive or debug one. This is the largest gap between "frames work" and
-   "frames are usable", and it also makes everything below easier to diagnose.
+1. **Finish CDP frame use.** Route child execution contexts to their frame
+   realms, then emit `Page.frameDetached` when a navigation removes old
+   children. Discovery is done: Playwright now sees `page.frames()`.
 2. **Replace the `_IframeDocument` shim** with the frame realm's real document
    behind `contentDocument`, and add same-origin access. The shim regex-strips
    `<head>` and is a visible divergence from a browser.

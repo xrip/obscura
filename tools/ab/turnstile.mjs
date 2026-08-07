@@ -2,7 +2,7 @@
 //
 //   node tools/ab/turnstile.mjs [url|local] [--only chrome|obscura]
 //                              [--wait seconds] [--proxy url] [--headed]
-//                              [--outbound] [--verbose <RUST_LOG>]
+//                              [--outbound] [--click] [--verbose <RUST_LOG>]
 //
 // "local" serves a fixture using Turnstile's dummy sitekey, which always issues
 // a token without interaction. That separates the two questions a live site
@@ -57,6 +57,7 @@ function parseArgs(argv) {
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--headed') opts.headed = true;
+    else if (arg === '--click') opts.click = true;
     // Obscura's own log is the only view into what a frame realm did; nothing
     // about a frame that failed to run reaches CDP.
     else if (arg === '--verbose') {
@@ -137,6 +138,17 @@ async function scenario(page) {
     // message an engine fails to send or answer is the actual difference
     // between passing and not; the DOM afterwards only shows that it did not.
     globalThis.__abMessages = [];
+    globalThis.__abInputEvents = [];
+    for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+      document.addEventListener(type, event => globalThis.__abInputEvents.push({
+        type, trusted: event.isTrusted, target: event.target && event.target.tagName,
+        clientX: event.clientX, clientY: event.clientY, screenX: event.screenX, screenY: event.screenY,
+        pageX: event.pageX, pageY: event.pageY, offsetX: event.offsetX, offsetY: event.offsetY,
+        movementX: event.movementX, movementY: event.movementY, button: event.button,
+        buttons: event.buttons, detail: event.detail, composed: event.composed,
+        viewIsWindow: event.view === window,
+      }), true);
+    }
     const label = data => {
       try {
         if (typeof data === 'string') return `"${data.slice(0, 60)}"`;
@@ -195,6 +207,36 @@ async function scenario(page) {
 
   await page.goto(opts.url, { waitUntil: 'load', timeout: 90000 });
 
+  let clickTarget = null;
+  if (opts.click) {
+    await new Promise(done => setTimeout(done, 5000));
+    const frameRect = await page.evaluate(() => {
+      const frames = [];
+      for (const root of globalThis.__abShadowRoots || []) {
+        try { frames.push(...root.querySelectorAll('iframe')); } catch { /* gone */ }
+      }
+      frames.push(...document.querySelectorAll('iframe'));
+      const rect = frames[0] && frames[0].getBoundingClientRect();
+      return rect && { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+    });
+    const child = page.frames().find(frame => frame !== page.mainFrame()
+      && frame.url().includes('challenges.cloudflare.com'));
+    if (child) {
+      clickTarget = await child.evaluate(() => {
+        const element = document.elementFromPoint(30, 30);
+        return element && { tag: element.tagName, id: element.id,
+          className: String(element.className || ''), outerHTML: element.outerHTML.slice(0, 500) };
+      }).catch(error => ({ error: String(error).slice(0, 200) }));
+    }
+    if (frameRect) {
+      const x = frameRect.x + 30, y = frameRect.y + 30;
+      await page.mouse.move(x, y);
+      await page.mouse.down();
+      await new Promise(done => setTimeout(done, 100));
+      await page.mouse.up();
+    }
+  }
+
   // Poll rather than wait once: the token can arrive many seconds after load,
   // and stopping early would report a failure that had not happened yet.
   let report = null;
@@ -204,7 +246,11 @@ async function scenario(page) {
     report = evaluated(await tryEvaluate(page, probe)) || report;
     if (report && report.token) { tokenAfter = second; break; }
   }
-  return { report, tokenAfter, errors, challengeRequests };
+  const child = page.frames().find(frame => frame !== page.mainFrame()
+    && frame.url().includes('challenges.cloudflare.com'));
+  const clickEvents = child && await child.evaluate(() => globalThis.__abInputEvents || [])
+    .catch(() => []);
+  return { report, tokenAfter, errors, challengeRequests, clickTarget, clickEvents };
 }
 
 const fixture = opts.url === 'local' ? await serveFixture() : null;
@@ -235,6 +281,8 @@ for (const engine of opts.only ? [opts.only] : ['chrome', 'obscura']) {
       if (f.loadInfo) console.log(`       loadInfo=${f.loadInfo}`);
     }
     console.log(`   message exchange  : ${(r.messages || []).length}`);
+    if (out.clickTarget) console.log(`   click target      : ${JSON.stringify(out.clickTarget)}`);
+    if (out.clickEvents?.length) console.log(`   click events      : ${JSON.stringify(out.clickEvents)}`);
     for (const line of r.messages || []) console.log('     ' + line);
     const seen = [...new Set(out.challengeRequests)];
     console.log(`   challenge requests: ${seen.length}`);

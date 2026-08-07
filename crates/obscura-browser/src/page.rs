@@ -303,6 +303,15 @@ impl Page {
                     continue;
                 }
             };
+            if let Some(js) = self.js.as_mut() {
+                if let Err(error) = realm.set_viewport(
+                    js,
+                    frame.viewport_width as f64,
+                    frame.viewport_height as f64,
+                ) {
+                    tracing::debug!("frame {} viewport setup failed: {error}", frame.url);
+                }
+            }
 
             // A frame's scripts resolve and are fetched against the frame's own
             // URL, so they need fetching before run_document_scripts, which
@@ -333,6 +342,14 @@ impl Page {
             }
 
             if let Some(js) = self.js.as_mut() {
+                // Page.addScriptToEvaluateOnNewDocument applies to every new
+                // document, including child frames. Debug hooks and browser
+                // automation setup must be present before frame scripts run.
+                for source in &self.preload_scripts {
+                    if let Err(error) = realm.execute_script(js, source) {
+                        tracing::debug!("frame {} preload failed: {error}", frame.url);
+                    }
+                }
                 // A frame that ran nothing and a frame that ran everything both
                 // finish silently, which has repeatedly been mistaken for the
                 // frame working. Say what was actually there.
@@ -1666,6 +1683,49 @@ impl Page {
         let Some(js) = self.js.as_mut() else { return serde_json::Value::Null };
         let Some(frame) = self.frames.get(index) else { return serde_json::Value::Null };
         frame.evaluate(js, expression).unwrap_or(serde_json::Value::Null)
+    }
+
+    /// Sends one mouse event to the browsing context under the page point.
+    /// An iframe owns its own hit test, so page coordinates are changed to the
+    /// frame's local coordinates before the event enters its realm.
+    pub fn dispatch_mouse_event(
+        &mut self,
+        event_type: &str,
+        x: f64,
+        y: f64,
+        click_count: u64,
+    ) -> bool {
+        let hit = self.evaluate(&format!(
+            "(function() {{\
+                var target = document.elementFromPoint({x}, {y});\
+                if (!target || target.tagName !== 'IFRAME' || !target._frameId) return null;\
+                var rect = target.getBoundingClientRect();\
+                return {{ frameId: target._frameId, x: {x} - rect.left, y: {y} - rect.top }};\
+            }})()"
+        ));
+        if let Some(frame_id) = hit["frameId"].as_u64().and_then(|id| u32::try_from(id).ok()) {
+            let local_x = hit["x"].as_f64().unwrap_or(0.0);
+            let local_y = hit["y"].as_f64().unwrap_or(0.0);
+            let Some(js) = self.js.as_mut() else { return false };
+            let Some(frame) = self.frames.iter().find(|frame| frame.frame_id() == frame_id) else {
+                return false;
+            };
+            let event_type = serde_json::to_string(event_type).unwrap_or_else(|_| "\"\"".to_string());
+            return frame
+                .execute_script(
+                    js,
+                    &format!(
+                        "globalThis.__obscura_dispatchMouse({event_type}, {local_x}, {local_y}, {click_count})"
+                    ),
+                )
+                .is_ok();
+        }
+
+        let event_type = serde_json::to_string(event_type).unwrap_or_else(|_| "\"\"".to_string());
+        self.evaluate(&format!(
+            "globalThis.__obscura_dispatchMouse({event_type}, {x}, {y}, {click_count})"
+        ));
+        false
     }
 
     pub fn evaluate(&mut self, expression: &str) -> serde_json::Value {

@@ -78,11 +78,11 @@ pub async fn handle(
             // checkbox activation that Element.click() already had.
             if matches!(event_type, "mouseMoved" | "mousePressed" | "mouseReleased") {
                 if let Some(page) = ctx.get_session_page_mut(session_id) {
-                    let code = format!(
-                        "globalThis.__obscura_dispatchMouse({t:?}, {x}, {y}, {c})",
-                        t = event_type, x = x, y = y, c = click_count,
-                    );
-                    page.evaluate(&code);
+                    let routed_to_frame =
+                        page.dispatch_mouse_event(event_type, x, y, click_count);
+                    if routed_to_frame && event_type == "mouseReleased" {
+                        page.settle(100).await;
+                    }
                     let moved = page
                         .process_pending_navigation()
                         .await

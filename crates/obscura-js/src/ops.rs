@@ -241,6 +241,8 @@ pub struct PendingFrame {
     pub frame_id: u32,
     pub url: String,
     pub html: String,
+    pub viewport_width: u64,
+    pub viewport_height: u64,
     /// The frame that holds this one; 0 when the page does.
     pub parent_frame_id: u32,
 }
@@ -1939,6 +1941,8 @@ fn op_frame_document_ready(
     state: &OpState,
     #[string] url: &str,
     #[string] html: &str,
+    #[number] viewport_width: u64,
+    #[number] viewport_height: u64,
 ) -> u32 {
     // Whoever called this is the new frame's parent, which is how a frame
     // nested two deep gets `parent` pointing at the frame above it rather than
@@ -1952,6 +1956,8 @@ fn op_frame_document_ready(
         frame_id,
         url: url.to_string(),
         html: html.to_string(),
+        viewport_width,
+        viewport_height,
         parent_frame_id,
     });
     frame_id

@@ -1563,6 +1563,9 @@ class Element extends Node {
     if (n === "src" && this.localName === "iframe" && value && value !== "about:blank") {
       _loadIframeSrc(this, value);
     }
+    if (n === "srcdoc" && this.localName === "iframe") {
+      _loadIframeSrcdoc(this, value);
+    }
     // The other half of the same gap: a script already in the tree starts as
     // soon as it is given a src.
     if (n === "src" && this.localName === "script" && value) {
@@ -2295,16 +2298,34 @@ class Element extends Node {
     });
     return this._dataset;
   }
-  get offsetWidth() { return this._isViewportRoot() ? (globalThis.innerWidth || 1280) : 100; }
-  get offsetHeight() { return this._isViewportRoot() ? (globalThis.innerHeight || 720) : 20; }
+  get offsetWidth() {
+    if (!_hasSyntheticLayoutBox(this)) return 0;
+    return this._isViewportRoot() ? (globalThis.innerWidth || 1280) : 100;
+  }
+  get offsetHeight() {
+    if (!_hasSyntheticLayoutBox(this)) return 0;
+    return this._isViewportRoot() ? (globalThis.innerHeight || 720) : 20;
+  }
   get offsetTop() { return 0; } get offsetLeft() { return 0; }
   // documentElement / body / window expose VIEWPORT geometry, not their own content box.
   // Puppeteer's #clickableBox clips boxes to document.documentElement.clientWidth/Height;
   // returning 100x20 there made every element appear off-screen and broke .click().
-  get clientWidth() { return this._isViewportRoot() ? (globalThis.innerWidth || 1280) : 100; }
-  get clientHeight() { return this._isViewportRoot() ? (globalThis.innerHeight || 720) : 20; }
-  get scrollWidth() { return this._isViewportRoot() ? (globalThis.innerWidth || 1280) : 100; }
-  get scrollHeight() { return this._isViewportRoot() ? (globalThis.innerHeight || 720) : 20; }
+  get clientWidth() {
+    if (!_hasSyntheticLayoutBox(this)) return 0;
+    return this._isViewportRoot() ? (globalThis.innerWidth || 1280) : 100;
+  }
+  get clientHeight() {
+    if (!_hasSyntheticLayoutBox(this)) return 0;
+    return this._isViewportRoot() ? (globalThis.innerHeight || 720) : 20;
+  }
+  get scrollWidth() {
+    if (!_hasSyntheticLayoutBox(this)) return 0;
+    return this._isViewportRoot() ? (globalThis.innerWidth || 1280) : 100;
+  }
+  get scrollHeight() {
+    if (!_hasSyntheticLayoutBox(this)) return 0;
+    return this._isViewportRoot() ? (globalThis.innerHeight || 720) : 20;
+  }
   _isViewportRoot() {
     const t = this.tagName;
     return t === 'HTML' || t === 'BODY';
@@ -2333,6 +2354,7 @@ class Element extends Node {
     if (changed && !this._scrollSuppress) this._fireScroll();
   }
   getBoundingClientRect() {
+    if (!_hasSyntheticLayoutBox(this)) return _rect(0, 0, 0, 0);
     // documentElement and body span the full viewport. Without this every
     // hit test against them clips down to one synthetic cell and
     // Document.elementFromPoint can never recurse into their children.
@@ -2340,7 +2362,6 @@ class Element extends Node {
       const view = _viewportSize();
       return _rect(0, 0, view.width, view.height);
     }
-    if (!_isHitTestable(this)) return _rect(0, 0, 0, 0);
     const cell = _cellFor(this);
     // Document space to viewport space, the one place scrolling is real.
     return _rect(
@@ -2350,7 +2371,10 @@ class Element extends Node {
       _CELL.height,
     );
   }
-  getClientRects() { return new DOMRectList([this.getBoundingClientRect()]); }
+  getClientRects() {
+    if (!_hasSyntheticLayoutBox(this)) return new DOMRectList([]);
+    return new DOMRectList([this.getBoundingClientRect()]);
+  }
   // Same predicate the hit test uses, so an element cannot claim to be visible
   // and then refuse to be found at its own centre.
   checkVisibility(opts) { return _isHitTestable(this); }
@@ -3195,6 +3219,9 @@ const _CELL = { width: 100, height: 20, gapX: 110, gapY: 30, margin: 10 };
 const _cellIndex = new Map();
 const _cellOwner = new Map();
 let _nextCellIndex = 0;
+let _shadowControlIndex = new WeakMap();
+let _shadowControlCounts = new WeakMap();
+const _shadowControls = new Set();
 
 function _rect(x, y, width, height) {
   return {
@@ -3224,19 +3251,91 @@ function _gridColumns() {
 // out of it zeroes an element's box, which reads to a client as "element is not
 // visible" and stalls every click on the page with no way to see why. An
 // element the page has not explicitly hidden is clickable.
-function _isHitTestable(el) {
+const _NON_RENDERED_HTML_TAGS = new Set([
+  'BASE', 'DATALIST', 'HEAD', 'LINK', 'META', 'NOFRAMES', 'NOSCRIPT', 'PARAM',
+  'RP', 'SCRIPT', 'STYLE', 'TEMPLATE', 'TITLE',
+]);
+
+// Whether an element owns a synthetic CSS box. This is separate from hit
+// testing: Blink keeps layout boxes for visibility:hidden, pointer-events:none,
+// and inert elements even though they cannot receive a pointer hit.
+function _hasSyntheticLayoutBox(el) {
   if (!el || el.nodeType !== 1) return false;
   if (!el.isConnected) return false;
-  if (el.hasAttribute && (el.hasAttribute('hidden') || el.hasAttribute('inert'))) return false;
-  const inline = el.style;
-  if (inline && (inline.display === 'none' || inline.visibility === 'hidden' ||
-                 inline.pointerEvents === 'none')) return false;
+  if (_NON_RENDERED_HTML_TAGS.has(el.tagName)) return false;
+  if (el.tagName === 'INPUT' && String(el.type).toLowerCase() === 'hidden') return false;
+  // A closed dialog has display:none in Blink's user-agent style sheet.
+  if (el.tagName === 'DIALOG' && !el.hasAttribute('open')) return false;
+
+  // Keep this to authored state: Obscura's computed cascade is approximate,
+  // and one bad selector must not hide a real page.
+  for (let node = el; node && node.nodeType === 1; node = node.parentElement) {
+    if (node.hasAttribute && node.hasAttribute('hidden')) return false;
+    if (node.style && node.style.display === 'none') return false;
+  }
+  return !(el.style && el.style.display === 'contents');
+}
+
+function _isHitTestable(el) {
+  if (!_hasSyntheticLayoutBox(el)) return false;
+  // Inertness applies to the full subtree but does not remove layout boxes.
+  for (let node = el; node && node.nodeType === 1; node = node.parentElement) {
+    if (node.hasAttribute && node.hasAttribute('inert')) return false;
+  }
+  // visibility and pointer-events inherit. The nearest authored value wins, so
+  // a child can restore visibility:pointer/visible just as it can in Blink.
+  let visibility = '';
+  let pointerEvents = '';
+  for (let node = el; node && node.nodeType === 1; node = node.parentElement) {
+    const inline = node.style;
+    if (!inline) continue;
+    if (!visibility && inline.visibility) visibility = inline.visibility;
+    if (!pointerEvents && inline.pointerEvents) pointerEvents = inline.pointerEvents;
+  }
+  if (visibility === 'hidden' || visibility === 'collapse' || pointerEvents === 'none') return false;
   return true;
+}
+
+function _isShadowControl(el) {
+  if (!el || !['BUTTON', 'INPUT', 'SELECT', 'TEXTAREA'].includes(el.tagName)) return false;
+  if (el.tagName === 'INPUT' && String(el.type).toLowerCase() === 'hidden') return false;
+  const root = el.getRootNode && el.getRootNode();
+  return typeof ShadowRoot !== 'undefined' && root instanceof ShadowRoot;
+}
+
+function _shadowControlCellFor(el) {
+  const root = el.getRootNode();
+  let index = _shadowControlIndex.get(el);
+  if (index === undefined) {
+    index = _shadowControlCounts.get(root) || 0;
+    _shadowControlCounts.set(root, index + 1);
+    _shadowControlIndex.set(el, index);
+    _shadowControls.add(el);
+  }
+  const hostRect = root.host && root.host.getBoundingClientRect
+    ? root.host.getBoundingClientRect()
+    : _rect(0, 0, _viewportSize().width, _viewportSize().height);
+  const columns = Math.max(1, Math.floor(Math.max(_CELL.width, hostRect.width) / _CELL.gapX));
+  return {
+    x: hostRect.left + (index % columns) * _CELL.gapX,
+    y: hostRect.top + Math.floor(index / columns) * _CELL.gapY,
+  };
+}
+
+function _shadowControlAtPoint(x, y) {
+  let hit = null;
+  for (const el of _shadowControls) {
+    if (!_isHitTestable(el)) continue;
+    const rect = el.getBoundingClientRect();
+    if (x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom) hit = el;
+  }
+  return hit;
 }
 
 // Position in document space. Assigned on first use and never reassigned, so a
 // rect is stable across the two animation frames Playwright compares.
 function _cellFor(el) {
+  if (_isShadowControl(el)) return _shadowControlCellFor(el);
   const nid = _nodeId(el) | 0;
   let index = _cellIndex.get(nid);
   if (index === undefined) {
@@ -3276,7 +3375,16 @@ function _elementInCellAt(x, y) {
 const _pointer = { x: 0, y: 0, inside: null, trusted: false };
 
 function _pointInit(el, type, extra) {
-  const view = _viewportSize();
+  let offsetX = _pointer.x;
+  let offsetY = _pointer.y;
+  if (el !== document.body && el !== document.documentElement &&
+      el && typeof el.getBoundingClientRect === 'function') {
+    try {
+      const rect = el.getBoundingClientRect();
+      offsetX -= rect.left;
+      offsetY -= rect.top;
+    } catch (_) {}
+  }
   return Object.assign({
     bubbles: true,
     cancelable: type !== 'mouseenter' && type !== 'mouseleave' &&
@@ -3290,6 +3398,8 @@ function _pointInit(el, type, extra) {
     screenY: _pointer.y + (globalThis.screenY || 0),
     pageX: _pointer.x + (globalThis.scrollX || 0),
     pageY: _pointer.y + (globalThis.scrollY || 0),
+    offsetX,
+    offsetY,
     button: 0,
     buttons: type === 'mousedown' || type === 'pointerdown' ? 1 : 0,
     relatedTarget: null,
@@ -3329,7 +3439,9 @@ function _firePointer(el, type, extra) {
       event = globalThis.__obscura_markTrusted(event);
     }
     return el.dispatchEvent(event);
-  } catch (_) { return true; }
+  } catch (_) {
+    return true;
+  }
 }
 
 // Move the pointer onto an element, firing what leaving the previous one and
@@ -3406,7 +3518,8 @@ function _activateClickTarget(el) {
 // The one entry point the CDP input domain uses, so a click driven over the
 // wire produces the same event stream as one made by page script.
 globalThis.__obscura_dispatchMouse = function(type, x, y, clickCount) {
-  const target = (document.elementFromPoint && document.elementFromPoint(x, y)) ||
+  const target = _shadowControlAtPoint(x, y) ||
+                 (document.elementFromPoint && document.elementFromPoint(x, y)) ||
                  document.activeElement || document.body;
   if (!target) return;
   _pointer.x = x;
@@ -3418,14 +3531,11 @@ globalThis.__obscura_dispatchMouse = function(type, x, y, clickCount) {
       _pointerMoveOnto(target);
     } else if (type === 'mousePressed') {
       _pointerMoveOnto(target);
-      _firePointer(target, 'pointerdown', { detail });
+      _firePointer(target, 'pointerdown', { detail: 0 });
       _firePointer(target, 'mousedown', { detail });
       try { if (typeof target.focus === 'function') target.focus(); } catch (_) {}
     } else if (type === 'mouseReleased') {
-      const drift = _driftPointer();
-      _firePointer(target, 'pointermove', drift);
-      _firePointer(target, 'mousemove', drift);
-      _firePointer(target, 'pointerup', { detail });
+      _firePointer(target, 'pointerup', { detail: 0 });
       _firePointer(target, 'mouseup', { detail });
       if (_firePointer(target, 'click', { detail })) {
         if (detail >= 3 && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) {
@@ -3701,6 +3811,22 @@ function _installFramingRelationships() {
   }
 }
 
+function _loadIframeSrcdoc(el, html) {
+  const url = 'about:srcdoc';
+  el._iframeDoc = new _IframeDocument(String(html), url, el);
+  if (el._iframeWin) {
+    el._iframeWin._adopt(el._iframeDoc, url, 0);
+  } else {
+    el._iframeWin = new _IframeWindow(el._iframeDoc, url);
+  }
+  el._iframeLoadInfo = { ok: true, status: 200, url, length: String(html).length };
+  setTimeout(() => {
+    try {
+      el.dispatchEvent(globalThis.__obscura_markTrusted(new Event('load')));
+    } catch (_) {}
+  }, 0);
+}
+
 function _loadIframeSrc(el, url) {
   let fullUrl = url;
   if (!url.includes('://')) {
@@ -3718,7 +3844,17 @@ function _loadIframeSrc(el, url) {
     // Hand the document to the host, which gives this frame a realm of its own
     // and runs the scripts that came with it. The shim document below stays for
     // now: it is what the parent still reads through contentDocument.
-    el._frameId = _denoCore.ops.op_frame_document_ready(result.url, result.html);
+    const frameRect = el.getBoundingClientRect();
+    const frameDimension = (styleValue, attributeValue, measured, fallback) => {
+      const authored = parseFloat(styleValue || attributeValue || '');
+      if (Number.isFinite(authored) && authored > 0) return Math.round(authored);
+      if (Number.isFinite(measured) && measured > 0) return Math.round(measured);
+      return fallback;
+    };
+    const frameWidth = frameDimension(el.style?.width, el.getAttribute('width'), frameRect.width, 300);
+    const frameHeight = frameDimension(el.style?.height, el.getAttribute('height'), frameRect.height, 150);
+    el._frameId = _denoCore.ops.op_frame_document_ready(
+      result.url, result.html, frameWidth, frameHeight);
     el._iframeDoc = new _IframeDocument(result.html, result.url, el);
     // Reuse the window object if the page already took one, so a reference
     // captured before the load still identifies this frame. Binding it to the
@@ -4709,6 +4845,13 @@ function _serializeBody(initBody, headers) {
 }
 
 globalThis.fetch = async (input, init = {}) => {
+  if (Array.isArray(globalThis.__probeApiCalls)) {
+    try {
+      globalThis.__probeApiCalls.push({ api: 'fetch', input: String(input && (input.url || input.href) || input),
+        initKeys: Object.keys(init || {}), privateToken: init && init.privateToken || null,
+        method: init && init.method || '' });
+    } catch (_) {}
+  }
   let url = typeof input === "string"
     ? input
     : (input instanceof Request
@@ -4724,6 +4867,12 @@ globalThis.fetch = async (input, init = {}) => {
   let _h = init.headers instanceof Headers ? Object.fromEntries(init.headers.entries()) : (init.headers || {});
   const body = _serializeBody(init.body, _h);
   const hdrs = JSON.stringify(_h);
+  if (Array.isArray(globalThis.__probeApiCalls)) {
+    try {
+      globalThis.__probeApiCalls.push({ api: 'fetch-serialized', url, method,
+        headers: _h, body, bodyLength: body.length });
+    } catch (_) {}
+  }
   const fetchMode = init.mode || (input instanceof Request ? input.mode : "cors");
   const pageOrigin = (function() { try { const u = new URL(_domParse("document_url") || "about:blank"); return u.origin; } catch(e) { return ""; } })();
   const raw = await _denoCore.ops.op_fetch_url(url, method, hdrs, body, pageOrigin, _documentUrl(), fetchMode, "fetch");
@@ -5005,7 +5154,9 @@ globalThis.XMLHttpRequest = class XMLHttpRequest extends XMLHttpRequestEventTarg
   _fireEvent(type) {
     const event = { type, target: this, currentTarget: this, bubbles: false };
     const handlers = this._listeners[type] || [];
-    for (const h of handlers) { try { h.call(this, event); } catch(e) {} }
+    for (const h of handlers) {
+      try { h.call(this, event); } catch(e) {}
+    }
     const prop = 'on' + type;
     if (type !== 'readystatechange' && typeof this[prop] === 'function') {
       try { this[prop](event); } catch(e) {}
@@ -6272,7 +6423,13 @@ function _blobPartToBytes(p, native) {
   if (native) s = s.replace(/\r\n|\r|\n/g, "\n");
   return new TextEncoder().encode(s);
 }
-function _bytesToBinaryString(bytes) { let s = ""; for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]); return s; }
+function _bytesToBinaryString(bytes) {
+  const chunks = [];
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    chunks.push(String.fromCharCode(...bytes.subarray(i, i + 0x8000)));
+  }
+  return chunks.join("");
+}
 if (typeof Blob === "undefined") globalThis.Blob = class Blob {
   constructor(parts, opts) {
     opts = opts || {};
@@ -6924,7 +7081,7 @@ globalThis.btoa = (s) => {
   }
   return r;
 };
-globalThis.atob = globalThis.atob || ((s) => { const c="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"; let r=[]; for(let i=0;i<s.length;i+=4){const a=c.indexOf(s[i]),b=c.indexOf(s[i+1]),cc=c.indexOf(s[i+2]),d=c.indexOf(s[i+3]); r.push((a<<2)|(b>>4)); if(cc>=0)r.push(((b&15)<<4)|(cc>>2)); if(d>=0)r.push(((cc&3)<<6)|d);} return String.fromCharCode(...r); });
+globalThis.atob = globalThis.atob || ((s) => _bytesToBinaryString(_base64ToUint8Array(s)));
 
 // Functional History API. The earlier stub returned constant state and was a
 // no-op on push/replace, so any SPA that tried to update its URL (Next.js
@@ -7694,11 +7851,56 @@ class _IframeDocument {
   close() {}
 }
 
+function _evalInIframeWindow(frameWindow, source) {
+  const trace = Array.isArray(globalThis.__iframeEvalTrace)
+    ? globalThis.__iframeEvalTrace : null;
+  if (trace) trace.push({ kind: 'eval', sourceLength: typeof source === 'string' ? source.length : -1,
+    source: typeof source === 'string' && source.length < 500 ? source : '' });
+  if (typeof source !== 'string') return source;
+  const trimmed = source.trim();
+  if (trimmed === 'this' || trimmed === 'window' || trimmed === 'self' ||
+      trimmed === 'globalThis') return frameWindow;
+
+  const mayDeclare = /\b(?:var|function|class)\b/.test(source);
+  const before = mayDeclare ? new Set(Object.getOwnPropertyNames(globalThis)) : null;
+  let result;
+  try {
+    result = (0, globalThis.eval)(source);
+  } finally {
+    if (before) {
+      for (const name of Object.getOwnPropertyNames(globalThis)) {
+        if (before.has(name)) continue;
+        try {
+          const descriptor = Object.getOwnPropertyDescriptor(globalThis, name);
+          if (trace && descriptor && Object.prototype.hasOwnProperty.call(descriptor, 'value')) {
+            let value = descriptor.value;
+            Object.defineProperty(frameWindow, name, {
+              configurable: descriptor.configurable,
+              enumerable: descriptor.enumerable,
+              get() {
+                trace.push({ kind: 'get', name, valueType: typeof value,
+                  stack: String(new Error().stack || '') });
+                return value;
+              },
+              set(next) { value = next; },
+            });
+          } else {
+            Object.defineProperty(frameWindow, name, descriptor);
+          }
+          delete globalThis[name];
+        } catch (_) {}
+      }
+    }
+  }
+  return result;
+}
+
 class _IframeWindow {
   constructor(doc, url) {
     this.document = doc;
     this._url = url;
     this.self = this;
+    this.globalThis = this;
     this.top = globalThis;
     this.parent = globalThis;
     this.window = this;
@@ -7720,6 +7922,31 @@ class _IframeWindow {
     this.crypto = globalThis.crypto;
     this.console = globalThis.console;
     this.chrome = globalThis.chrome;
+    this.Window = _IframeWindow;
+    const frameWindow = this;
+    const frameEval = (source) => _evalInIframeWindow(frameWindow, source);
+    Object.defineProperty(frameEval, 'name', { value: 'eval', configurable: true });
+    const evalTrace = Array.isArray(globalThis.__iframeWindowTrace)
+      ? globalThis.__iframeWindowTrace : null;
+    const traceEval = (operation, name) => {
+      if (evalTrace && evalTrace.length < 500) {
+        evalTrace.push({ kind: 'eval-' + operation, name: name === undefined ? '' : String(name),
+          stack: String(new Error().stack || '') });
+      }
+    };
+    const exposedEval = evalTrace ? new Proxy(frameEval, {
+      get(target, name, receiver) { traceEval('get', name); return Reflect.get(target, name, receiver); },
+      getPrototypeOf(target) { traceEval('getPrototypeOf'); return Reflect.getPrototypeOf(target); },
+      getOwnPropertyDescriptor(target, name) { traceEval('descriptor', name); return Reflect.getOwnPropertyDescriptor(target, name); },
+      ownKeys(target) { traceEval('ownKeys'); return Reflect.ownKeys(target); },
+      has(target, name) { traceEval('has', name); return Reflect.has(target, name); },
+      apply(target, thisArg, args) { traceEval('apply'); return Reflect.apply(target, thisArg, args); },
+      construct(target, args, newTarget) { traceEval('construct'); return Reflect.construct(target, args, newTarget); },
+    }) : frameEval;
+    _markNative(exposedEval);
+    Object.defineProperty(this, 'eval', {
+      value: exposedEval, writable: true, enumerable: false, configurable: true,
+    });
     // This is not a separate realm, but it exposes the same profile-backed
     // graphics constructors and keeps canvas resource state per object.
     for (const name of [
@@ -7744,6 +7971,19 @@ class _IframeWindow {
       };
     } catch(e) {
       this.location = { href: url, origin: '', protocol: '', host: '', hostname: '', port: '', pathname: '/', search: '', hash: '', toString() { return url; }, assign(){}, reload(){}, replace(){} };
+    }
+    const windowTrace = Array.isArray(globalThis.__iframeWindowTrace)
+      ? globalThis.__iframeWindowTrace : null;
+    if (windowTrace) {
+      return new Proxy(this, {
+        get(target, name, receiver) {
+          if (windowTrace.length < 500) {
+            windowTrace.push({ kind: 'get', name: String(name),
+              stack: String(new Error().stack || '') });
+          }
+          return Reflect.get(target, name, receiver);
+        },
+      });
     }
   }
 
@@ -7808,6 +8048,11 @@ class _IframeWindow {
   focus() {}
   blur() {}
 }
+
+Object.defineProperty(_IframeWindow, 'name', { value: 'Window' });
+Object.defineProperty(_IframeWindow.prototype, Symbol.toStringTag, {
+  value: 'Window', configurable: true,
+});
 
 // Encode an RGBA pixel buffer into a valid PNG data URL.
 // Uses stored-block DEFLATE (no compression) wrapped in zlib.
@@ -8406,7 +8651,21 @@ if (typeof PointerEvent === 'undefined') {
 }
 
 if (typeof navigator.credentials === 'undefined') {
-  _defineNavigatorValue('credentials', { get(){return Promise.resolve(null);}, create(){return Promise.resolve(null);}, store(){return Promise.resolve();}, preventSilentAccess(){return Promise.resolve();} });
+  _defineNavigatorValue('credentials', {
+    get(options){
+      if (Array.isArray(globalThis.__probeApiCalls)) {
+        try { globalThis.__probeApiCalls.push({ api: 'credentials.get', keys: Object.keys(options || {}) }); } catch (_) {}
+      }
+      return Promise.resolve(null);
+    },
+    create(options){
+      if (Array.isArray(globalThis.__probeApiCalls)) {
+        try { globalThis.__probeApiCalls.push({ api: 'credentials.create', keys: Object.keys(options || {}) }); } catch (_) {}
+      }
+      return Promise.resolve(null);
+    },
+    store(){return Promise.resolve();}, preventSilentAccess(){return Promise.resolve();}
+  });
 }
 
 _defineNavigatorValue('mediaCapabilities', {
@@ -8623,7 +8882,8 @@ globalThis.Worker = class Worker {
 
   _dispatchMessageToOwner(data) {
     if (this._terminated) return;
-    const event = { type: 'message', data };
+    const event = globalThis.__obscura_markTrusted(
+      new MessageEvent('message', { data, origin: '', source: null }));
     if (typeof this.onmessage === 'function') this.onmessage.call(this, event);
     for (const handler of this._listeners.message || []) handler.call(this, event);
   }
@@ -8631,7 +8891,8 @@ globalThis.Worker = class Worker {
   _dispatchMessageToScope(data) {
     if (this._terminated) return;
     const scope = this._makeScope();
-    const event = { type: 'message', data };
+    const event = globalThis.__obscura_markTrusted(
+      new MessageEvent('message', { data, origin: '', source: null }));
     try {
       for (const handler of scope._workerListeners?.message || []) handler.call(scope, event);
       if (typeof scope.onmessage === 'function') scope.onmessage.call(scope, event);
@@ -9556,8 +9817,16 @@ globalThis.__obscura_init = function() {
   _cellIndex.clear();
   _cellOwner.clear();
   _nextCellIndex = 0;
+  _shadowControlIndex = new WeakMap();
+  _shadowControlCounts = new WeakMap();
+  _shadowControls.clear();
 
-  globalThis.document = new (globalThis.HTMLDocument || Document)(+_dom("document_node_id"));
+  const documentNodeId = +_dom("document_node_id");
+  globalThis.document = new (globalThis.HTMLDocument || Document)(documentNodeId);
+  // Parent traversal must return the same Document object scripts use.
+  // Without this, body -> html -> document ends at a second wrapper, so
+  // bubbling events never reach listeners registered on global document.
+  _cache.set(documentNodeId, globalThis.document);
 
   const scr = _fingerprintProfile && _fingerprintProfile.screen || {
     width:1920,height:1080,availWidth:1920,availHeight:1040,availLeft:0,availTop:0,

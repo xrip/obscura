@@ -5,6 +5,60 @@ use crate::dispatch::CdpContext;
 use crate::types::CdpEvent;
 use crate::util::url_is_file_scheme;
 
+fn child_frame_id(page_frame_id: &str, frame_id: u32) -> String {
+    format!("{page_frame_id}-frame-{frame_id}")
+}
+
+fn child_frame_value(
+    page_frame_id: &str,
+    frame: &obscura_js::frame::FrameRealm,
+) -> Value {
+    let id = child_frame_id(page_frame_id, frame.frame_id());
+    let parent_id = if frame.parent_frame_id() == 0 {
+        page_frame_id.to_string()
+    } else {
+        child_frame_id(page_frame_id, frame.parent_frame_id())
+    };
+    json!({
+        "id": id,
+        "parentId": parent_id,
+        "loaderId": format!("{id}-loader"),
+        "url": frame.url(),
+        "domainAndRegistry": "",
+        "securityOrigin": frame.origin(),
+        "mimeType": "text/html",
+        "adFrameStatus": { "adFrameType": "none" },
+    })
+}
+
+fn frame_tree(page: &obscura_browser::Page) -> Value {
+    fn children(page: &obscura_browser::Page, parent_frame_id: u32) -> Vec<Value> {
+        page.frames
+            .iter()
+            .filter(|frame| frame.parent_frame_id() == parent_frame_id)
+            .map(|frame| {
+                json!({
+                    "frame": child_frame_value(&page.frame_id, frame),
+                    "childFrames": children(page, frame.frame_id()),
+                })
+            })
+            .collect()
+    }
+
+    json!({
+        "frame": {
+            "id": page.frame_id,
+            "loaderId": "initial-loader",
+            "url": page.url_string(),
+            "domainAndRegistry": "",
+            "securityOrigin": page.url_string(),
+            "mimeType": "text/html",
+            "adFrameStatus": { "adFrameType": "none" },
+        },
+        "childFrames": children(page, 0),
+    })
+}
+
 /// Emit the post-navigation event stream into `ctx.pending_events`. Shared
 /// by both the in-process `do_navigate` path and the spawned path in
 /// `server::process_navigation`, so the recent goto-returns-Response /
@@ -22,6 +76,15 @@ pub fn emit_navigation_events(
 ) {
     let es = session_id.clone();
     let ts = timestamp();
+    let child_frames: Vec<Value> = ctx
+        .get_page(page_id)
+        .map(|page| {
+            page.frames
+                .iter()
+                .map(|frame| child_frame_value(frame_id, frame))
+                .collect()
+        })
+        .unwrap_or_default();
 
     // Real Chrome uses the navigation's loaderId as the main document's
     // request id, and Puppeteer/Playwright identify the navigation response
@@ -104,6 +167,20 @@ pub fn emit_navigation_events(
         });
     }
     phase1.push(CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "commit", "timestamp": ts}), session_id: es.clone() });
+    for frame in &child_frames {
+        let child_id = frame["id"].as_str().unwrap_or_default();
+        let parent_id = frame["parentId"].as_str().unwrap_or_default();
+        phase1.push(CdpEvent {
+            method: "Page.frameAttached".into(),
+            params: json!({"frameId": child_id, "parentFrameId": parent_id}),
+            session_id: es.clone(),
+        });
+        phase1.push(CdpEvent {
+            method: "Page.frameNavigated".into(),
+            params: json!({"frame": frame, "type": "Navigation"}),
+            session_id: es.clone(),
+        });
+    }
     ctx.pending_events.extend(phase1);
 
     if ctx.fetch_intercept.enabled {
@@ -159,6 +236,13 @@ pub fn emit_navigation_events(
         phase3.push(CdpEvent { method: "Page.lifecycleEvent".into(), params: json!({"frameId": frame_id, "loaderId": loader_id, "name": "networkIdle", "timestamp": idle_ts}), session_id: es.clone() });
     }
     phase3.push(CdpEvent { method: "Page.frameStoppedLoading".into(), params: json!({"frameId": frame_id}), session_id: es });
+    for frame in &child_frames {
+        phase3.push(CdpEvent {
+            method: "Page.frameStoppedLoading".into(),
+            params: json!({"frameId": frame["id"]}),
+            session_id: session_id.clone(),
+        });
+    }
     ctx.pending_events.extend(phase3);
 
     // Target.targetInfoChanged: strict CDP clients (browser-use, and
@@ -318,20 +402,7 @@ pub async fn handle(
         }
         "getFrameTree" => {
             let page = ctx.get_session_page(session_id).ok_or("No page for session")?;
-            Ok(json!({
-                "frameTree": {
-                    "frame": {
-                        "id": page.frame_id,
-                        "loaderId": "initial-loader",
-                        "url": page.url_string(),
-                        "domainAndRegistry": "",
-                        "securityOrigin": page.url_string(),
-                        "mimeType": "text/html",
-                        "adFrameStatus": { "adFrameType": "none" },
-                    },
-                    "childFrames": [],
-                }
-            }))
+            Ok(json!({ "frameTree": frame_tree(page) }))
         }
         "createIsolatedWorld" => {
             let (frame_id_param, world_name, page_url, page_id) = {
@@ -551,6 +622,40 @@ mod tests {
     use super::*;
     use crate::dispatch::CdpContext;
 
+    fn context_with_nested_frames() -> (CdpContext, String, String) {
+        let mut ctx = CdpContext::new();
+        let page_id = ctx.create_page();
+        let session_id = format!("{page_id}-session");
+        ctx.sessions.insert(session_id.clone(), page_id.clone());
+
+        let page = ctx.get_page_mut(&page_id).expect("page exists");
+        let mut runtime = obscura_js::runtime::ObscuraJsRuntime::new();
+        runtime.set_dom(obscura_dom::parse_html("<html><body>root</body></html>"));
+        runtime.set_url("about:blank");
+        runtime.run_page_init();
+        page.js = Some(runtime);
+        let js = page.js.as_mut().expect("blank page has a JS runtime");
+        let child = obscura_js::frame::FrameRealm::new(
+            js,
+            1,
+            0,
+            "https://child.example/frame",
+            "<html><body>child</body></html>",
+        )
+        .expect("child realm");
+        let grandchild = obscura_js::frame::FrameRealm::new(
+            js,
+            2,
+            1,
+            "https://nested.example/frame",
+            "<html><body>nested</body></html>",
+        )
+        .expect("nested realm");
+        page.frames.extend([child, grandchild]);
+
+        (ctx, page_id, session_id)
+    }
+
     #[tokio::test]
     async fn get_layout_metrics_returns_chrome_default_viewport() {
         let mut ctx = CdpContext::new();
@@ -594,6 +699,52 @@ mod tests {
             .await
             .expect_err("unknown methods must surface as errors");
         assert!(err.contains("Unknown Page method"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn get_frame_tree_includes_nested_child_frames() {
+        let (mut ctx, _page_id, session_id) = context_with_nested_frames();
+        let result = handle("getFrameTree", &json!({}), &mut ctx, &Some(session_id))
+            .await
+            .expect("getFrameTree should succeed");
+
+        let root = &result["frameTree"];
+        let child = &root["childFrames"][0];
+        let nested = &child["childFrames"][0];
+        assert_eq!(child["frame"]["parentId"], root["frame"]["id"]);
+        assert_eq!(child["frame"]["url"], "https://child.example/frame");
+        assert_eq!(nested["frame"]["parentId"], child["frame"]["id"]);
+        assert_eq!(nested["frame"]["url"], "https://nested.example/frame");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn navigation_emits_child_frame_attach_before_navigate() {
+        let (mut ctx, page_id, session_id) = context_with_nested_frames();
+        let (frame_id, page_url) = {
+            let page = ctx.get_page(&page_id).expect("page exists");
+            (page.frame_id.clone(), page.url_string())
+        };
+
+        emit_navigation_events(
+            &mut ctx,
+            &Some(session_id),
+            &frame_id,
+            "loader-test",
+            &page_url,
+            &page_id,
+            &[],
+            WaitUntil::Load,
+            false,
+        );
+
+        let child_id = child_frame_id(&frame_id, 1);
+        let attach = ctx.pending_events.iter().position(|event| {
+            event.method == "Page.frameAttached" && event.params["frameId"] == child_id
+        }).expect("child frameAttached event");
+        let navigate = ctx.pending_events.iter().position(|event| {
+            event.method == "Page.frameNavigated" && event.params["frame"]["id"] == child_id
+        }).expect("child frameNavigated event");
+        assert!(attach < navigate, "frameAttached must come before frameNavigated");
     }
 
     #[tokio::test]

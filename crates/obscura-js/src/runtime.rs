@@ -1166,56 +1166,20 @@ impl ObscuraJsRuntime {
         if timeout.is_zero() {
             return self.execute_named_script(name, source);
         }
-
-        let isolate_handle = self.runtime.v8_isolate().thread_safe_handle();
-
-        let pair = std::sync::Arc::new((
-            std::sync::Mutex::new(false),
-            std::sync::Condvar::new(),
-        ));
-        let pair_clone = pair.clone();
-
-        let watchdog = std::thread::spawn(move || {
-            let (lock, cvar) = &*pair_clone;
-            let mut cancelled = lock.lock().unwrap();
-            let deadline = std::time::Instant::now() + timeout;
-
-            loop {
-                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-                if remaining.is_zero() {
-                    isolate_handle.terminate_execution();
-                    return;
-                }
-
-                let result = cvar.wait_timeout(cancelled, remaining).unwrap();
-                cancelled = result.0;
-                if *cancelled {
-                    return;
-                }
-            }
-        });
-
+        let token = self.arm_watchdog(timeout);
         let result = self.execute_named_script(name, source);
-
-        {
-            let (lock, cvar) = &*pair;
-            let mut cancelled = lock.lock().unwrap();
-            *cancelled = true;
-            cvar.notify_one();
-        }
-        let _ = watchdog.join();
-
+        let fired = self.disarm_watchdog(token);
         match result {
-            Ok(_) => Ok(()),
-            Err(msg) => {
-                if msg.contains("Uncaught Error: execution terminated") {
-                    tracing::warn!("Script killed after {}s timeout", timeout.as_secs());
-                    self.runtime.execute_script("<reset>", "undefined".to_string()).ok();
-                    Ok(())
-                } else {
-                    Err(msg)
-                }
+            Ok(_) if !fired => Ok(()),
+            Ok(_) => {
+                tracing::warn!("Script killed after {}s timeout", timeout.as_secs());
+                Ok(())
             }
+            Err(msg) if fired || msg.contains("execution terminated") => {
+                tracing::warn!("Script killed after {}s timeout", timeout.as_secs());
+                Ok(())
+            }
+            Err(msg) => Err(msg),
         }
     }
 
@@ -2212,9 +2176,16 @@ mod tests {
           const b=frame.contentDocument.createElement('canvas').getContext('webgl');
           const ea=a.getExtension('WEBGL_debug_renderer_info'),eb=b.getExtension('WEBGL_debug_renderer_info');
           const ba=a.createBuffer(),bb=b.createBuffer();
-          return JSON.stringify([frame.contentWindow.navigator.userAgent===navigator.userAgent,frame.contentWindow.screen.width===screen.width,frame.contentWindow.WebGLRenderingContext===WebGLRenderingContext,a!==b,a.isBuffer(bb),a.getParameter(ea.UNMASKED_RENDERER_WEBGL)===b.getParameter(eb.UNMASKED_RENDERER_WEBGL)]);
+          const child=frame.contentWindow;
+          const childThis=child.eval('this')===child;
+          child.eval('function obscuraFrameEvalProbe(){return this}');
+          const childDeclaration=typeof child.obscuraFrameEvalProbe==='function'&&child.obscuraFrameEvalProbe()===child&&typeof globalThis.obscuraFrameEvalProbe==='undefined';
+          const evalDescriptor=Object.getOwnPropertyDescriptor(child,'eval');
+          let evalConstructible=true;try{Reflect.construct(child.eval,[])}catch(_){evalConstructible=false}
+          const childSurface=Object.prototype.toString.call(child)==='[object Window]'&&child.constructor.name==='Window'&&child.Window===child.constructor&&child instanceof child.Window&&Object.prototype.hasOwnProperty.call(child,'eval')&&child.eval!==globalThis.eval&&Function.prototype.toString.call(child.eval)==='function eval() { [native code] }'&&!evalDescriptor.enumerable&&evalDescriptor.writable&&evalDescriptor.configurable&&child.eval.length===1&&!Object.prototype.hasOwnProperty.call(child.eval,'prototype')&&!evalConstructible;
+          return JSON.stringify([child.navigator.userAgent===navigator.userAgent,child.screen.width===screen.width,child.WebGLRenderingContext===WebGLRenderingContext,typeof child.eval==='function',child.eval('1+2')===3,childThis,childDeclaration,childSurface,a!==b,a.isBuffer(bb),a.getParameter(ea.UNMASKED_RENDERER_WEBGL)===b.getParameter(eb.UNMASKED_RENDERER_WEBGL)]);
         })()"#).unwrap();
-        assert_eq!(value.as_str(), Some("[true,true,true,true,false,true]"));
+        assert_eq!(value.as_str(), Some("[true,true,true,true,true,true,true,true,true,false,true]"));
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -2277,6 +2248,40 @@ mod tests {
             serde_json::json!([true, "undefined", "undefined", true, true, "function", 41])
         );
         assert_eq!(&state[1..], ["1", "2"]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_messages_are_trusted_message_events() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "worker-message-event-test",
+            r#"
+              globalThis.__workerMessageEvent = null;
+              const source = 'onmessage = event => postMessage(JSON.stringify([' +
+                'event instanceof MessageEvent,event.isTrusted,event.origin,event.source' +
+              ']));';
+              const worker = new Worker(
+                URL.createObjectURL(new Blob([source], {type:'text/javascript'}))
+              );
+              worker.onmessage = event => {
+                globalThis.__workerMessageEvent = [
+                  event instanceof MessageEvent,
+                  event.isTrusted,
+                  event.origin,
+                  event.source,
+                  JSON.parse(event.data)
+                ];
+                worker.terminate();
+              };
+              worker.postMessage('run');
+            "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("globalThis.__workerMessageEvent").unwrap(),
+            serde_json::json!([true, true, "", null, [true, true, "", null]])
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -3233,6 +3238,51 @@ mod tests {
         );
     }
 
+    #[test]
+    fn shadow_controls_are_not_pushed_outside_a_small_viewport() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    innerWidth = 300;
+                    innerHeight = 65;
+                    const root = document.body.attachShadow({ mode: 'closed' });
+                    for (let i = 0; i < 24; i++) {
+                        const wrapper = document.createElement('div');
+                        root.appendChild(wrapper);
+                        wrapper.getBoundingClientRect();
+                    }
+                    const input = document.createElement('input');
+                    input.type = 'checkbox';
+                    root.appendChild(input);
+                    let trusted = false;
+                    input.addEventListener('click', event => { trusted = event.isTrusted; });
+                    const rect = input.getBoundingClientRect();
+                    const x = rect.left + rect.width / 2;
+                    const y = rect.top + rect.height / 2;
+                    for (const type of ['mouseMoved', 'mousePressed', 'mouseReleased']) {
+                        __obscura_dispatchMouse(type, x, y, 1);
+                    }
+                    return { rect, trusted, checked: input.checked };
+                })()"#,
+            )
+            .unwrap();
+        assert!(result["rect"]["bottom"].as_f64().unwrap() <= 65.0, "{result}");
+        assert_eq!(result["trusted"], true, "{result}");
+        assert_eq!(result["checked"], true, "{result}");
+    }
+
+    #[test]
+    fn script_watchdog_leaves_the_runtime_usable() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script_with_timeout(
+            "while (true) {}",
+            std::time::Duration::from_millis(20),
+        )
+        .unwrap();
+        assert_eq!(rt.evaluate("1 + 1").unwrap().as_f64(), Some(2.0));
+    }
+
     /// Chrome carries these on HTMLIFrameElement.prototype. Scripts feature-test
     /// them before configuring a frame, so their absence is itself a signal.
     #[test]
@@ -3264,6 +3314,39 @@ mod tests {
                 "allow": "fullscreen",
                 "allowFullscreen": true,
                 "widthAttribute": "300",
+            })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn iframe_srcdoc_creates_a_document_and_fires_load() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "iframe-srcdoc-test",
+            r#"
+              globalThis.__srcdocLoad = null;
+              const frame = document.createElement('iframe');
+              frame.onload = event => {
+                globalThis.__srcdocLoad = {
+                  trusted: event.isTrusted,
+                  text: frame.contentDocument.body.textContent,
+                  sameWindow: frame.contentDocument.defaultView === frame.contentWindow,
+                  url: frame.contentDocument.URL,
+                };
+              };
+              frame.srcdoc = '<html><body>inside</body></html>';
+              document.body.appendChild(frame);
+            "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("globalThis.__srcdocLoad").unwrap(),
+            serde_json::json!({
+                "trusted": true,
+                "text": "inside",
+                "sameWindow": true,
+                "url": "about:srcdoc",
             })
         );
     }
@@ -4160,6 +4243,41 @@ mod tests {
             return count;
         "#).unwrap();
         assert_eq!(result.as_f64().unwrap() as i64, 1);
+    }
+
+    #[test]
+    fn document_parent_wrapper_keeps_identity_and_receives_bubbled_click() {
+        let mut rt = setup_runtime(r#"<button id="go">Go</button>"#);
+        let result = rt.evaluate(r#"
+            let clicks = 0, point = null, events = [];
+            for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
+                document.addEventListener(type, event => events.push({
+                    type, detail: event.detail, offsetX: event.offsetX, offsetY: event.offsetY
+                }));
+            }
+            document.addEventListener('click', event => {
+                if (event.target.id === 'go' && event.isTrusted) {
+                    clicks += 1;
+                    point = [event.clientX, event.clientY];
+                }
+            });
+            document.getElementById('go').getBoundingClientRect();
+            globalThis.__obscura_dispatchMouse('mousePressed', 50, 10, 1);
+            globalThis.__obscura_dispatchMouse('mouseReleased', 50, 10, 1);
+            return { same: document.documentElement.parentNode === document, clicks, point, events };
+        "#).unwrap();
+        assert_eq!(result, serde_json::json!({
+            "same": true,
+            "clicks": 1,
+            "point": [50, 10],
+            "events": [
+                { "type": "pointerdown", "detail": 0, "offsetX": 40, "offsetY": 0 },
+                { "type": "mousedown", "detail": 1, "offsetX": 40, "offsetY": 0 },
+                { "type": "pointerup", "detail": 0, "offsetX": 40, "offsetY": 0 },
+                { "type": "mouseup", "detail": 1, "offsetX": 40, "offsetY": 0 },
+                { "type": "click", "detail": 1, "offsetX": 40, "offsetY": 0 }
+            ]
+        }));
     }
 
     #[test]
@@ -5204,6 +5322,48 @@ mod tests {
         assert_eq!(inf, serde_json::Value::Null);
     }
 
+    #[test]
+    fn technical_elements_do_not_get_hit_test_boxes() {
+        let mut rt = setup_runtime(
+            "<html><head><style id=s>button{color:red}</style><script id=j></script></head>\
+             <body><template id=t></template><datalist id=d></datalist><param id=p>\
+             <rp id=r></rp><noframes id=n></noframes><input id=h type=hidden>\
+             <button id=b>go</button></body></html>",
+        );
+        let state = rt.evaluate(
+            "JSON.stringify(['s','j','t','d','p','r','n','h'].map(id=>{const e=document.getElementById(id);\
+             const r=e.getBoundingClientRect();return [e.checkVisibility(),e.offsetWidth,\
+             e.clientWidth,e.getClientRects().length,r.width,r.height]}).concat([\
+             [document.getElementById('b').checkVisibility(),\
+              document.getElementById('b').getBoundingClientRect().width]]))",
+        ).unwrap();
+        assert_eq!(state, serde_json::json!(
+            r#"[[false,0,0,0,0,0],[false,0,0,0,0,0],[false,0,0,0,0,0],[false,0,0,0,0,0],[false,0,0,0,0,0],[false,0,0,0,0,0],[false,0,0,0,0,0],[false,0,0,0,0,0],[true,100]]"#
+        ));
+    }
+
+    #[test]
+    fn hidden_or_inert_ancestor_removes_descendant_from_hit_testing() {
+        let mut rt = setup_runtime(
+            "<div hidden><button id=hidden>no</button></div>\
+             <div inert><button id=inert>no</button></div>\
+             <div style='display:none'><button id=none>no</button></div>\
+             <div style='display:contents' id=contents><button id=child>yes</button></div>\
+             <div style='visibility:hidden'><button id=inherited>no</button></div>\
+             <div style='visibility:hidden'><button id=restored style='visibility:visible'>yes</button></div>\
+             <button id=invisible style='visibility:hidden'>no</button>\
+             <button id=shown>yes</button>",
+        );
+        let state = rt.evaluate(
+            "JSON.stringify(['hidden','inert','none','contents','child','inherited','restored','invisible','shown'].map(id=>{\
+             const e=document.getElementById(id),r=e.getBoundingClientRect();\
+             return [e.checkVisibility(),r.width,e.getClientRects().length]}))",
+        ).unwrap();
+        assert_eq!(state, serde_json::json!(
+            r#"[[false,0,0],[false,100,1],[false,0,0],[false,0,0],[true,100,1],[false,100,1],[true,100,1],[false,100,1],[true,100,1]]"#
+        ));
+    }
+
     // Issue #139 — proxy_url must thread through to both the ES-module
     // loader (module_loader.rs) and op_fetch_url's reqwest client
     // (ops.rs::build_request_client). Pre-fix both built clients with
@@ -5464,6 +5624,20 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result, serde_json::json!(["45Hu", [0xe3, 0x91, 0xee]]));
+    }
+
+    #[test]
+    fn atob_decodes_large_input_without_overflowing_the_stack() {
+        let mut rt = setup_runtime("<div></div>");
+        let result = rt
+            .evaluate(
+                r#"
+                const decoded = atob("QUJD".repeat(225000));
+                return [decoded.length, decoded.slice(0, 6), decoded.slice(-6)];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([675000, "ABCABC", "ABCABC"]));
     }
 
     #[test]

@@ -785,6 +785,12 @@ async fn cdp_processor(
     // registers and stays registered across iterations, so a later
     // `notify_waiters()` wakes this processor even while it is mid-dispatch.
     let mut shutdown = Box::pin(shutdown_notify.notified());
+    // A browser page keeps running when no CDP command is in flight. Without a
+    // host tick, Obscura stopped timers, promises, workers, and frame messages
+    // as soon as Page.navigate returned. Keep this modest: settle exits at once
+    // when V8 is idle and its own watchdog bounds busy page work.
+    let mut page_tick = tokio::time::interval(std::time::Duration::from_millis(50));
+    page_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         // Drain any deferred messages from the previous interception window
@@ -802,6 +808,16 @@ async fn cdp_processor(
                 _ = &mut shutdown => {
                     tracing::info!("Shutdown signal received (connection processor)");
                     break;
+                }
+                _ = page_tick.tick(), if ctx.pages.iter().any(|page| page.has_js()) => {
+                    let lock = ctx.v8_lock.clone();
+                    let _v8_guard = lock.lock_owned().await;
+                    for page in &mut ctx.pages {
+                        if page.has_js() {
+                            page.settle(25).await;
+                        }
+                    }
+                    continue;
                 }
             }
         };
