@@ -880,6 +880,65 @@ fn fetch_timeout() -> std::time::Duration {
     std::time::Duration::from_millis(timeout_ms)
 }
 
+/// Records a scripted request so the CDP layer can emit
+/// `Network.requestWillBeSent` / `responseReceived` for it, and
+/// `Network.getResponseBody` can resolve. Both transports call this: the
+/// stealth one used to record nothing, so a stealth build — the only one worth
+/// pointing at a real site — reported almost none of its traffic over CDP and
+/// could not be tooled with Playwright's request/response events.
+fn record_scripted_request(
+    state: &Rc<RefCell<OpState>>,
+    url: &str,
+    method: &str,
+    status: u16,
+    resp_headers: &HashMap<String, String>,
+    resp_bytes: &[u8],
+    resp_body: &str,
+) -> String {
+    let state_borrow = state.borrow();
+    let gs = state_borrow.borrow::<SharedState>().clone();
+    let mut gs = gs.borrow_mut();
+    gs.network_response_body_counter += 1;
+    let request_id = format!("fetch-{}", gs.network_response_body_counter);
+    let max_entries = response_body_entry_limit();
+    let max_bytes = response_body_byte_limit();
+    if max_entries > 0 && max_bytes > 0 && resp_bytes.len() <= max_bytes {
+        gs.network_response_bodies.insert(
+            request_id.clone(),
+            StoredNetworkResponseBody {
+                body: resp_body.to_string(),
+                base64_encoded: false,
+            },
+        );
+        gs.network_response_body_order.push_back(request_id.clone());
+        while gs.network_response_body_order.len() > max_entries {
+            if let Some(oldest) = gs.network_response_body_order.pop_front() {
+                gs.network_response_bodies.remove(&oldest);
+            }
+        }
+    }
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+    gs.js_network_events.push(JsNetworkEvent {
+        request_id: request_id.clone(),
+        url: url.to_string(),
+        method: method.to_string(),
+        status,
+        response_headers: resp_headers.clone(),
+        body_size: resp_bytes.len(),
+        timestamp,
+    });
+    // Cap it so a long lived page cannot grow this without bound.
+    const MAX_JS_NETWORK_EVENTS: usize = 4096;
+    if gs.js_network_events.len() > MAX_JS_NETWORK_EVENTS {
+        let overflow = gs.js_network_events.len() - MAX_JS_NETWORK_EVENTS;
+        gs.js_network_events.drain(0..overflow);
+    }
+    request_id
+}
+
 /// Cap on the number of redirect hops op_fetch_url will follow.
 /// Matches reqwest's default policy of 10.
 const FETCH_REDIRECT_LIMIT: usize = 10;
@@ -1099,6 +1158,7 @@ async fn op_fetch_url(
         };
         if let Some(stealth) = stealth {
             return stealth_fetch_all(
+                state.clone(),
                 stealth,
                 url.clone(),
                 req_method.as_str().to_string(),
@@ -1331,53 +1391,15 @@ async fn op_fetch_url(
             cbs.fire_response(&info, &resp).await;
         }
     }
-    let response_request_id = {
-        let state_borrow = state.borrow();
-        let gs = state_borrow.borrow::<SharedState>().clone();
-        let mut gs = gs.borrow_mut();
-        gs.network_response_body_counter += 1;
-        let request_id = format!("fetch-{}", gs.network_response_body_counter);
-        let max_entries = response_body_entry_limit();
-        let max_bytes = response_body_byte_limit();
-        if max_entries > 0 && max_bytes > 0 && resp_bytes.len() <= max_bytes {
-            gs.network_response_bodies.insert(
-                request_id.clone(),
-                StoredNetworkResponseBody {
-                    body: resp_body.clone(),
-                    base64_encoded: false,
-                },
-            );
-            gs.network_response_body_order.push_back(request_id.clone());
-            while gs.network_response_body_order.len() > max_entries {
-                if let Some(oldest) = gs.network_response_body_order.pop_front() {
-                    gs.network_response_bodies.remove(&oldest);
-                }
-            }
-        }
-        // Record a network event so the CDP layer emits requestWillBeSent /
-        // responseReceived for this script-initiated request (#406). Keyed by
-        // the same fetch-{N} id as the stored body so Network.getResponseBody
-        // resolves. Capped to keep a long-lived page from growing unbounded.
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
-        gs.js_network_events.push(JsNetworkEvent {
-            request_id: request_id.clone(),
-            url: url.clone(),
-            method: method.clone(),
-            status,
-            response_headers: resp_headers.clone(),
-            body_size: resp_bytes.len(),
-            timestamp,
-        });
-        const MAX_JS_NETWORK_EVENTS: usize = 4096;
-        if gs.js_network_events.len() > MAX_JS_NETWORK_EVENTS {
-            let overflow = gs.js_network_events.len() - MAX_JS_NETWORK_EVENTS;
-            gs.js_network_events.drain(0..overflow);
-        }
-        request_id
-    };
+    let response_request_id = record_scripted_request(
+        &state,
+        &url,
+        &method,
+        status,
+        &resp_headers,
+        &resp_bytes,
+        &resp_body,
+    );
 
     tracing::debug!("op_fetch_url completed: {} {} ({} bytes)", method, url, resp_body.len());
 
@@ -1474,10 +1496,10 @@ fn insert_scripted_fetch_metadata(
 /// and CORS semantics but sends every hop through the wreq stealth client so
 /// the request carries the Chrome TLS fingerprint and client hints. Cookie
 /// handling lives inside StealthHttpClient::send_single, which shares the
-/// context jar. Response bodies are not mirrored into the CDP
-/// Network.getResponseBody buffer here; that is a follow-up for stealth fetches.
+/// context jar.
 #[cfg(feature = "stealth")]
 async fn stealth_fetch_all(
+    state: Rc<RefCell<OpState>>,
     stealth: Arc<StealthHttpClient>,
     url: String,
     method: String,
@@ -1626,10 +1648,21 @@ async fn stealth_fetch_all(
         }
     }
 
+    let request_id = record_scripted_request(
+        &state,
+        &url,
+        &current_method,
+        status,
+        &resp_headers,
+        &resp_bytes,
+        &resp_body,
+    );
+
     Ok(serde_json::json!({
         "status": status,
         "body": resp_body,
         "bodyBase64": resp_body_base64,
+        "requestId": request_id,
         "url": url,
         "headers": resp_headers,
     })

@@ -97,9 +97,23 @@ fn response_request_id(ctx: &CdpContext, url_needle: &str) -> Option<String> {
 
 #[tokio::test(flavor = "current_thread")]
 async fn js_fetch_emits_network_request_and_response() {
+    assert_fetch_is_observable(false).await;
+}
+
+// Stealth mode routes scripted fetch through a second transport, and that one
+// recorded nothing: a stealth build — the only one worth pointing at a real
+// site — reported almost none of its own traffic over CDP. On a live product
+// page it surfaced 9 requests out of 173. The test above never caught it
+// because a plain CdpContext is not stealth.
+#[tokio::test(flavor = "current_thread")]
+async fn js_fetch_emits_network_events_in_stealth_mode_too() {
+    assert_fetch_is_observable(true).await;
+}
+
+async fn assert_fetch_is_observable(stealth: bool) {
     std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
     let base = serve().await;
-    let mut ctx = CdpContext::new();
+    let mut ctx = CdpContext::new_with_options(None, stealth);
     let page_id = ctx.create_page();
     let session_id = "session-1";
     ctx.sessions.insert(session_id.to_string(), page_id.clone());
@@ -124,7 +138,7 @@ async fn js_fetch_emits_network_request_and_response() {
         .collect::<Vec<_>>();
     assert!(
         request_urls.iter().any(|u| u.contains("/api/data.json")),
-        "script-initiated fetch must emit Network.requestWillBeSent; saw {request_urls:?}"
+        "script-initiated fetch must emit Network.requestWillBeSent (stealth={stealth}); saw {request_urls:?}"
     );
 
     // And its response body must be resolvable via the same requestId, so a
