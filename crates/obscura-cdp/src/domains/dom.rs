@@ -603,19 +603,24 @@ mod tests {
             json!({ "backendNodeId": node_id }),
             json!({ "objectId": object_id }),
         ] {
+            // Park the viewport far away so a no-op would be visible.
             ctx.get_session_page_mut(&session)
                 .unwrap()
-                .evaluate("globalThis.__obscura_click_target = null");
+                .evaluate("globalThis.scrollTo(0, 100000)");
 
             handle("scrollIntoViewIfNeeded", &params, &mut ctx, &session)
                 .await
                 .expect("scrollIntoViewIfNeeded should succeed");
 
-            let target_id = ctx
-                .get_session_page_mut(&session)
-                .unwrap()
-                .evaluate("globalThis.__obscura_click_target && globalThis.__obscura_click_target.id");
-            assert_eq!(target_id, json!("target"));
+            // The contract is the element being in view afterwards, whichever
+            // identifier named it.
+            let in_view = ctx.get_session_page_mut(&session).unwrap().evaluate(
+                "(function() {
+                    const r = document.getElementById('target').getBoundingClientRect();
+                    return r.top >= 0 && r.bottom <= (globalThis.innerHeight || 720);
+                })()",
+            );
+            assert_eq!(in_view, json!(true), "params {params} left the element out of view");
         }
     }
 

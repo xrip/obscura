@@ -1812,7 +1812,7 @@ class Element extends Node {
       }
     }
   }
-  focus() { globalThis.__obscura_focused = this; globalThis.__obscura_click_target = this; }
+  focus() { globalThis.__obscura_focused = this; }
   blur() { if (globalThis.__obscura_focused === this) globalThis.__obscura_focused = null; }
 
   // --- Popover API (HTML "popover") ---------------------------------------
@@ -2357,36 +2357,22 @@ class Element extends Node {
     if (changed && !this._scrollSuppress) this._fireScroll();
   }
   getBoundingClientRect() {
-    globalThis.__obscura_click_target = this;
     // documentElement and body span the full viewport. Without this every
-    // hit test against them clips down to a 100x20 synthetic cell and
+    // hit test against them clips down to one synthetic cell and
     // Document.elementFromPoint can never recurse into their children.
     if (this._isViewportRoot()) {
-      const vw = globalThis.innerWidth || 1280;
-      const vh = globalThis.innerHeight || 720;
-      return {
-        x: 0, y: 0, width: vw, height: vh,
-        top: 0, right: vw, bottom: vh, left: 0,
-        toJSON() { return this; },
-      };
+      const view = _viewportSize();
+      return _rect(0, 0, view.width, view.height);
     }
-    // No layout engine, but Playwright's actionability polling needs each
-    // element to occupy a stable, distinct rect so hit-testing can pick the
-    // right one (issue #45). Synthesize a deterministic position from the
-    // node id: every nid maps to a unique cell in a 12-column grid, sized
-    // to fit a 1280x720 viewport. Stable across reads, different per node.
-    const VW = 1280, VH = 720, COLS = 12, CW = 100, CH = 20, GX = 110, GY = 30;
-    const rowsPerScreen = Math.max(1, Math.floor((VH - 10) / GY));
-    const cell = _nodeId(this) | 0;
-    const col = ((cell * 7) | 0) % COLS;
-    const row = (((cell * 13) | 0) >> 0) % rowsPerScreen;
-    const x = 10 + col * GX;
-    const y = 10 + row * GY;
-    return {
-      x, y, width: CW, height: CH,
-      top: y, right: x + CW, bottom: y + CH, left: x,
-      toJSON() { return this; },
-    };
+    if (!_isHitTestable(this)) return _rect(0, 0, 0, 0);
+    const cell = _cellFor(this);
+    // Document space to viewport space, the one place scrolling is real.
+    return _rect(
+      cell.x - (globalThis.scrollX || 0),
+      cell.y - (globalThis.scrollY || 0),
+      _CELL.width,
+      _CELL.height,
+    );
   }
   getClientRects() { return new DOMRectList([this.getBoundingClientRect()]); }
   // No layout engine: a stub that always returns true unblocks Playwright's
@@ -2412,7 +2398,8 @@ class Element extends Node {
   set ariaHidden(v) { if (v == null) this.removeAttribute('aria-hidden'); else this.setAttribute('aria-hidden', String(v)); }
   get ariaSelected() { return this.getAttribute('aria-selected'); }
   set ariaSelected(v) { if (v == null) this.removeAttribute('aria-selected'); else this.setAttribute('aria-selected', String(v)); }
-  scrollIntoView() { globalThis.__obscura_click_target = this; }
+  scrollIntoView() { _scrollCellIntoView(this); }
+  scrollIntoViewIfNeeded() { _scrollCellIntoView(this); }
   // scrollTo/scrollBy/scroll accept either (x, y) or a ScrollToOptions object.
   // The setters fire a scroll event of their own, so suppress the per-axis ones
   // here and emit a single event for the whole movement, the way a real browser
@@ -3215,6 +3202,118 @@ class DocumentType extends Node {
 }
 
 const _cache = new Map();
+
+// Synthetic layout.
+//
+// Obscura has no layout engine and never will, but Playwright refuses to click
+// an element until it is visible, stable, and returned by elementFromPoint at
+// its own centre. None of that needs real geometry — it needs geometry that is
+// *self consistent*. So every element gets a cell in a grid, and the only
+// property that has to hold is that no two elements share one.
+//
+// The previous version hashed the node id into a fixed 12x23 grid, which is 276
+// cells. A page with thousands of elements collided dozens deep, elementFromPoint
+// handed back whichever collider had the highest node id, and every click timed
+// out waiting to receive pointer events. Cells are handed out densely now, so a
+// collision is not possible rather than unlikely.
+const _CELL = { width: 100, height: 20, gapX: 110, gapY: 30, margin: 10 };
+const _cellIndex = new Map();
+const _cellOwner = new Map();
+let _nextCellIndex = 0;
+
+function _rect(x, y, width, height) {
+  return {
+    x, y, width, height,
+    top: y, right: x + width, bottom: y + height, left: x,
+    toJSON() { return this; },
+  };
+}
+
+// The viewport comes from the fingerprint profile, like every other screen
+// dimension. A page whose layout disagrees with the size it was told is a tell.
+function _viewportSize() {
+  return {
+    width: globalThis.innerWidth || 1280,
+    height: globalThis.innerHeight || 720,
+  };
+}
+
+function _gridColumns() {
+  return Math.max(1, Math.floor((_viewportSize().width - _CELL.margin) / _CELL.gapX));
+}
+
+// Explicit reasons an element cannot be hit. Nothing is computed or measured:
+// if the page has not said an element is hidden, it is clickable.
+function _isHitTestable(el) {
+  if (!el || el.nodeType !== 1) return false;
+  if (!el.isConnected) return false;
+  if (el.hasAttribute && (el.hasAttribute('hidden') || el.hasAttribute('inert'))) return false;
+  const inline = el.style;
+  if (inline && (inline.display === 'none' || inline.visibility === 'hidden' ||
+                 inline.pointerEvents === 'none')) return false;
+  try {
+    const computed = globalThis.getComputedStyle && globalThis.getComputedStyle(el);
+    if (computed && (computed.display === 'none' || computed.visibility === 'hidden')) {
+      return false;
+    }
+  } catch (_) { /* no computed style is not a reason to hide it */ }
+  return true;
+}
+
+// Position in document space. Assigned on first use and never reassigned, so a
+// rect is stable across the two animation frames Playwright compares.
+function _cellFor(el) {
+  const nid = _nodeId(el) | 0;
+  let index = _cellIndex.get(nid);
+  if (index === undefined) {
+    index = _nextCellIndex++;
+    _cellIndex.set(nid, index);
+    _cellOwner.set(index, nid);
+  }
+  const columns = _gridColumns();
+  return {
+    x: _CELL.margin + (index % columns) * _CELL.gapX,
+    y: _CELL.margin + Math.floor(index / columns) * _CELL.gapY,
+  };
+}
+
+// Which element owns the cell under a viewport point, if any. The reverse of
+// _cellFor, so the two cannot disagree.
+function _elementInCellAt(x, y) {
+  const docX = x + (globalThis.scrollX || 0);
+  const docY = y + (globalThis.scrollY || 0);
+  const col = Math.floor((docX - _CELL.margin) / _CELL.gapX);
+  const row = Math.floor((docY - _CELL.margin) / _CELL.gapY);
+  if (col < 0 || row < 0) return null;
+  // Inside the gap between cells, not on one.
+  if (docX - _CELL.margin - col * _CELL.gapX > _CELL.width) return null;
+  if (docY - _CELL.margin - row * _CELL.gapY > _CELL.height) return null;
+  const index = row * _gridColumns() + col;
+  const nid = _cellOwner.get(index);
+  if (nid === undefined) return null;
+  const el = _cache.get(nid);
+  return el && _isHitTestable(el) ? el : null;
+}
+
+// Scroll so an element's cell lands inside the viewport. This is what makes a
+// grid taller than one screen clickable at all: without it every element past
+// the first screenful is permanently out of view and Playwright will not click.
+function _scrollCellIntoView(el) {
+  if (!_isHitTestable(el)) return;
+  const cell = _cellFor(el);
+  const view = _viewportSize();
+  const margin = _CELL.margin;
+  let top = globalThis.scrollY || 0;
+  if (cell.y < top + margin) top = Math.max(0, cell.y - margin);
+  else if (cell.y + _CELL.height > top + view.height - margin) {
+    top = Math.max(0, cell.y + _CELL.height + margin - view.height);
+  }
+  if (top !== (globalThis.scrollY || 0)) {
+    globalThis.scrollTo ? globalThis.scrollTo(globalThis.scrollX || 0, top)
+                        : (globalThis.scrollY = globalThis.pageYOffset = top);
+  }
+}
+
 
 // URL-valued `src` reflection belongs to the matching HTML interfaces, not to
 // Element. Keeping it off Element.prototype matches Chromium's prototype shape
@@ -9054,26 +9153,14 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
     if (typeof x !== 'number' || typeof y !== 'number' || !isFinite(x) || !isFinite(y)) {
       return null;
     }
-    var w = (typeof window !== 'undefined' && window.innerWidth) || 1280;
-    var h = (typeof window !== 'undefined' && window.innerHeight) || 720;
-    if (x < 0 || y < 0 || x > w || y > h) return null;
-    var all = this.querySelectorAll('*');
-    var best = null;
-    var bestNid = -1;
-    for (var i = 0; i < all.length; i++) {
-      var el = all[i];
-      if (!el || !el.getBoundingClientRect) continue;
-      // documentElement / body span the viewport; skip them so we pick a
-      // real descendant instead of falling back to <html>/<body>.
-      if (el === this.documentElement || el === this.body) continue;
-      var r = el.getBoundingClientRect();
-      if (r.width === 0 || r.height === 0) continue;
-      if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) {
-        var nid = _nodeId(el) | 0;
-        if (nid > bestNid) { best = el; bestNid = nid; }
-      }
-    }
-    return best || this.body || this.documentElement || null;
+    const view = _viewportSize();
+    if (x < 0 || y < 0 || x > view.width || y > view.height) return null;
+    // Cells are handed out densely, so the point identifies at most one of
+    // them. That is an arithmetic inverse, not a search over the document:
+    // the old version read every element's rect on every call.
+    const el = _elementInCellAt(x, y);
+    if (el && el.ownerDocument === this) return el;
+    return this.body || this.documentElement || null;
   };
   Document.prototype.elementsFromPoint = function(x, y) {
     var el = this.elementFromPoint(x, y);
@@ -9103,6 +9190,10 @@ globalThis.__obscura_init = function() {
     _fingerprintProfile = _freezeFingerprintProfile(injectedProfile);
   }
   delete globalThis.__obscura_fingerprint_profile;
+
+  _cellIndex.clear();
+  _cellOwner.clear();
+  _nextCellIndex = 0;
 
   globalThis.document = new (globalThis.HTMLDocument || Document)(+_dom("document_node_id"));
 
