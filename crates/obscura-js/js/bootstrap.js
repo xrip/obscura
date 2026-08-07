@@ -1786,7 +1786,7 @@ class Element extends Node {
     return cache[name];
   }
   click() {
-    const cancelled = !this.dispatchEvent(new MouseEvent("click", {bubbles: true, cancelable: true}));
+    const cancelled = !_dispatchClickSequence(this);
     if (!cancelled) {
       const link = this.tagName === 'A' ? this : (this.closest ? this.closest('a[href]') : null);
       if (link) {
@@ -2375,10 +2375,9 @@ class Element extends Node {
     );
   }
   getClientRects() { return new DOMRectList([this.getBoundingClientRect()]); }
-  // No layout engine: a stub that always returns true unblocks Playwright's
-  // actionability polling. With a real layout we'd check display, visibility,
-  // opacity and rect dimensions per spec.
-  checkVisibility(opts) { return true; }
+  // Same predicate the hit test uses, so an element cannot claim to be visible
+  // and then refuse to be found at its own centre.
+  checkVisibility(opts) { return _isHitTestable(this); }
   // ARIA reflection properties. Without an accessibility tree we expose the
   // raw aria-* attributes so Playwright's getByRole / getByLabel locators can
   // at least find elements that author them explicitly.
@@ -3293,6 +3292,92 @@ function _elementInCellAt(x, y) {
   if (nid === undefined) return null;
   const el = _cache.get(nid);
   return el && _isHitTestable(el) ? el : null;
+}
+
+// Where the pointer is. A real click never arrives from nowhere: it is preceded
+// by a move, and the coordinates of every event in the sequence agree with the
+// target's rect. Detectors check exactly that, so the position has to be state
+// we keep rather than something invented per event.
+const _pointer = { x: 0, y: 0, inside: null };
+
+function _pointInit(el, type, extra) {
+  const view = _viewportSize();
+  return Object.assign({
+    bubbles: true,
+    cancelable: type !== 'mouseenter' && type !== 'mouseleave' &&
+                type !== 'pointerenter' && type !== 'pointerleave',
+    composed: true,
+    view: globalThis,
+    detail: type === 'click' || type === 'mousedown' || type === 'mouseup' ? 1 : 0,
+    clientX: _pointer.x,
+    clientY: _pointer.y,
+    screenX: _pointer.x + (globalThis.screenX || 0),
+    screenY: _pointer.y + (globalThis.screenY || 0),
+    pageX: _pointer.x + (globalThis.scrollX || 0),
+    pageY: _pointer.y + (globalThis.scrollY || 0),
+    button: 0,
+    buttons: type === 'mousedown' || type === 'pointerdown' ? 1 : 0,
+    relatedTarget: null,
+  }, extra || {});
+}
+
+function _firePointer(el, type, extra) {
+  const Ctor = type.startsWith('pointer') && globalThis.PointerEvent
+    ? globalThis.PointerEvent
+    : globalThis.MouseEvent;
+  const init = _pointInit(el, type, extra);
+  if (type.startsWith('pointer')) {
+    init.pointerId = 1;
+    init.pointerType = 'mouse';
+    init.isPrimary = true;
+    init.width = 1;
+    init.height = 1;
+    init.pressure = init.buttons ? 0.5 : 0;
+  }
+  try { return el.dispatchEvent(new Ctor(type, init)); } catch (_) { return true; }
+}
+
+// Move the pointer onto an element, firing what leaving the previous one and
+// arriving at this one would fire. Chrome's order, and the enter/leave pair is
+// non-bubbling on purpose.
+function _pointerMoveOnto(el) {
+  const previous = _pointer.inside;
+  if (previous === el) {
+    _firePointer(el, 'pointermove');
+    _firePointer(el, 'mousemove');
+    return;
+  }
+  if (previous && previous.isConnected) {
+    _firePointer(previous, 'pointerout', { relatedTarget: el });
+    _firePointer(previous, 'pointerleave', { bubbles: false, relatedTarget: el });
+    _firePointer(previous, 'mouseout', { relatedTarget: el });
+    _firePointer(previous, 'mouseleave', { bubbles: false, relatedTarget: el });
+  }
+  _firePointer(el, 'pointerover', { relatedTarget: previous });
+  _firePointer(el, 'pointerenter', { bubbles: false, relatedTarget: previous });
+  _firePointer(el, 'mouseover', { relatedTarget: previous });
+  _firePointer(el, 'mouseenter', { bubbles: false, relatedTarget: previous });
+  _pointer.inside = el;
+  _firePointer(el, 'pointermove');
+  _firePointer(el, 'mousemove');
+}
+
+// The full sequence Chrome delivers for a click, in Chrome's order. Returns
+// whether the click itself went uncancelled.
+function _dispatchClickSequence(el) {
+  _scrollCellIntoView(el);
+  const rect = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+  if (rect && rect.width > 0 && rect.height > 0) {
+    _pointer.x = Math.round(rect.left + rect.width / 2);
+    _pointer.y = Math.round(rect.top + rect.height / 2);
+  }
+  _pointerMoveOnto(el);
+  _firePointer(el, 'pointerdown');
+  _firePointer(el, 'mousedown');
+  try { if (typeof el.focus === 'function') el.focus(); } catch (_) {}
+  _firePointer(el, 'pointerup');
+  _firePointer(el, 'mouseup');
+  return _firePointer(el, 'click');
 }
 
 // Scroll so an element's cell lands inside the viewport. This is what makes a
@@ -5507,19 +5592,34 @@ globalThis.IntersectionObserver = class IntersectionObserver {
   _fireFor(targets) {
     if (!this._connected || !targets.length || this._fireCount >= 256) return;
     this._fireCount++;
-    const records = targets.map(target => ({
-      target,
-      isIntersecting: true,
-      intersectionRatio: 1,
-      boundingClientRect: target.getBoundingClientRect
+    const view = _viewportSize();
+    const records = targets.map(target => {
+      const rect = target.getBoundingClientRect
         ? target.getBoundingClientRect()
-        : { x: 0, y: 0, width: 100, height: 20, top: 0, left: 0, right: 100, bottom: 20 },
-      intersectionRect: target.getBoundingClientRect
-        ? target.getBoundingClientRect()
-        : { x: 0, y: 0, width: 100, height: 20, top: 0, left: 0, right: 100, bottom: 20 },
-      rootBounds: { x: 0, y: 0, width: 1280, height: 720, top: 0, left: 0, right: 1280, bottom: 720 },
-      time: Date.now(),
-    }));
+        : _rect(0, 0, 0, 0);
+      // The cell rect already carries the scroll offset, so clipping it to the
+      // viewport is the whole calculation. An element parked below the fold now
+      // reports isIntersecting:false, and reports true once something scrolls
+      // it in — which is what a reveal-on-scroll or infinite-scroll sentinel is
+      // waiting for, and what it could never learn while everything claimed to
+      // be fully visible.
+      const left = Math.max(rect.left, 0);
+      const top = Math.max(rect.top, 0);
+      const right = Math.min(rect.right, view.width);
+      const bottom = Math.min(rect.bottom, view.height);
+      const width = Math.max(0, right - left);
+      const height = Math.max(0, bottom - top);
+      const area = rect.width * rect.height;
+      return {
+        target,
+        isIntersecting: width > 0 && height > 0,
+        intersectionRatio: area > 0 ? (width * height) / area : 0,
+        boundingClientRect: rect,
+        intersectionRect: _rect(left, top, width, height),
+        rootBounds: _rect(0, 0, view.width, view.height),
+        time: Date.now(),
+      };
+    });
     try { this._callback(records, this); } catch (e) { /* IO callbacks must not propagate */ }
   }
   observe(el) {
@@ -5711,7 +5811,7 @@ globalThis.CustomEvent = class extends Event {
   }
 };
 globalThis.MouseEvent = class extends Event {
-  constructor(t,o={}) { super(t,o);this.view=o.view||null;this.detail=o.detail||0;this.screenX=o.screenX||0;this.screenY=o.screenY||0;this.clientX=o.clientX||0;this.clientY=o.clientY||0;this.ctrlKey=!!o.ctrlKey;this.altKey=!!o.altKey;this.shiftKey=!!o.shiftKey;this.metaKey=!!o.metaKey;this.button=o.button||0;this.buttons=o.buttons||0;this.relatedTarget=o.relatedTarget||null; }
+  constructor(t,o={}) { super(t,o);this.view=o.view||null;this.detail=o.detail||0;this.screenX=o.screenX||0;this.screenY=o.screenY||0;this.clientX=o.clientX||0;this.clientY=o.clientY||0;this.x=this.clientX;this.y=this.clientY;this.pageX=o.pageX===undefined?this.clientX:o.pageX;this.pageY=o.pageY===undefined?this.clientY:o.pageY;this.offsetX=o.offsetX||0;this.offsetY=o.offsetY||0;this.movementX=o.movementX||0;this.movementY=o.movementY||0;this.ctrlKey=!!o.ctrlKey;this.altKey=!!o.altKey;this.shiftKey=!!o.shiftKey;this.metaKey=!!o.metaKey;this.button=o.button||0;this.buttons=o.buttons||0;this.relatedTarget=o.relatedTarget||null; }
   // Legacy DOM Level 2 initializer. Positional signature per UI Events spec.
   initMouseEvent(type,canBubble,cancelable,view,detail,screenX,screenY,clientX,clientY,ctrlKey,altKey,shiftKey,metaKey,button,relatedTarget) {
     if (arguments.length < 1) throw new TypeError("Failed to execute 'initMouseEvent' on 'MouseEvent': 1 argument required, but only 0 present.");
@@ -5748,7 +5848,24 @@ globalThis.KeyboardEvent = class extends Event {
 globalThis.FocusEvent = class extends Event { constructor(t,o={}) { super(t,o);this.relatedTarget=o.relatedTarget||null; } };
 globalThis.InputEvent = class extends Event { constructor(t,o={}) { super(t,o);this.data=o.data||null;this.inputType=o.inputType||""; } };
 globalThis.ErrorEvent = class extends Event { constructor(t,o={}) { super(t,o);this.message=o.message||"";this.error=o.error||null; } };
-globalThis.PointerEvent = class extends Event { constructor(t,o={}) { super(t,o); } };
+// A PointerEvent is a MouseEvent. Extending Event instead dropped every
+// coordinate, so a pointerdown carried no position while the mousedown right
+// after it did — an inconsistency a detector reads for free.
+globalThis.PointerEvent = class extends globalThis.MouseEvent {
+  constructor(t, o = {}) {
+    super(t, o);
+    this.pointerId = o.pointerId === undefined ? 0 : o.pointerId;
+    this.pointerType = o.pointerType || 'mouse';
+    this.isPrimary = o.isPrimary === undefined ? true : !!o.isPrimary;
+    this.width = o.width === undefined ? 1 : o.width;
+    this.height = o.height === undefined ? 1 : o.height;
+    this.pressure = o.pressure === undefined ? 0 : o.pressure;
+    this.tangentialPressure = o.tangentialPressure || 0;
+    this.tiltX = o.tiltX || 0;
+    this.tiltY = o.tiltY || 0;
+    this.twist = o.twist || 0;
+  }
+};
 globalThis.AnimationEvent = class extends Event {};
 globalThis.TransitionEvent = class extends Event {};
 globalThis.UIEvent = class extends Event {

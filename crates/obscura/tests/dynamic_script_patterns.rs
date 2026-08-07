@@ -163,3 +163,54 @@ async fn every_bundler_script_insertion_reaches_the_network() {
         "these chunks were fetched but never ran: {not_run:?}\n  ran: {ran}\n  load events: {loaded}"
     );
 }
+
+/// A click that arrives from nowhere is a tell. Chrome precedes it with a move
+/// onto the element, and every event in the sequence carries coordinates that
+/// agree with the target's own rect.
+#[tokio::test(flavor = "current_thread")]
+async fn a_click_arrives_with_the_events_a_real_one_would() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let browser = Browser::new().unwrap();
+    let mut page = browser.new_page().await.unwrap();
+    page.goto("about:blank").await.unwrap();
+    page.evaluate(
+        r#"(function() {
+            document.body.innerHTML = '<button id="b">go</button>';
+            globalThis.__seen = [];
+            const b = document.getElementById('b');
+            for (const type of ['pointerover','pointerenter','mouseover','mouseenter',
+                                'pointermove','mousemove','pointerdown','mousedown',
+                                'pointerup','mouseup','click']) {
+                b.addEventListener(type, e => globalThis.__seen.push(
+                    type + ':' + e.clientX + ',' + e.clientY));
+            }
+            b.click();
+        })()"#,
+    );
+
+    let seen = page.evaluate("JSON.stringify(globalThis.__seen)");
+    let seen: Vec<String> = serde_json::from_str(seen.as_str().unwrap()).unwrap();
+    let order: Vec<&str> = seen.iter().map(|e| e.split(':').next().unwrap()).collect();
+    assert_eq!(
+        order,
+        vec![
+            "pointerover", "pointerenter", "mouseover", "mouseenter",
+            "pointermove", "mousemove", "pointerdown", "mousedown",
+            "pointerup", "mouseup", "click",
+        ],
+        "click sequence does not match Chrome's: {seen:?}"
+    );
+
+    // Every event has to report the same point, and it has to be the middle of
+    // the element — a click whose coordinates contradict the target's rect is
+    // as good a signal as no coordinates at all.
+    let centre = page.evaluate(
+        "(function() { const r = document.getElementById('b').getBoundingClientRect();
+          return Math.round(r.left + r.width / 2) + ',' + Math.round(r.top + r.height / 2); })()",
+    );
+    let centre = centre.as_str().unwrap();
+    for event in &seen {
+        let point = event.split_once(':').unwrap().1;
+        assert_eq!(point, centre, "{event} did not land on the element's centre");
+    }
+}
