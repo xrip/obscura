@@ -285,7 +285,7 @@ async function __processDynScriptQueue() {
           if (task.url.startsWith('data:')) {
             body = _decodeDataScriptUrl(task.url);
           } else {
-            const raw = await _denoCore.ops.op_fetch_url(task.url, "GET", "{}", "", task.pageOrigin, "no-cors", "script");
+            const raw = await _denoCore.ops.op_fetch_url(task.url, "GET", "{}", "", task.pageOrigin, _documentUrl(), "no-cors", "script");
             body = JSON.parse(raw).body;
           }
           if (body) {
@@ -346,7 +346,7 @@ async function _loadLinkedStylesheet(c) {
   let pageOrigin = "";
   try { pageOrigin = new URL(fullUrl).origin; } catch(e) {}
   try {
-    await _denoCore.ops.op_fetch_url(fullUrl, "GET", "{}", "", pageOrigin, "no-cors", "stylesheet");
+    await _denoCore.ops.op_fetch_url(fullUrl, "GET", "{}", "", pageOrigin, _documentUrl(), "no-cors", "stylesheet");
     try { c.dispatchEvent(new Event('load', { bubbles: true })); } catch(e) {}
   } catch(e) {
     try { c.dispatchEvent(new Event('error', { bubbles: true })); } catch(e) {}
@@ -400,6 +400,9 @@ const _eventRegistry = globalThis._eventRegistry;
 const _formValues = globalThis._formValues;
 const _formChecked = globalThis._formChecked;
 const _domParse = (cmd, a1, a2) => { try { return JSON.parse(_dom(cmd, a1, a2)); } catch { return null; } };
+// The calling realm's document URL. An async op cannot look up its own realm,
+// so every fetch tells it, and the answer comes from the realm-aware op_dom.
+const _documentUrl = () => _domParse("document_url") || "about:blank";
 
 // HTML "ASCII whitespace": U+0009 TAB, U+000A LF, U+000C FF, U+000D CR, U+0020 SPACE.
 // Class token splitting (classList, getElementsByClassName) uses exactly this set.
@@ -3297,7 +3300,7 @@ async function _fetchFrameDocument(url) {
     catch (_) { return ''; }
   })();
   const raw = await _denoCore.ops.op_fetch_url(
-    url, 'GET', '{}', '', pageOrigin, 'navigate', 'iframe');
+    url, 'GET', '{}', '', pageOrigin, _documentUrl(), 'navigate', 'iframe');
   const parsed = JSON.parse(raw);
   if (parsed.blocked || parsed.corsBlocked) {
     throw new TypeError('net::ERR_FAILED');
@@ -4324,7 +4327,7 @@ globalThis.fetch = async (input, init = {}) => {
   const hdrs = JSON.stringify(_h);
   const fetchMode = init.mode || (input instanceof Request ? input.mode : "cors");
   const pageOrigin = (function() { try { const u = new URL(_domParse("document_url") || "about:blank"); return u.origin; } catch(e) { return ""; } })();
-  const raw = await _denoCore.ops.op_fetch_url(url, method, hdrs, body, pageOrigin, fetchMode, "fetch");
+  const raw = await _denoCore.ops.op_fetch_url(url, method, hdrs, body, pageOrigin, _documentUrl(), fetchMode, "fetch");
   const parsed = JSON.parse(raw);
   if (parsed.blocked) {
     const err = new TypeError('net::ERR_FAILED');

@@ -13,9 +13,10 @@
 //!   restore, not a re-parse.
 //! - The realm's op table is filled from the page realm's, so every shim in the
 //!   frame can call ops.
-//! - Ops read one isolate-wide `ObscuraState`. Only one realm runs at a time, so
-//!   a frame is made current by swapping that state around its work. No op
-//!   signature changes.
+//! - Each realm registers its document in `RealmStates`, and an op looks up the
+//!   realm that called it. Making a realm current around the host's calls into
+//!   it is not enough, because a frame's timers and settled promises re-enter
+//!   JavaScript straight from the event loop.
 //!
 //! Staying in one isolate is what lets same-origin frames share objects with
 //! their parent, the way `iframe.contentWindow.document` does in a browser. A
@@ -26,17 +27,24 @@ use std::rc::Rc;
 
 use obscura_dom::parse_html;
 
-use crate::ops::ObscuraState;
+use crate::ops::{ObscuraState, RealmStates};
 use crate::runtime::ObscuraJsRuntime;
 
 /// One child browsing context: its own realm, document and origin, living in
 /// the page's isolate.
 pub struct FrameRealm {
     context: deno_core::v8::Global<deno_core::v8::Context>,
-    state: Rc<RefCell<ObscuraState>>,
+    /// Held so the frame's entry can be taken out again when the frame dies.
+    realms: Rc<RefCell<RealmStates>>,
     frame_id: u32,
     url: String,
     origin: String,
+}
+
+impl Drop for FrameRealm {
+    fn drop(&mut self) {
+        self.realms.borrow_mut().forget(&self.context);
+    }
 }
 
 impl FrameRealm {
@@ -62,14 +70,19 @@ impl FrameRealm {
         state.url = url.to_string();
         parent.share_resources_with(&mut state);
 
+        let realms = parent.realm_states();
+        realms
+            .borrow_mut()
+            .register(context.clone(), Rc::new(RefCell::new(state)));
+
         let realm = FrameRealm {
             context,
-            state: Rc::new(RefCell::new(state)),
+            realms,
             frame_id,
             url: url.to_string(),
             origin: origin_of(url),
         };
-        // Build the frame's document against the frame's own state.
+        // Registered first, so this already builds the frame's own document.
         realm.run(parent, "globalThis.__obscura_init();").ok()?;
         Some(realm)
     }
@@ -94,12 +107,10 @@ impl FrameRealm {
         self.origin != "null" && self.origin == other_origin
     }
 
-    /// Runs `source` in the frame's realm with the frame's document current.
+    /// Runs `source` in the frame's realm. Ops called from it find the frame's
+    /// document by looking up the realm they were called from.
     fn run(&self, parent: &mut ObscuraJsRuntime, source: &str) -> Result<String, String> {
-        let previous = parent.swap_op_state(self.state.clone());
-        let result = parent.eval_in_realm(&self.context, source);
-        parent.swap_op_state(previous);
-        result
+        parent.eval_in_realm(&self.context, source)
     }
 
     /// Runs a script inside the frame, reporting a script error as `Err`.
@@ -471,6 +482,47 @@ mod tests {
                 serde_json::json!(index.to_string())
             );
         }
+    }
+
+    /// The hard case. A frame's deferred work re-enters JavaScript from the
+    /// event loop, long after the host last called into the frame, so nothing
+    /// can have made the frame "current" for it. It has to find its own
+    /// document anyway.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_frames_deferred_work_still_sees_the_frames_document() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let frame = FrameRealm::new(
+            &mut parent,
+            1,
+            "https://child.example/",
+            "<html><body></body></html>",
+        )
+        .expect("frame realm");
+
+        // 50ms, not 0: a zero delay drains as a microtask while the host is
+        // still inside the frame, which would hide the bug this guards.
+        frame
+            .execute_script(
+                &mut parent,
+                "setTimeout(() => { document.body.setAttribute('data-who', location.href); }, 50);",
+            )
+            .unwrap();
+        parent.run_event_loop_bounded(300).await.unwrap();
+
+        assert_eq!(
+            frame
+                .evaluate(&mut parent, "document.body.getAttribute('data-who')")
+                .unwrap(),
+            serde_json::json!("https://child.example/"),
+            "the frame's timer did not write to the frame's own document"
+        );
+        assert_eq!(
+            parent
+                .evaluate("document.body.getAttribute('data-who')")
+                .unwrap(),
+            serde_json::Value::Null,
+            "the frame's timer wrote to the parent's document"
+        );
     }
 
     #[test]

@@ -200,7 +200,14 @@ impl ObscuraJsRuntime {
                 }
             }
 
-            runtime.op_state().borrow_mut().put(state_clone);
+            {
+                let op_state = runtime.op_state();
+                let mut op_state = op_state.borrow_mut();
+                op_state.put(state_clone);
+                // Empty until a frame realm exists, which is what keeps the
+                // lookup free for pages that have no frames.
+                op_state.put(Rc::new(RefCell::new(crate::ops::RealmStates::default())));
+            }
 
             runtime
                 .execute_script(
@@ -458,15 +465,13 @@ impl ObscuraJsRuntime {
         }
     }
 
-    /// Swaps the state every op reads. Only one realm runs at a time, so the
-    /// frame's DOM, URL and origin can be made current for the duration of that
-    /// realm's work and then restored, without touching any op signature.
-    pub(crate) fn swap_op_state(&mut self, replacement: Rc<RefCell<ObscuraState>>) -> Rc<RefCell<ObscuraState>> {
-        let op_state = self.runtime.op_state();
-        let mut op_state = op_state.borrow_mut();
-        let previous = op_state.borrow::<Rc<RefCell<ObscuraState>>>().clone();
-        op_state.put(replacement);
-        previous
+    /// The table ops consult to find the calling realm's document.
+    pub(crate) fn realm_states(&self) -> Rc<RefCell<crate::ops::RealmStates>> {
+        self.runtime
+            .op_state()
+            .borrow()
+            .borrow::<Rc<RefCell<crate::ops::RealmStates>>>()
+            .clone()
     }
 
     pub fn set_cookie_jar(&self, jar: std::sync::Arc<obscura_net::CookieJar>) {
@@ -4450,11 +4455,11 @@ mod tests {
         );
     }
 
-    /// The frame realm needs its own DOM. Ops read one isolate-wide state, so a
-    /// realm is made current by swapping that state around its work rather than
-    /// by changing all 66 op signatures.
+    /// The frame realm needs its own DOM. A registered realm's document is
+    /// found by the op from the realm it was called in, so no host bookkeeping
+    /// surrounds the call and no op signature depends on which realm is "in".
     #[test]
-    fn swapping_op_state_gives_a_realm_its_own_dom() {
+    fn a_registered_realm_gets_its_own_dom() {
         let mut rt = setup_runtime("<html><body><h1>Parent</h1></body></html>");
         let realm = rt.create_realm_context().expect("snapshot context");
         assert!(rt.share_ops_with_realm(&realm));
@@ -4464,19 +4469,28 @@ mod tests {
         frame_state.borrow_mut().dom = Some(parse_html(
             "<html><body><h1>Frame</h1></body></html>",
         ));
+        let realms = rt.realm_states();
+        realms.borrow_mut().register(realm.clone(), frame_state);
 
-        let parent_state = rt.swap_op_state(frame_state);
         rt.eval_in_realm(&realm, "globalThis.__obscura_init();").unwrap();
         let frame_title = rt
             .eval_in_realm(&realm, "document.querySelector('h1').textContent")
             .unwrap();
-        rt.swap_op_state(parent_state);
 
         assert_eq!(frame_title, "Frame");
         // The parent realm still sees its own document afterwards.
         assert_eq!(
             rt.evaluate("document.querySelector('h1').textContent").unwrap(),
             serde_json::json!("Parent")
+        );
+
+        // Once forgotten, the realm falls back to the page's document instead of
+        // reading through a dangling entry.
+        realms.borrow_mut().forget(&realm);
+        assert_eq!(
+            rt.eval_in_realm(&realm, "document.querySelector('h1').textContent")
+                .unwrap(),
+            "Parent"
         );
     }
 

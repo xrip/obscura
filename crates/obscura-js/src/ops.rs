@@ -4,6 +4,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use deno_core::op2;
+use deno_core::v8;
 use deno_core::OpState;
 use deno_core::Extension;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
@@ -280,9 +281,70 @@ fn response_body_byte_limit() -> usize {
 
 pub type SharedState = Rc<RefCell<ObscuraState>>;
 
+/// Which document belongs to which realm.
+///
+/// An op has to read the state of the realm that *called* it. Making a realm
+/// "current" around the host's own calls into it is not enough: a frame's
+/// deferred work — a timer firing, a promise settling — re-enters JavaScript
+/// from the event loop, where nothing had the chance to swap anything. Before
+/// this existed, a frame's `setTimeout` callback ran with the frame's globals
+/// but wrote to the *parent's* DOM.
+#[derive(Default)]
+pub struct RealmStates {
+    entries: Vec<(v8::Global<v8::Context>, SharedState)>,
+}
+
+impl RealmStates {
+    pub fn register(
+        &mut self,
+        context: v8::Global<v8::Context>,
+        state: SharedState,
+    ) {
+        self.entries.push((context, state));
+    }
+
+    pub fn forget(&mut self, context: &v8::Global<v8::Context>) {
+        self.entries.retain(|(known, _)| known != context);
+    }
+}
+
+/// The state of the realm running right now, or the page's when the caller is
+/// the page itself.
+///
+/// A page with no frames pays only an `is_empty` check: looking up the current
+/// context is not free, and `op_dom` is the hottest op in the system.
+pub fn realm_state(scope: &mut v8::HandleScope, op_state: &OpState) -> SharedState {
+    let page = || op_state.borrow::<SharedState>().clone();
+    let registry = match op_state.try_borrow::<Rc<RefCell<RealmStates>>>() {
+        Some(registry) => registry.clone(),
+        None => return page(),
+    };
+    let registry = registry.borrow();
+    if registry.entries.is_empty() {
+        return page();
+    }
+    // Not `get_current_context`: an op is a native function bound in the page
+    // realm, so V8 reports that realm as current no matter who called it. This
+    // one answers "whose code is running", which is the question.
+    let current = scope.get_entered_or_microtask_context();
+    registry
+        .entries
+        .iter()
+        .find(|(context, _)| *context == current)
+        .map(|(_, state)| state.clone())
+        .unwrap_or_else(page)
+}
+
 #[op2]
 #[string]
-fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[string] arg2: String) -> String {
+fn op_dom(
+    scope: &mut v8::HandleScope,
+    state: &OpState,
+    #[string] cmd: String,
+    #[string] arg1: String,
+    #[string] arg2: String,
+) -> String {
+    let realm = realm_state(scope, state);
     // Anti-panic boundary: a panic in a DOM op would unwind through deno_core
     // into V8's FFI frame, where V8_Fatal calls abort(3) and takes the whole
     // engine (and every CDP client) down. Catch it so one malformed selector or
@@ -290,7 +352,7 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
     // No per-call clone: on the happy path this is just a landing pad, so the
     // hot DOM path (querySelector/getAttribute/...) pays nothing measurable.
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
-        op_dom_inner(state, cmd, arg1, arg2)
+        op_dom_inner(realm, cmd, arg1, arg2)
     }))
     .unwrap_or_else(|_| {
         tracing::error!("op_dom panicked; returning null");
@@ -298,8 +360,7 @@ fn op_dom(state: &OpState, #[string] cmd: String, #[string] arg1: String, #[stri
     })
 }
 
-fn op_dom_inner(state: &OpState, cmd: String, arg1: String, arg2: String) -> String {
-    let gs = state.borrow::<SharedState>().clone();
+fn op_dom_inner(gs: SharedState, cmd: String, arg1: String, arg2: String) -> String {
     let gs = gs.borrow();
     let dom = match &gs.dom {
         Some(d) => d,
@@ -832,13 +893,19 @@ async fn op_fetch_url(
     #[string] headers_json: String,
     #[string] body: String,
     #[string] origin: String,
+    #[string] document_url: String,
     #[string] mode: String,
     #[string] resource_kind: String,
 ) -> Result<String, deno_error::JsErrorBox> {
     tracing::debug!("op_fetch_url called: {} {} (intercept check pending)", method, url);
     let request_resource_type = resource_type_from_kind(&resource_kind);
 
-    let (cookie_jar, in_flight, intercept_tx, proxy_url, callbacks, http_client, _document_url) = {
+    // The calling document's URL comes from the caller, because an async op has
+    // no scope to look up the realm it was called from. The shim reads it from
+    // op_dom, which is realm-aware. Page script could pass a false one, but the
+    // same script can already override `referer` outright through init.headers.
+    let _document_url = document_url;
+    let (cookie_jar, in_flight, intercept_tx, proxy_url, callbacks, http_client) = {
         let state_borrow = state.borrow();
         let gs = state_borrow.borrow::<SharedState>().clone();
         let mut gs = gs.borrow_mut();
@@ -877,7 +944,6 @@ async fn op_fetch_url(
             proxy_url,
             gs.callbacks.clone(),
             gs.http_client.clone(),
-            gs.url.clone(),
         )
     };
     let allow_private_network = http_client
@@ -1710,8 +1776,8 @@ fn validate_fetch_url(url: &url::Url, allow_private_network: bool) -> Result<(),
 
 #[op2]
 #[string]
-fn op_get_cookies(state: &OpState) -> String {
-    let gs = state.borrow::<SharedState>().clone();
+fn op_get_cookies(scope: &mut v8::HandleScope, state: &OpState) -> String {
+    let gs = realm_state(scope, state);
     let gs = gs.borrow();
     let jar = match &gs.cookie_jar {
         Some(j) => j,
@@ -1725,8 +1791,8 @@ fn op_get_cookies(state: &OpState) -> String {
 }
 
 #[op2(fast)]
-fn op_set_cookie(state: &OpState, #[string] cookie_str: &str) {
-    let gs = state.borrow::<SharedState>().clone();
+fn op_set_cookie(scope: &mut v8::HandleScope, state: &OpState, #[string] cookie_str: &str) {
+    let gs = realm_state(scope, state);
     let gs = gs.borrow();
     let jar = match &gs.cookie_jar {
         Some(j) => j,
@@ -1748,12 +1814,13 @@ fn local_storage_origin(raw_url: &str) -> String {
 #[op2]
 #[string]
 fn op_local_storage(
+    scope: &mut v8::HandleScope,
     state: &OpState,
     #[string] command: &str,
     #[string] key: &str,
     #[string] value: &str,
 ) -> String {
-    let gs = state.borrow::<SharedState>().clone();
+    let gs = realm_state(scope, state);
     let (storage, origin) = {
         let gs = gs.borrow();
         (
@@ -1783,9 +1850,17 @@ fn op_local_storage(
     }
 }
 
+// A frame that navigates itself must not move the top document. Recording the
+// navigation against the calling realm keeps it inside that frame.
 #[op2(fast)]
-fn op_navigate(state: &OpState, #[string] url: &str, #[string] method: &str, #[string] body: &str) {
-    let gs = state.borrow::<SharedState>().clone();
+fn op_navigate(
+    scope: &mut v8::HandleScope,
+    state: &OpState,
+    #[string] url: &str,
+    #[string] method: &str,
+    #[string] body: &str,
+) {
+    let gs = realm_state(scope, state);
     let mut gs = gs.borrow_mut();
     gs.url = url.to_string();
     gs.pending_navigation = Some((url.to_string(), method.to_string(), body.to_string()));

@@ -12,7 +12,8 @@ use std::sync::{Arc, Mutex};
 use obscura::Browser;
 
 /// Serves a page holding one iframe, the frame document, and the frame's
-/// external script. Returns the base URL and the list of paths requested.
+/// external script. Returns the base URL and one entry per request, as
+/// "<path> referer=<referer>".
 fn spawn_server() -> (String, Arc<Mutex<Vec<String>>>) {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -28,7 +29,18 @@ fn spawn_server() -> (String, Arc<Mutex<Vec<String>>>) {
                 let _ = stream.read(&mut request);
                 let request = String::from_utf8_lossy(&request).to_string();
                 let path = request.split_whitespace().nth(1).unwrap_or("/").to_string();
-                recorder.lock().unwrap().push(path.clone());
+                let referer = request
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("referer:")
+                            .map(|_| line[8..].trim().to_string())
+                    })
+                    .unwrap_or_default();
+                recorder
+                    .lock()
+                    .unwrap()
+                    .push(format!("{path} referer={referer}"));
 
                 let (content_type, body) = if path.starts_with("/frame.js") {
                     (
@@ -105,5 +117,14 @@ async fn a_frames_own_scripts_run_against_the_frames_own_document() {
     assert!(
         seen.iter().any(|path| path.contains("from=external") && path.contains("tag=child")),
         "the frame's external script did not run against the frame's DOM: {seen:?}"
+    );
+    // The frame's own subresources are referred by the frame, not by the page
+    // that holds it. Only the host driven fetch is checked here: the plain
+    // reqwest path behind scripted fetch() sends no Referer at all, in a frame
+    // or out of it. Stealth mode, which does, is covered by the live smoke.
+    assert!(
+        seen.iter()
+            .any(|entry| entry.starts_with("/frame.js") && entry.ends_with("/frame")),
+        "the frame's script was not fetched with the frame's referer: {seen:?}"
     );
 }
