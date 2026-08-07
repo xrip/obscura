@@ -148,8 +148,13 @@ async function journey(page, log) {
           (document.body ? document.body.innerText : '').includes(needle), id);
         if (found) { opened = second; break; }
       }
-      bodyLength = await tryEvaluate(page, () =>
-        (document.body ? document.body.innerText.replace(/\s+/g, ' ') : '').length) || 0;
+      // Ask for the number as a string. Obscura's Runtime.evaluate has been
+      // seen returning something unserialisable for a bare numeric expression
+      // here, which printed as [object Object] and hid whether the card had
+      // rendered anything at all.
+      const measured = await tryEvaluate(page, () =>
+        String((document.body ? document.body.innerText.replace(/\s+/g, ' ') : '').length));
+      bodyLength = Number.isFinite(Number(measured)) ? Number(measured) : `unreadable(${typeof measured})`;
     } catch (error) {
       failure = String(error).split('\n')[0].slice(0, 140);
     }
