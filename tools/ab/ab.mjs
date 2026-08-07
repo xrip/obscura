@@ -19,15 +19,7 @@
 // reported 9 of its own 173 requests, which made every comparison misleading
 // until it was found.
 
-import { spawn } from 'node:child_process';
-import net from 'node:net';
-import { join, resolve } from 'node:path';
-import { pathToFileURL } from 'node:url';
-
-const root = resolve(import.meta.dirname, '..', '..');
-const obscuraBin = join(root, 'target', 'release', 'obscura.exe');
-const playwrightPath = join(root, 'target', 'test-fixtures', 'playwright',
-  'node_modules', 'playwright-core', 'index.mjs');
+import { runIn, tryEvaluate, evaluated } from './engines.mjs';
 
 function parseArgs(argv) {
   const opts = { wait: 20, headed: false };
@@ -51,22 +43,6 @@ if (!opts.url) {
   console.error('usage: node tools/ab/ab.mjs <url> [--needle text] [--match regexp]' +
                 ' [--only chrome|obscura] [--wait seconds] [--proxy url] [--headed]');
   process.exit(2);
-}
-
-const { chromium } = await import(pathToFileURL(playwrightPath).href);
-
-// A navigation part way through an evaluate destroys the execution context.
-// That is ordinary on a site that redirects itself, not a result, so retry.
-async function tryEvaluate(page, fn, arg) {
-  for (let attempt = 0; attempt < 5; attempt++) {
-    try {
-      return await page.evaluate(fn, arg);
-    } catch (error) {
-      if (!String(error).includes('Execution context was destroyed')) throw error;
-      await new Promise(done => setTimeout(done, 500));
-    }
-  }
-  return null;
 }
 
 async function scenario(page) {
@@ -97,101 +73,22 @@ async function scenario(page) {
   if (opts.needle) {
     for (let second = 1; second <= opts.wait; second++) {
       await new Promise(done => setTimeout(done, 1000));
-      const found = await tryEvaluate(page, needle =>
-        (document.body ? document.body.innerText : '').includes(needle), opts.needle);
+      const found = evaluated(await tryEvaluate(page, needle =>
+        (document.body ? document.body.innerText : '').includes(needle), opts.needle));
       if (found) { needleAfter = second; break; }
     }
   }
 
-  const bodyLength = await tryEvaluate(page, () =>
-    (document.body ? document.body.innerText.replace(/\s+/g, ' ') : '').length);
+  const bodyLength = evaluated(await tryEvaluate(page, () =>
+    (document.body ? document.body.innerText.replace(/\s+/g, ' ') : '').length));
 
   return { needleAfter, bodyLength, requests, traffic, errors, elapsed: Date.now() - started };
-}
-
-function proxyForPlaywright(raw) {
-  if (!raw) return undefined;
-  const parsed = new URL(raw);
-  const proxy = { server: `${parsed.protocol}//${parsed.host}` };
-  if (parsed.username) proxy.username = decodeURIComponent(parsed.username);
-  if (parsed.password) proxy.password = decodeURIComponent(parsed.password);
-  return proxy;
-}
-
-async function withChrome() {
-  const browser = await chromium.launch({
-    channel: 'chrome',
-    headless: !opts.headed,
-    proxy: proxyForPlaywright(opts.proxy),
-  });
-  try {
-    const context = await browser.newContext();
-    return await scenario(await context.newPage());
-  } finally {
-    await browser.close();
-  }
-}
-
-function freePort() {
-  return new Promise((done, fail) => {
-    const server = net.createServer();
-    server.once('error', fail);
-    server.listen(0, '127.0.0.1', () => {
-      const { port } = server.address();
-      server.close(() => done(port));
-    });
-  });
-}
-
-async function withObscura() {
-  const port = await freePort();
-  const child = spawn(obscuraBin, ['--stealth', 'serve', '--port', String(port)], {
-    cwd: root,
-    // Explicit, not inherited. A proxy sitting in the shell sends a run through
-    // an exit it never asked for, and the result then reads as the site
-    // treating this machine differently rather than as a different IP.
-    // HTTPS_PROXY is the one that actually bit: it was set here, only some
-    // request paths honoured it, and runs silently disagreed about their own
-    // exit address.
-    env: (() => {
-      const env = { ...process.env, OBSCURA_NAV_TIMEOUT_MS: '90000' };
-      for (const name of ['OBSCURA_PROXY', 'HTTP_PROXY', 'HTTPS_PROXY', 'ALL_PROXY',
-                          'http_proxy', 'https_proxy', 'all_proxy']) {
-        delete env[name];
-      }
-      if (opts.proxy) env.OBSCURA_PROXY = opts.proxy;
-      return env;
-    })(),
-    stdio: ['ignore', 'pipe', 'pipe'],
-    windowsHide: true,
-  });
-  child.stdout.on('data', () => {});
-  child.stderr.on('data', () => {});
-  try {
-    const deadline = Date.now() + 30000;
-    for (;;) {
-      try {
-        const probe = await fetch(`http://127.0.0.1:${port}/json/version`);
-        if (probe.ok) break;
-      } catch { /* not up yet */ }
-      if (Date.now() > deadline) throw new Error('obscura did not start');
-      await new Promise(done => setTimeout(done, 200));
-    }
-    const browser = await chromium.connectOverCDP(`http://127.0.0.1:${port}`);
-    const context = await browser.newContext();
-    const result = await scenario(await context.newPage());
-    await context.close();
-    await browser.close();
-    return result;
-  } finally {
-    child.kill();
-  }
 }
 
 const engines = opts.only ? [opts.only] : ['chrome', 'obscura'];
 for (const engine of engines) {
   try {
-    const out = engine === 'chrome' ? await withChrome() : await withObscura();
+    const out = await runIn(engine, opts, scenario);
     const needle = opts.needle ? `  needle=${out.needleAfter ?? 'NEVER'}s` : '';
     console.log(`\n=== ${engine}  ${out.elapsed}ms${needle}` +
                 `  bodyLength=${out.bodyLength}  requests=${out.requests}`);
