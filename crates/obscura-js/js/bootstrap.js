@@ -901,76 +901,7 @@ class Node extends EventTarget {
     }
     _dom("append_child", _nodeId(this), _nodeId(c));
     if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('childList', _nodeId(this), [_nodeId(c)], []);
-    if (c instanceof Element && c.tagName === 'SCRIPT') {
-      const scriptType = c.getAttribute('type') || '';
-      const isModule = scriptType === 'module';
-      if (scriptType && !isModule && scriptType !== 'text/javascript' && scriptType !== 'application/javascript') {
-        return c;
-      }
-      const src = c.getAttribute('src');
-      const prevNid = globalThis.__currentScriptNid;
-      if (src) {
-        // Resolve against <base href> when present, else the document URL.
-        // The base href is resolved to an absolute URL first: a bare path like
-        // <base href="/"> (the common Angular form) is not a valid URL base on
-        // its own and would otherwise throw. Both the base and the final
-        // resolution are guarded so a bad value can never escape appendChild.
-        let baseHref;
-        try {
-          const baseEl = globalThis.document?.querySelector('base[href]');
-          baseHref = baseEl ? baseEl.getAttribute('href') : null;
-        } catch(e) { baseHref = null; }
-        const docUrl = globalThis.location?.href || 'http://localhost/';
-        let baseUrl;
-        try { baseUrl = baseHref ? new URL(baseHref, docUrl).href : docUrl; }
-        catch(e) { baseUrl = docUrl; }
-        let fullUrl;
-        try {
-          fullUrl = src.startsWith('http') || src.startsWith('data:')
-            ? src
-            : new URL(src, baseUrl).href;
-        } catch(e) {
-          console.error('Dynamic script URL resolve failed (' + src + '):', e.message);
-          fullUrl = src;
-        }
-        const pageOrigin = (function() { try { return new URL(baseUrl).origin; } catch(e) { return ""; } })();
-        // Enqueue — serialized via __processDynScriptQueue to prevent
-        // concurrent import() calls from triggering deno_core RefCell panic.
-        __dynScriptQueue.push({
-          url: fullUrl,
-          isModule,
-          nid: _nodeId(c),
-          prevNid,
-          pageOrigin,
-          dispatchEvent: (ev) => { try { c.dispatchEvent(ev); } catch(e) {} },
-        });
-        __processDynScriptQueue();
-      } else {
-        const code = c.textContent;
-        if (code) {
-          if (isModule) {
-            const dataUrl = 'data:text/javascript;base64,' + btoa(unescape(encodeURIComponent(code)));
-            __dynScriptQueue.push({
-              url: dataUrl,
-              isModule: true,
-              nid: _nodeId(c),
-              prevNid,
-              pageOrigin: "",
-              dispatchEvent: (ev) => { try { c.dispatchEvent(ev); } catch(e) {} },
-            });
-            __processDynScriptQueue();
-          } else {
-            globalThis.__currentScriptNid = _nodeId(c);
-            try { (0, eval)(code); }
-            catch(e) { console.error('Dynamic inline script error:', e.message); }
-            finally { globalThis.__currentScriptNid = prevNid || 0; }
-          }
-        }
-      }
-    }
-    if (c instanceof Element && c.tagName === 'LINK') {
-      _loadLinkedStylesheet(c);
-    }
+    _activateInsertedNode(c);
     return c;
   }
   removeChild(c) {
@@ -989,6 +920,7 @@ class Node extends EventTarget {
     }
     _dom("insert_before", _nodeId(newChild), _nodeId(oldChild));
     _dom("remove_child", _nodeId(oldChild));
+    _activateInsertedNode(newChild);
     return oldChild;
   }
   insertBefore(n, ref) {
@@ -1000,6 +932,8 @@ class Node extends EventTarget {
       return n;
     }
     _dom("insert_before", _nodeId(n), _nodeId(ref));
+    if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('childList', _nodeId(this), [_nodeId(n)], []);
+    _activateInsertedNode(n);
     return n;
   }
   contains(o) { return o ? _dom("contains", _nodeId(this), _nodeId(o)) === "true" : false; }
@@ -1628,6 +1562,11 @@ class Element extends Node {
     // their frame at all.
     if (n === "src" && this.localName === "iframe" && value && value !== "about:blank") {
       _loadIframeSrc(this, value);
+    }
+    // The other half of the same gap: a script already in the tree starts as
+    // soon as it is given a src.
+    if (n === "src" && this.localName === "script" && value) {
+      _activateScriptSrc(this);
     }
     if (popoverPrev !== undefined) this._popoverTypeMaybeChanged(popoverPrev);
     if (globalThis.__mutationObservers?.length) globalThis.__notifyMutation('attributes', _nodeId(this), [], [], n);
@@ -3313,6 +3252,97 @@ async function _fetchFrameDocument(url) {
     get(name) { return headers[String(name).toLowerCase()] || ''; },
   });
   return { status: parsed.status, url: parsed.url || url, html };
+}
+
+// One activation point for every way a node reaches the tree. appendChild used
+// to be the only path that started a script, so a loader that used insertBefore
+// or set `src` after inserting silently never fetched anything: no request, no
+// error, and a promise that never settles. That is what a bundler's chunk
+// loading looks like when it stalls.
+function _activateInsertedNode(c) {
+  if (!(c instanceof Element)) return;
+  if (c.tagName === 'LINK') { _loadLinkedStylesheet(c); return; }
+  if (c.tagName !== 'SCRIPT') return;
+  // The spec's "already started" flag: a script runs once, however many times
+  // it is moved around or has its src rewritten afterwards.
+  if (c.__obscuraScriptStarted) return;
+  const src = c.getAttribute('src');
+  if (!src && !c.textContent) return;
+  c.__obscuraScriptStarted = true;
+  {
+    const scriptType = c.getAttribute('type') || '';
+    const isModule = scriptType === 'module';
+    if (scriptType && !isModule && scriptType !== 'text/javascript' && scriptType !== 'application/javascript') {
+      return;
+    }
+    const prevNid = globalThis.__currentScriptNid;
+    if (src) {
+      // Resolve against <base href> when present, else the document URL.
+      // The base href is resolved to an absolute URL first: a bare path like
+      // <base href="/"> (the common Angular form) is not a valid URL base on
+      // its own and would otherwise throw. Both the base and the final
+      // resolution are guarded so a bad value can never escape appendChild.
+      let baseHref;
+      try {
+        const baseEl = globalThis.document?.querySelector('base[href]');
+        baseHref = baseEl ? baseEl.getAttribute('href') : null;
+      } catch(e) { baseHref = null; }
+      const docUrl = globalThis.location?.href || 'http://localhost/';
+      let baseUrl;
+      try { baseUrl = baseHref ? new URL(baseHref, docUrl).href : docUrl; }
+      catch(e) { baseUrl = docUrl; }
+      let fullUrl;
+      try {
+        fullUrl = src.startsWith('http') || src.startsWith('data:')
+          ? src
+          : new URL(src, baseUrl).href;
+      } catch(e) {
+        console.error('Dynamic script URL resolve failed (' + src + '):', e.message);
+        fullUrl = src;
+      }
+      const pageOrigin = (function() { try { return new URL(baseUrl).origin; } catch(e) { return ""; } })();
+      // Enqueue — serialized via __processDynScriptQueue to prevent
+      // concurrent import() calls from triggering deno_core RefCell panic.
+      __dynScriptQueue.push({
+        url: fullUrl,
+        isModule,
+        nid: _nodeId(c),
+        prevNid,
+        pageOrigin,
+        dispatchEvent: (ev) => { try { c.dispatchEvent(ev); } catch(e) {} },
+      });
+      __processDynScriptQueue();
+    } else {
+      const code = c.textContent;
+      if (code) {
+        if (isModule) {
+          const dataUrl = 'data:text/javascript;base64,' + btoa(unescape(encodeURIComponent(code)));
+          __dynScriptQueue.push({
+            url: dataUrl,
+            isModule: true,
+            nid: _nodeId(c),
+            prevNid,
+            pageOrigin: "",
+            dispatchEvent: (ev) => { try { c.dispatchEvent(ev); } catch(e) {} },
+          });
+          __processDynScriptQueue();
+        } else {
+          globalThis.__currentScriptNid = _nodeId(c);
+          try { (0, eval)(code); }
+          catch(e) { console.error('Dynamic inline script error:', e.message); }
+          finally { globalThis.__currentScriptNid = prevNid || 0; }
+        }
+      }
+    }
+  }
+}
+
+// A script that is already in the tree starts as soon as it gets a src, which
+// is the other half of the same gap.
+function _activateScriptSrc(el) {
+  if (!(el instanceof Element) || el.tagName !== 'SCRIPT') return;
+  if (el.__obscuraScriptStarted || !el.isConnected) return;
+  _activateInsertedNode(el);
 }
 
 function _loadIframeSrc(el, url) {
