@@ -44,46 +44,22 @@ try {
   await page.goto('https://www.wildberries.ru/', { waitUntil: 'load', timeout: 90000 });
   await new Promise(done => setTimeout(done, 3000));
 
+  const nav = [];
+  page.on('framenavigated', f => nav.push('nav:' + f.url().slice(0, 70)));
+  page.on('request', r => { if (r.url().includes('/catalog/')) nav.push('req:' + r.url().slice(0, 70)); });
   const report = await page.evaluate(async () => {
     const a = document.querySelector('a[href*="/catalog/"][href*="/detail.aspx"]');
     if (!a) return { error: 'no card anchor' };
-    a.scrollIntoView();
-
-    const rect1 = a.getBoundingClientRect();
-    await new Promise(r => requestAnimationFrame(() => requestAnimationFrame(r)));
-    const rect2 = a.getBoundingClientRect();
-
-    const cx = rect2.left + rect2.width / 2;
-    const cy = rect2.top + rect2.height / 2;
-    const hit = document.elementFromPoint(cx, cy);
-    const style = getComputedStyle(a);
-
-    // Playwright walks up from the hit element looking for the target.
-    let found = false;
-    for (let n = hit; n; n = n.parentElement) if (n === a) { found = true; break; }
-
-    return {
-      // 1 visible
-      rect: { x: rect2.left, y: rect2.top, w: rect2.width, h: rect2.height },
-      nonEmpty: rect2.width > 0 && rect2.height > 0,
-      visibility: style.visibility,
-      display: style.display,
-      // 2 stable across two frames
-      stable: rect1.left === rect2.left && rect1.top === rect2.top &&
-              rect1.width === rect2.width && rect1.height === rect2.height,
-      rectBefore: { x: rect1.left, y: rect1.top, w: rect1.width, h: rect1.height },
-      // 3 receives events
-      hitTag: hit ? (hit.tagName + (hit.id ? '#' + hit.id : '')) : 'null',
-      hitIsTargetOrChild: found,
-      // 4 enabled
-      disabled: a.hasAttribute('disabled'),
-      inViewport: cx >= 0 && cy >= 0 &&
-                  cx <= (window.innerWidth || 0) && cy <= (window.innerHeight || 0),
-      viewport: { w: window.innerWidth, h: window.innerHeight },
-      scroll: { x: window.scrollX, y: window.scrollY },
-    };
+    const href = a.getAttribute('href');
+    let defaultPrevented = null;
+    a.addEventListener('click', e => { defaultPrevented = e.defaultPrevented; }, true);
+    const after = new Promise(r => setTimeout(r, 1500));
+    a.click();
+    await after;
+    return { href, defaultPrevented, locationAfter: location.href, historyLen: history.length };
   });
   console.log(JSON.stringify(report, null, 2));
+  console.log(JSON.stringify(nav, null, 1));
 
   await context.close();
   await browser.close();
