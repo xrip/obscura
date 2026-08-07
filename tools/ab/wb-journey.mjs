@@ -72,6 +72,8 @@ const productId = url => (url.match(/\/catalog\/(\d+)\/detail/) || [])[1];
 
 async function journey(page, log) {
   const steps = [];
+  let requests = 0;
+  page.on('request', () => { requests += 1; });
 
   await page.goto(HOME, { waitUntil: 'load', timeout: 90000 });
   // The home page fills its rails after hydration, so wait for links rather
@@ -85,20 +87,39 @@ async function journey(page, log) {
     if (links.length >= 3) break;
   }
   const unique = [...new Set(links.filter(productId))];
-  steps.push({ step: 'home', links: unique.length, ok: unique.length >= opts.cards });
-  log(`home: ${unique.length} product links`);
+  steps.push({ step: 'home', links: unique.length, requests, ok: unique.length >= opts.cards });
+  log(`home: ${unique.length} product links, ${requests} requests`);
   if (!unique.length) return steps;
 
-  const picked = [];
-  while (picked.length < Math.min(opts.cards, unique.length)) {
-    const candidate = unique[Math.floor(Math.random() * unique.length)];
-    if (!picked.includes(candidate)) picked.push(candidate);
-  }
+  // One card at a time, returning home in between. The home feed reshuffles on
+  // every visit, so ids picked up front are gone by the second card — which
+  // reads as a click failure and is really a stale locator.
+  const visited = new Set();
+  for (let round = 0; round < opts.cards; round++) {
+    if (round > 0) {
+      await page.goto(HOME, { waitUntil: 'load', timeout: 90000 });
+      await new Promise(done => setTimeout(done, 2000));
+    }
 
-  for (const url of picked) {
+    // Only cards the page currently shows, and only ones we have not used.
+    const candidates = (await tryEvaluate(page, () =>
+      [...document.querySelectorAll('a[href*="/catalog/"][href*="/detail.aspx"]')]
+        .filter(a => {
+          const r = a.getBoundingClientRect();
+          return r.width > 0 && r.height > 0;
+        })
+        .map(a => a.href)) || []).filter(u => productId(u) && !visited.has(productId(u)));
+    if (!candidates.length) {
+      steps.push({ step: 'card', ok: false, failure: 'no unvisited card on the page' });
+      log('card: none available on the home page');
+      continue;
+    }
+    const url = candidates[Math.floor(Math.random() * candidates.length)];
     const id = productId(url);
-    // Pause between cards. A person reads before clicking, and back to back
-    // navigations are what gets an IP throttled.
+    visited.add(id);
+
+    // A person reads before clicking, and back to back navigations are what
+    // gets an IP throttled.
     await new Promise(done => setTimeout(done, 1500 + Math.random() * 2000));
     let opened = null;
     let bodyLength = 0;
@@ -108,24 +129,17 @@ async function journey(page, log) {
       if (opts.goto) {
         await page.goto(url, { waitUntil: 'load', timeout: 90000 });
       } else {
-        // Back to the page holding the card, then click the real anchor.
-        if (!page.url().startsWith(HOME) || !(await page.$(`a[href*="/catalog/${id}/"]`))) {
-          await page.goto(HOME, { waitUntil: 'load', timeout: 90000 });
-          await new Promise(done => setTimeout(done, 2000));
-        }
         const card = page.locator(`a[href*="/catalog/${id}/"]`).first();
         await card.scrollIntoViewIfNeeded({ timeout: 15000 });
         await new Promise(done => setTimeout(done, 400 + Math.random() * 600));
         await card.click({ timeout: 15000 });
-        // The site may route client side or navigate; either way the URL has
-        // to end up on this card.
         for (let tick = 0; tick < 40; tick++) {
           if (page.url().includes(`/catalog/${id}/`)) break;
           await new Promise(done => setTimeout(done, 500));
         }
         if (!page.url().includes(`/catalog/${id}/`)) {
           how = 'click(no-nav)';
-          throw new Error(`click did not reach the card, still at ${page.url().slice(0, 80)}`);
+          throw new Error(`click did not reach the card, still at ${page.url().slice(0, 60)}`);
         }
       }
       for (let second = 1; second <= opts.wait; second++) {
@@ -137,11 +151,12 @@ async function journey(page, log) {
       bodyLength = await tryEvaluate(page, () =>
         (document.body ? document.body.innerText.replace(/\s+/g, ' ') : '').length) || 0;
     } catch (error) {
-      failure = String(error).split('\n')[0].slice(0, 160);
+      failure = String(error).split('\n')[0].slice(0, 140);
     }
-    steps.push({ step: 'card', id, how, opened, bodyLength, failure, ok: opened !== null });
+    steps.push({ step: 'card', id, how, opened, bodyLength, failure, requests, ok: opened !== null });
     log(`card ${id} via ${how}: ${failure ? `FAILED ${failure}` : opened !== null
-      ? `opened after ${opened}s (${bodyLength} chars)` : `NEVER rendered (${bodyLength} chars)`}`);
+      ? `opened after ${opened}s (${bodyLength} chars)` : `NEVER rendered (${bodyLength} chars)`}` +
+      `  [${requests} requests total]`);
   }
   return steps;
 }
