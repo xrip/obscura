@@ -793,7 +793,17 @@ mod tests {
     #[tokio::test]
     async fn stealth_client_decodes_gzip_response() {
         let port = gzip_fixture().await;
-        let client = StealthHttpClient::new(Arc::new(CookieJar::new()));
+        // allow_private_network: this fork blocks loopback by default (SSRF
+        // protection); the upstream test was written before that gate existed.
+        let client = StealthHttpClient::with_browser_identity(
+            Arc::new(CookieJar::new()),
+            None,
+            "",
+            "",
+            "",
+            0,
+            true,
+        );
         let url = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
 
         let resp = client.fetch(&url).await.expect("fixture must be reachable");
