@@ -69,68 +69,21 @@ pub async fn handle(
             let _button = params.get("button").and_then(|v| v.as_str()).unwrap_or("left");
             let click_count = params.get("clickCount").and_then(|v| v.as_u64()).unwrap_or(1);
 
-            if event_type == "mousePressed" {
+            // One entry point in the page, so a click driven over the wire
+            // produces the same event stream as one made by page script: the
+            // move onto the element, the press, the pixel of drift a hand adds
+            // between press and release, then the release and the click. This
+            // used to fire mousedown and click together with no mouseup and no
+            // preceding move, and carried its own copy of the link, form and
+            // checkbox activation that Element.click() already had.
+            if matches!(event_type, "mouseMoved" | "mousePressed" | "mouseReleased") {
                 if let Some(page) = ctx.get_session_page_mut(session_id) {
                     let code = format!(
-                        "(function() {{\
-                            var target = (document.elementFromPoint && document.elementFromPoint({x},{y})) || globalThis.__obscura_click_target || document.activeElement || document.body;\
-                            if (!target) return;\
-                            globalThis.__obscura_click_target = target;\
-                            var evt = globalThis.__obscura_markTrusted(new MouseEvent('mousedown', {{bubbles:true,cancelable:true,clientX:{x},clientY:{y},button:0,detail:{click_count}}}));\
-                            target.dispatchEvent(evt);\
-                            var click = globalThis.__obscura_markTrusted(new MouseEvent('click', {{bubbles:true,cancelable:true,clientX:{x},clientY:{y},button:0,detail:{click_count}}}));\
-                            var cancelled = !target.dispatchEvent(click);\
-                            if (!cancelled) {{\
-                                var link = target.closest ? target.closest('a[href]') : null;\
-                                if (!link && target.tagName === 'A' && target.getAttribute('href')) link = target;\
-                                if (link) {{\
-                                    var href = link.getAttribute('href');\
-                                    if (href && !href.startsWith('#') && !href.startsWith('javascript:')) {{\
-                                        location.assign(href);\
-                                    }}\
-                                }} else {{\
-                                    var tag = target.tagName;\
-                                    var type = (target.getAttribute && target.getAttribute('type') || '').toLowerCase();\
-                                    if (tag === 'BUTTON' && type !== 'button' && type !== 'reset') {{\
-                                        var form = target.closest ? target.closest('form') : null;\
-                                        if (form) {{ try {{ if (typeof form.requestSubmit === 'function') {{ form.requestSubmit(target); }} else {{ form.submit(target); }} }} catch(e) {{}} }}\
-                                    }} else if (tag === 'INPUT' && (type === 'submit' || type === 'image')) {{\
-                                        var form2 = target.closest ? target.closest('form') : null;\
-                                        if (form2) {{ try {{ if (typeof form2.requestSubmit === 'function') {{ form2.requestSubmit(target); }} else {{ form2.submit(target); }} }} catch(e) {{}} }}\
-                                    }} else if (tag === 'INPUT' && (type === 'checkbox' || type === 'radio')) {{\
-                                        target.checked = !target.checked;\
-                                        try {{ target.dispatchEvent(globalThis.__obscura_markTrusted(new Event('change', {{bubbles:true}}))); }} catch(e) {{}}\
-                                    }} else if ({click_count} >= 3 && (tag === 'INPUT' || tag === 'TEXTAREA')) {{\
-                                        // Triple-click selects all text (browser native behavior not replicated
-                                        // by synthetic MouseEvent, so we do it manually).
-                                        var len = target.value ? target.value.length : 0;\
-                                        if (target.setSelectionRange) {{\
-                                            target.setSelectionRange(0, len);\
-                                        }} else {{\
-                                            target.selectionStart = 0;\
-                                            target.selectionEnd = len;\
-                                        }}\
-                                    }}\
-                                }}\
-                            }}\
-                        }})()",
-                        x = x, y = y, click_count = click_count,
+                        "globalThis.__obscura_dispatchMouse({t:?}, {x}, {y}, {c})",
+                        t = event_type, x = x, y = y, c = click_count,
                     );
                     page.evaluate(&code);
                     page.process_pending_navigation().await.map_err(|e| e.to_string())?;
-                }
-            } else if event_type == "mouseReleased" {
-                if let Some(page) = ctx.get_session_page_mut(session_id) {
-                    let code = format!(
-                        "(function() {{\
-                            var target = (document.elementFromPoint && document.elementFromPoint({x},{y})) || globalThis.__obscura_click_target || document.activeElement || document.body;\
-                            if (!target) return;\
-                            var evt = globalThis.__obscura_markTrusted(new MouseEvent('mouseup', {{bubbles:true,cancelable:true,clientX:{x},clientY:{y},button:0}}));\
-                            target.dispatchEvent(evt);\
-                        }})()",
-                        x = x, y = y,
-                    );
-                    page.evaluate(&code);
                 }
             }
 

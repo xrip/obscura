@@ -196,6 +196,8 @@ async fn a_click_arrives_with_the_events_a_real_one_would() {
         vec![
             "pointerover", "pointerenter", "mouseover", "mouseenter",
             "pointermove", "mousemove", "pointerdown", "mousedown",
+            // the pixel of drift a hand adds between press and release
+            "pointermove", "mousemove",
             "pointerup", "mouseup", "click",
         ],
         "click sequence does not match Chrome's: {seen:?}"
@@ -209,9 +211,18 @@ async fn a_click_arrives_with_the_events_a_real_one_would() {
           return Math.round(r.left + r.width / 2) + ',' + Math.round(r.top + r.height / 2); })()",
     );
     let centre = centre.as_str().unwrap();
-    for event in &seen {
-        let point = event.split_once(':').unwrap().1;
-        assert_eq!(point, centre, "{event} did not land on the element's centre");
+    let (cx, cy) = centre.split_once(',').unwrap();
+    let (cx, cy): (i64, i64) = (cx.parse().unwrap(), cy.parse().unwrap());
+    for (index, event) in seen.iter().enumerate() {
+        let (x, y) = event.split_once(':').unwrap().1.split_once(',').unwrap();
+        let (x, y): (i64, i64) = (x.parse().unwrap(), y.parse().unwrap());
+        // Everything up to mousedown is on the centre; from the drift onward it
+        // is within a pixel of it, which is the point of the drift.
+        let slack = if index <= 7 { 0 } else { 1 };
+        assert!(
+            (x - cx).abs() <= slack && (y - cy).abs() <= slack,
+            "{event} is more than {slack}px from the centre {centre}"
+        );
     }
 }
 

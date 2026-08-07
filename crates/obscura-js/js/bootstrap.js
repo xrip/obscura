@@ -1786,31 +1786,7 @@ class Element extends Node {
     return cache[name];
   }
   click() {
-    const cancelled = !_dispatchClickSequence(this);
-    if (!cancelled) {
-      const link = this.tagName === 'A' ? this : (this.closest ? this.closest('a[href]') : null);
-      if (link) {
-        const href = link.getAttribute('href');
-        if (href && !href.startsWith('#') && !href.startsWith('javascript:')) {
-          location.assign(href);
-          return;
-        }
-      }
-      // Same predicate requestSubmit validates against, so an internal click
-      // can never hand it a submitter it would reject. Also matches the CDP
-      // click path in input.rs, which already treats <input type=image> as a
-      // submit button.
-      if (_isSubmitButton(this)) {
-        const form = this.closest ? this.closest('form') : null;
-        // A real submit-button click fires the cancelable submit event, so use
-        // requestSubmit() (not the plain submit() method, which now bypasses it).
-        if (form && typeof form.requestSubmit === 'function') {
-          form.requestSubmit(this);
-        } else if (form && typeof form.submit === 'function') {
-          form.submit(this);
-        }
-      }
-    }
+    if (_dispatchClickSequence(this)) _activateClickTarget(this);
   }
   focus() { globalThis.__obscura_focused = this; }
   blur() { if (globalThis.__obscura_focused === this) globalThis.__obscura_focused = null; }
@@ -3298,7 +3274,7 @@ function _elementInCellAt(x, y) {
 // by a move, and the coordinates of every event in the sequence agree with the
 // target's rect. Detectors check exactly that, so the position has to be state
 // we keep rather than something invented per event.
-const _pointer = { x: 0, y: 0, inside: null };
+const _pointer = { x: 0, y: 0, inside: null, trusted: false };
 
 function _pointInit(el, type, extra) {
   const view = _viewportSize();
@@ -3321,6 +3297,18 @@ function _pointInit(el, type, extra) {
   }, extra || {});
 }
 
+// A hand is not a clamp. Between pressing and releasing, a real pointer moves
+// a pixel or so, and Chrome reports the release at wherever it ended up. A
+// mouseup landing on exactly the same coordinate as its mousedown, every time,
+// is a signature nothing physical produces.
+function _driftPointer() {
+  const dx = Math.random() < 0.5 ? -1 : 1;
+  const dy = Math.random() < 0.5 ? 0 : (Math.random() < 0.5 ? -1 : 1);
+  _pointer.x += dx;
+  _pointer.y += dy;
+  return { movementX: dx, movementY: dy };
+}
+
 function _firePointer(el, type, extra) {
   const Ctor = type.startsWith('pointer') && globalThis.PointerEvent
     ? globalThis.PointerEvent
@@ -3334,7 +3322,15 @@ function _firePointer(el, type, extra) {
     init.height = 1;
     init.pressure = init.buttons ? 0.5 : 0;
   }
-  try { return el.dispatchEvent(new Ctor(type, init)); } catch (_) { return true; }
+  try {
+    let event = new Ctor(type, init);
+    // Events the host drives are as trusted as any other; only page script
+    // making its own is not.
+    if (_pointer.trusted && globalThis.__obscura_markTrusted) {
+      event = globalThis.__obscura_markTrusted(event);
+    }
+    return el.dispatchEvent(event);
+  } catch (_) { return true; }
 }
 
 // Move the pointer onto an element, firing what leaving the previous one and
@@ -3375,10 +3371,75 @@ function _dispatchClickSequence(el) {
   _firePointer(el, 'pointerdown');
   _firePointer(el, 'mousedown');
   try { if (typeof el.focus === 'function') el.focus(); } catch (_) {}
+  const drift = _driftPointer();
+  _firePointer(el, 'pointermove', drift);
+  _firePointer(el, 'mousemove', drift);
   _firePointer(el, 'pointerup');
   _firePointer(el, 'mouseup');
   return _firePointer(el, 'click');
 }
+
+// What a click does once nothing has cancelled it: follow a link, submit a
+// form, toggle a control. Shared, because the CDP path used to carry its own
+// copy of this and the two had already drifted apart.
+function _activateClickTarget(el) {
+  const link = el.tagName === 'A' ? el : (el.closest ? el.closest('a[href]') : null);
+  if (link) {
+    const href = link.getAttribute('href');
+    if (href && !href.startsWith('#') && !href.startsWith('javascript:')) {
+      location.assign(href);
+    }
+    return;
+  }
+  if (_isSubmitButton(el)) {
+    const form = el.closest ? el.closest('form') : null;
+    if (form && typeof form.requestSubmit === 'function') form.requestSubmit(el);
+    else if (form && typeof form.submit === 'function') form.submit(el);
+    return;
+  }
+  const type = (el.getAttribute && (el.getAttribute('type') || '')).toLowerCase();
+  if (el.tagName === 'INPUT' && (type === 'checkbox' || type === 'radio')) {
+    el.checked = !el.checked;
+    try { el.dispatchEvent(new Event('change', { bubbles: true })); } catch (_) {}
+  }
+}
+
+// The one entry point the CDP input domain uses, so a click driven over the
+// wire produces the same event stream as one made by page script.
+globalThis.__obscura_dispatchMouse = function(type, x, y, clickCount) {
+  const target = (document.elementFromPoint && document.elementFromPoint(x, y)) ||
+                 document.activeElement || document.body;
+  if (!target) return;
+  _pointer.x = x;
+  _pointer.y = y;
+  _pointer.trusted = true;
+  const detail = clickCount || 1;
+  try {
+    if (type === 'mouseMoved') {
+      _pointerMoveOnto(target);
+    } else if (type === 'mousePressed') {
+      _pointerMoveOnto(target);
+      _firePointer(target, 'pointerdown', { detail });
+      _firePointer(target, 'mousedown', { detail });
+      try { if (typeof target.focus === 'function') target.focus(); } catch (_) {}
+    } else if (type === 'mouseReleased') {
+      const drift = _driftPointer();
+      _firePointer(target, 'pointermove', drift);
+      _firePointer(target, 'mousemove', drift);
+      _firePointer(target, 'pointerup', { detail });
+      _firePointer(target, 'mouseup', { detail });
+      if (_firePointer(target, 'click', { detail })) {
+        if (detail >= 3 && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) {
+          const length = target.value ? target.value.length : 0;
+          if (target.setSelectionRange) target.setSelectionRange(0, length);
+        }
+        _activateClickTarget(target);
+      }
+    }
+  } finally {
+    _pointer.trusted = false;
+  }
+};
 
 // Scroll so an element's cell lands inside the viewport. This is what makes a
 // grid taller than one screen clickable at all: without it every element past
