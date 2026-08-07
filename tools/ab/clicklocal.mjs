@@ -35,7 +35,16 @@ const fixture = http.createServer((req, res) => {
                `<img src="/i.webp"><span>Product ${i}</span></a></article>`;
     }
     res.end(`<!doctype html><html><head><style>.card{position:relative}</style></head>
-             <body><div class="feed">${cards}</div></body></html>`);
+             <body><div class="feed">${cards}
+             <article class="card"><a href="/catalog/999/detail.aspx" id="spa">routed</a></article>
+             </div>
+             <script>
+               document.getElementById('spa').addEventListener('click', function(e) {
+                 e.preventDefault();
+                 history.pushState({}, '', '/catalog/999/detail.aspx');
+               });
+             </script>
+             </body></html>`);
   }
 });
 await new Promise(r => fixture.listen(fixturePort, '127.0.0.1', r));
@@ -90,6 +99,14 @@ try {
     for (let i=0;i<20;i++){ if(page.url().includes('/catalog/')) break; await new Promise(r=>setTimeout(r,300)); }
     console.log('click        : OK, now at', page.url());
     console.log('server saw   :', JSON.stringify(hits));
+    await page.goBack().catch(() => {});
+    await page.goto(base, { waitUntil: 'load', timeout: 60000 });
+    await page.locator('#spa').click({ timeout: 10000 });
+    for (let i = 0; i < 20; i++) {
+      if (page.url().includes('/catalog/999/')) break;
+      await new Promise(r => setTimeout(r, 300));
+    }
+    console.log('spa route    :', page.url().includes('/catalog/999/') ? 'OK ' + page.url() : 'FAILED, still at ' + page.url());
   } catch (e) {
     console.log('LOG:', JSON.stringify(e.log || e.message, null, 1).slice(0, 2000));
     console.log('click        : FAILED', String(e).split('\n')[0].slice(0, 140));

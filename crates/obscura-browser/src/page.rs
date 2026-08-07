@@ -1867,6 +1867,30 @@ impl Page {
         self.callbacks.remove_response(id)
     }
 
+    /// Adopt a URL the page routed to itself, without fetching anything.
+    ///
+    /// A single page app answers a click by calling history.pushState and
+    /// rendering the next view in place. bootstrap tracks that in
+    /// `__virtualUrl` so `location.href` reads correctly, but nothing on this
+    /// side ever looked at it — so the page had moved on and `page.url()` still
+    /// reported the old document. To a client that is a click that did nothing.
+    ///
+    /// Returns whether the URL changed.
+    pub fn sync_virtual_url(&mut self) -> bool {
+        let Some(js) = self.js.as_mut() else { return false };
+        let Ok(virtual_url) = js.evaluate("globalThis.__virtualUrl || ''") else { return false };
+        let Some(virtual_url) = virtual_url.as_str().filter(|url| !url.is_empty()) else {
+            return false;
+        };
+        let Ok(parsed) = Url::parse(virtual_url) else { return false };
+        if self.url.as_ref() == Some(&parsed) {
+            return false;
+        }
+        self.url = Some(parsed);
+        self.push_history(self.url_string());
+        true
+    }
+
     pub async fn process_pending_navigation(&mut self) -> Result<bool, PageError> {
         if let Some((url, method, body)) = self.take_pending_navigation() {
             self.navigate_with_wait_post(
@@ -1878,7 +1902,7 @@ impl Page {
             .await?;
             Ok(true)
         } else {
-            Ok(false)
+            Ok(self.sync_virtual_url())
         }
     }
 

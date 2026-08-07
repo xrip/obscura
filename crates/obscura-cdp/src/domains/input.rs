@@ -83,7 +83,32 @@ pub async fn handle(
                         t = event_type, x = x, y = y, c = click_count,
                     );
                     page.evaluate(&code);
-                    page.process_pending_navigation().await.map_err(|e| e.to_string())?;
+                    let moved = page
+                        .process_pending_navigation()
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    // A single page app answers a click by routing itself, with
+                    // no document fetch. The client still has to be told the
+                    // frame moved, or the click looks like it did nothing.
+                    if moved {
+                        let url = page.url_string();
+                        let frame_id = page.frame_id.clone();
+                        ctx.pending_events.push(crate::types::CdpEvent {
+                            method: "Page.frameNavigated".into(),
+                            params: json!({
+                                "frame": {
+                                    "id": frame_id,
+                                    "url": url,
+                                    "domainAndRegistry": "",
+                                    "securityOrigin": "",
+                                    "mimeType": "text/html",
+                                    "adFrameStatus": { "adFrameType": "none" },
+                                },
+                                "type": "Navigation",
+                            }),
+                            session_id: Some(session_id.clone().unwrap_or_default()),
+                        });
+                    }
                 }
             }
 
