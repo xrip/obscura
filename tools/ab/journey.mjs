@@ -1,7 +1,8 @@
-// A Wildberries journey, run against real Chrome and against Obscura.
+// A storefront journey, run against real Chrome and against Obscura.
 //
-//   node tools/ab/wb-journey.mjs [options]
+//   node tools/ab/journey.mjs [options]
 //
+//     --site <name>      wb (default) or ozon
 //     --cards <n>        product cards to visit (default 3)
 //     --only <engine>    "chrome" or "obscura"
 //     --proxy <url>      send both engines through the same proxy
@@ -35,10 +36,29 @@ const root = resolve(import.meta.dirname, '..', '..');
 const obscuraBin = join(root, 'target', 'release', 'obscura.exe');
 const playwrightPath = join(root, 'target', 'test-fixtures', 'playwright',
   'node_modules', 'playwright-core', 'index.mjs');
-const HOME = 'https://www.wildberries.ru/';
+// What differs between storefronts: where the home page is, what a card link
+// looks like, and where the product id hides in its URL.
+const SITES = {
+  wb: {
+    home: 'https://www.wildberries.ru/',
+    cardLink: 'a[href*="/catalog/"][href*="/detail.aspx"]',
+    idFrom: url => (url.match(/\/catalog\/(\d+)\/detail/) || [])[1],
+    // The href fragment that says the browser is on this card.
+    onCard: id => `/catalog/${id}/`,
+    cardLinkFor: id => `a[href*="/catalog/${id}/"]`,
+  },
+  ozon: {
+    home: 'https://www.ozon.ru/',
+    cardLink: 'a[href*="/product/"]',
+    // Ozon slugs end in the id: /product/some-name-1902651403/
+    idFrom: url => (url.match(/\/product\/[^/?#]*?-(\d+)(?:[/?#]|$)/) || [])[1],
+    onCard: id => `-${id}`,
+    cardLinkFor: id => `a[href*="-${id}"]`,
+  },
+};
 
 function parseArgs(argv) {
-  const opts = { cards: 3, wait: 20, headed: false };
+  const opts = { cards: 3, wait: 20, headed: false, site: 'wb' };
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--headed') opts.headed = true;
@@ -47,10 +67,17 @@ function parseArgs(argv) {
     else if (arg === '--proxy') opts.proxy = argv[++i];
     else if (arg === '--wait') opts.wait = Number(argv[++i]);
     else if (arg === '--goto') opts.goto = true;
+    else if (arg === '--site') opts.site = argv[++i];
   }
   return opts;
 }
 const opts = parseArgs(process.argv.slice(2));
+const site = SITES[opts.site];
+if (!site) {
+  console.error(`unknown --site ${opts.site}; expected one of ${Object.keys(SITES).join(', ')}`);
+  process.exit(2);
+}
+const HOME = site.home;
 
 const { chromium } = await import(pathToFileURL(playwrightPath).href);
 
@@ -68,7 +95,7 @@ async function tryEvaluate(page, fn, arg) {
   return null;
 }
 
-const productId = url => (url.match(/\/catalog\/(\d+)\/detail/) || [])[1];
+const productId = url => site.idFrom(url);
 
 async function journey(page, log) {
   const steps = [];
@@ -81,9 +108,8 @@ async function journey(page, log) {
   let links = [];
   for (let second = 1; second <= opts.wait; second++) {
     await new Promise(done => setTimeout(done, 1000));
-    links = await tryEvaluate(page, () =>
-      [...document.querySelectorAll('a[href*="/catalog/"][href*="/detail.aspx"]')]
-        .map(a => a.href)) || [];
+    links = await tryEvaluate(page, selector =>
+      [...document.querySelectorAll(selector)].map(a => a.href), site.cardLink) || [];
     if (links.length >= 3) break;
   }
   const unique = [...new Set(links.filter(productId))];
@@ -102,13 +128,14 @@ async function journey(page, log) {
     }
 
     // Only cards the page currently shows, and only ones we have not used.
-    const candidates = (await tryEvaluate(page, () =>
-      [...document.querySelectorAll('a[href*="/catalog/"][href*="/detail.aspx"]')]
+    const candidates = (await tryEvaluate(page, selector =>
+      [...document.querySelectorAll(selector)]
         .filter(a => {
           const r = a.getBoundingClientRect();
           return r.width > 0 && r.height > 0;
         })
-        .map(a => a.href)) || []).filter(u => productId(u) && !visited.has(productId(u)));
+        .map(a => a.href), site.cardLink) || [])
+      .filter(u => productId(u) && !visited.has(productId(u)));
     if (!candidates.length) {
       steps.push({ step: 'card', ok: false, failure: 'no unvisited card on the page' });
       log('card: none available on the home page');
@@ -129,15 +156,15 @@ async function journey(page, log) {
       if (opts.goto) {
         await page.goto(url, { waitUntil: 'load', timeout: 90000 });
       } else {
-        const card = page.locator(`a[href*="/catalog/${id}/"]`).first();
+        const card = page.locator(site.cardLinkFor(id)).first();
         await card.scrollIntoViewIfNeeded({ timeout: 15000 });
         await new Promise(done => setTimeout(done, 400 + Math.random() * 600));
         await card.click({ timeout: 15000 });
         for (let tick = 0; tick < 40; tick++) {
-          if (page.url().includes(`/catalog/${id}/`)) break;
+          if (page.url().includes(site.onCard(id))) break;
           await new Promise(done => setTimeout(done, 500));
         }
-        if (!page.url().includes(`/catalog/${id}/`)) {
+        if (!page.url().includes(site.onCard(id))) {
           how = 'click(no-nav)';
           throw new Error(`click did not reach the card, still at ${page.url().slice(0, 60)}`);
         }
