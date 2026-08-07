@@ -2329,6 +2329,26 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn string_timeout_declarations_reach_global_scope() {
+        // A string timer handler runs as a classic script in global scope, so a
+        // top-level var/function declaration in it becomes a global. new Function()
+        // kept those declarations local to the compiled function, so they never
+        // reached globalThis.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.evaluate(
+            "setTimeout('var __leaked = 42; function __leakedFn(){ return 7; }', 0)",
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        let v = rt
+            .evaluate(
+                "String(globalThis.__leaked) + '|' + (typeof globalThis.__leakedFn === 'function' ? globalThis.__leakedFn() : 'missing')",
+            )
+            .unwrap();
+        assert_eq!(v, serde_json::json!("42|7"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn string_interval_handler_repeats_and_can_clear_itself() {
         let mut rt = setup_runtime("<html><body></body></html>");
         rt.evaluate("globalThis.__ticks=0").unwrap();
@@ -2886,6 +2906,22 @@ mod tests {
     }
 
     #[test]
+    fn set_attribute_updates_a_parsed_namespaced_attribute_in_place() {
+        // setAttribute matched the stored attribute by local name only, so a
+        // parsed `xlink:href` (prefix=xlink, local=href) was never found by the
+        // qualified name "xlink:href": the update was pushed as a *second*
+        // attribute, getAttribute kept returning the stale original, and the
+        // element serialized `xlink:href` twice.
+        let mut rt = setup_runtime(
+            r##"<html><body><svg><use id="u" xlink:href="#a"></use></svg></body></html>"##,
+        );
+        let v = rt
+            .evaluate("(function(){var u=document.getElementById('u');u.setAttribute('xlink:href','#b');var dup=(u.outerHTML.match(/xlink:href/g)||[]).length;return u.getAttribute('xlink:href')+'|'+u.getAttributeNS('http://www.w3.org/1999/xlink','href')+'|'+u.getAttributeNames().join(',')+'|'+dup;})()")
+            .unwrap();
+        assert_eq!(v, serde_json::json!("#b|#b|id,xlink:href|1"));
+    }
+
+    #[test]
     fn set_attribute_ns_validates_namespace_constraints() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let v = rt
@@ -2897,6 +2933,34 @@ mod tests {
                 "NamespaceError|InvalidCharacterError|NamespaceError|NamespaceError"
             )
         );
+    }
+
+    #[test]
+    fn dom_parser_flags_malformed_xml_with_parsererror() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let has_err = rt
+            .evaluate("(function(){var d=new DOMParser().parseFromString('<a><b></a>','application/xml'); return d.querySelector('parsererror') ? true : false;})()")
+            .unwrap();
+        assert_eq!(has_err, serde_json::json!(true));
+    }
+
+    #[test]
+    fn dom_parser_accepts_well_formed_xml() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let ok = rt
+            .evaluate("(function(){var d=new DOMParser().parseFromString('<root><child>x</child></root>','application/xml'); return d.querySelector('parsererror') ? 'ERR' : 'OK';})()")
+            .unwrap();
+        assert_eq!(ok, serde_json::json!("OK"));
+    }
+
+    #[test]
+    fn dom_parser_html_never_gets_parsererror() {
+        // HTML parsing is tolerant and must never synthesize a parsererror.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let ok = rt
+            .evaluate("(function(){var d=new DOMParser().parseFromString('<div><p>hi</a>','text/html'); return d.querySelector('parsererror') ? 'ERR' : 'OK';})()")
+            .unwrap();
+        assert_eq!(ok, serde_json::json!("OK"));
     }
 
     #[test]
@@ -3547,6 +3611,38 @@ mod tests {
                 0
             ])
         );
+    }
+
+    /// Setting innerHTML on the <html> element parses in the "before head"
+    /// insertion mode, which synthesizes head and body. The importer must keep
+    /// both; it previously returned the synthesized body and dropped the head
+    /// (so a <title>/<meta> assigned this way vanished).
+    #[test]
+    fn documentelement_inner_html_keeps_head_and_body() {
+        let mut rt = setup_runtime("<html><head></head><body></body></html>");
+        let v = rt
+            .evaluate(
+                "(function(){ document.documentElement.innerHTML = '<head><title>T</title></head><body><p>hi</p></body>'; \
+                 var t = document.querySelector('title'); var p = document.querySelector('p'); \
+                 return (t ? t.textContent : 'no-title') + '|' + (p ? p.textContent : 'no-p'); })()",
+            )
+            .unwrap();
+        assert_eq!(v, serde_json::json!("T|hi"));
+    }
+
+    /// Regression guard: innerHTML on an ordinary element still imports the
+    /// parsed nodes directly (no head/body is synthesized for a div context),
+    /// so the fix above must not change the common case.
+    #[test]
+    fn ordinary_element_inner_html_imports_content_directly() {
+        let mut rt = setup_runtime("<html><body><div id=\"d\"></div></body></html>");
+        let v = rt
+            .evaluate(
+                "(function(){ var d=document.getElementById('d'); d.innerHTML='<span>a</span><span>b</span>'; \
+                 return d.children.length + '|' + d.textContent; })()",
+            )
+            .unwrap();
+        assert_eq!(v, serde_json::json!("2|ab"));
     }
 
     /// Issue #463: the same must hold for a template that arrives via innerHTML
@@ -5096,12 +5192,54 @@ mod tests {
     }
 
     #[test]
+    fn cssstyledeclaration_is_a_usable_global_interface() {
+        // CSSStyleDeclaration was pre-declared non-enumerable but never assigned
+        // a value (the only WebIDL interface missing its globalThis.X = X line),
+        // so it was `undefined` while `'CSSStyleDeclaration' in window` was true,
+        // and `el.style instanceof CSSStyleDeclaration` threw. It must be a real
+        // constructor, non-enumerable like a browser, and the type of .style.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let v = rt
+            .evaluate("(function(){var d=Object.getOwnPropertyDescriptor(window,'CSSStyleDeclaration');return (typeof window.CSSStyleDeclaration)+'|'+(document.body.style instanceof CSSStyleDeclaration)+'|'+(d?d.enumerable:'missing');})()")
+            .unwrap();
+        assert_eq!(v, serde_json::json!("function|true|false"));
+    }
+
+    #[test]
     fn test_create_event_unknown_type_returns_event() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let kind = rt
             .evaluate("document.createEvent('NotARealType') instanceof Event")
             .unwrap();
         assert_eq!(kind, serde_json::json!(true));
+    }
+
+    #[test]
+    fn event_constructor_matches_webidl_conformance() {
+        // new Event()/new CustomEvent() must throw (type is a required arg),
+        // the type argument must be coerced to a string, CustomEvent.detail must
+        // default to null (not undefined), createEvent must still build a
+        // type-"" event, and an explicit detail must be preserved.
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let v = rt
+            .evaluate(
+                "(function(){\
+                 var out=[];\
+                 try{new Event();out.push('no-throw')}catch(e){out.push(e.name)}\
+                 try{new CustomEvent();out.push('no-throw')}catch(e){out.push(e.name)}\
+                 out.push(new Event(123).type+':'+typeof new Event(123).type);\
+                 out.push(String(new CustomEvent('x').detail));\
+                 out.push(String(new CustomEvent('x',{detail:7}).detail));\
+                 out.push(new Event('click').type);\
+                 out.push(JSON.stringify(document.createEvent('Event').type));\
+                 return out.join('|');\
+                 })()",
+            )
+            .unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!("TypeError|TypeError|123:string|null|7|click|\"\"")
+        );
     }
 
     #[test]

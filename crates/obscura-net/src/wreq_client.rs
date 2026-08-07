@@ -237,9 +237,10 @@ impl StealthHttpClient {
         //    `tls/conn/ext.rs`), it does not add to them. Applying it unconditionally would break
         //    every ordinary site whenever the bundle is incomplete. With neither variable set,
         //    behaviour is byte-for-byte what it was before.
-        if std::env::var_os("SSL_CERT_FILE").is_some()
-            || std::env::var_os("SSL_CERT_DIR").is_some()
-        {
+        if crate::client::custom_cert_store_requested(
+            std::env::var_os("SSL_CERT_FILE").as_deref(),
+            std::env::var_os("SSL_CERT_DIR").as_deref(),
+        ) {
             match wreq::tls::trust::CertStore::builder().set_default_paths().build() {
                 Ok(store) => builder = builder.tls_cert_store(store),
                 Err(error) => tracing::warn!(
@@ -643,6 +644,7 @@ fn referrer_for_target(referrer: &Url, target: &Url) -> Option<Url> {
 }
 
 #[cfg(all(test, feature = "stealth"))]
+#[cfg(all(test, feature = "stealth"))]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -747,4 +749,55 @@ mod tests {
         assert!(request.contains(&format!("referer: http://{address}/page\r\n")));
     }
 
+
+    const PLAIN_BODY: &str = "<!DOCTYPE html><html><body><p id=\"mark\">gzip ok</p></body></html>";
+
+    // gzip (level 9) of PLAIN_BODY, hardcoded so the fixture needs no
+    // compression dependency. A wrong byte fails the assert below.
+    const GZIP_BODY: &[u8] = &[
+        0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x03, 0xb3, 0x51,
+        0x74, 0xf1, 0x77, 0x0e, 0x89, 0x0c, 0x70, 0x55, 0xc8, 0x28, 0xc9, 0xcd,
+        0xb1, 0xb3, 0x81, 0x90, 0x49, 0xf9, 0x29, 0x95, 0x76, 0x36, 0x05, 0x0a,
+        0x99, 0x29, 0xb6, 0x4a, 0xb9, 0x89, 0x45, 0xd9, 0x4a, 0x76, 0xe9, 0x55,
+        0x99, 0x05, 0x0a, 0xf9, 0xd9, 0x36, 0xfa, 0x05, 0x76, 0x36, 0xfa, 0x10,
+        0x69, 0x7d, 0xb0, 0x5a, 0x00, 0x80, 0x3d, 0x1c, 0x5f, 0x41, 0x00, 0x00,
+        0x00,
+    ];
+
+    /// Serve one `Content-Encoding: gzip` response on an ephemeral port.
+    async fn gzip_fixture() -> u16 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 1024];
+                    let _ = stream.read(&mut buf).await;
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: text/html; charset=utf-8\r\ncontent-encoding: gzip\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        GZIP_BODY.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let _ = stream.write_all(GZIP_BODY).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+
+        port
+    }
+
+    // The emulation profile advertises gzip, so origins compress. Without the
+    // decoder the raw gzip bytes reach the HTML parser as document text.
+    #[tokio::test]
+    async fn stealth_client_decodes_gzip_response() {
+        let port = gzip_fixture().await;
+        let client = StealthHttpClient::new(Arc::new(CookieJar::new()));
+        let url = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
+
+        let resp = client.fetch(&url).await.expect("fixture must be reachable");
+        assert_eq!(resp.status, 200);
+        assert_eq!(resp.text(), PLAIN_BODY, "gzip body must be decompressed");
+    }
 }

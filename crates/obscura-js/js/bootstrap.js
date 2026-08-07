@@ -25,7 +25,7 @@
     '_isSpecialScheme', '_applyDocQueryEncoding', '_anchorBase',
     '_elemHrefURL', '_setElemHrefPart', '_pad', '_daysInMonth',
     '_isoWeek1Monday', '_inputParseNumber', '_inputFormatNumber',
-    '_htmlAttrName', '_convertNodes', '_parseHTMLFragment', '_elementClassFor', '_wrap', '_wrapEl',
+    '_htmlAttrName', '_convertNodes', '_parseHTMLFragment', '_xmlWellFormed', '_elementClassFor', '_wrap', '_wrapEl',
     '_resolveUrl', '_registerIframe', '_base64ToUint8Array',
     '_bodyToUint8Array', '_arrayBufferFromBytes',
     '_installWasmStreamingFallback', '_urlParseOp', '_urlSetOp',
@@ -496,7 +496,15 @@ const _scheduleAfter = (delay, fn) => {
 // call silently no-ops and JS-triggered navigations (cookie → reload) never fire.
 const _coerceTimerFn = (fn) => {
   if (typeof fn === "string") {
-    try { return new Function(fn); } catch (_) { return null; }
+    // Per HTML, a string handler is compiled and run as a classic script in
+    // global scope *at fire time*. Indirect eval ((0, eval)) runs in the true
+    // global scope, so top-level var/function declarations become globals (a
+    // `new Function(fn)` wrapper kept them local); deferring to fire time also
+    // surfaces a SyntaxError when the timer elapses, matching a real browser,
+    // instead of swallowing it eagerly at scheduling. The dynamic-script path
+    // uses the same indirect eval for the same reason.
+    const src = fn;
+    return () => { (0, eval)(src); };
   }
   return typeof fn === "function" ? fn : null;
 };
@@ -6129,7 +6137,7 @@ globalThis.__obscura_setInputFiles = function(el, specs) {
   try { el.dispatchEvent(globalThis.__obscura_markTrusted(new Event("change", { bubbles: true }))); } catch (_e) {}
 };
 globalThis.Event = class Event {
-  constructor(t,o={}) { this.type=t;this.bubbles=!!o.bubbles;this.cancelable=!!o.cancelable;this.composed=!!o.composed;this.defaultPrevented=false;this.target=null;this.currentTarget=null;this.eventPhase=0;this.timeStamp=Date.now();this._propagationStopped=false;this._immediatePropagationStopped=false; }
+  constructor(t,o={}) { if (arguments.length < 1) throw new TypeError("Failed to construct 'Event': 1 argument required, but only 0 present."); this.type=String(t);this.bubbles=!!o.bubbles;this.cancelable=!!o.cancelable;this.composed=!!o.composed;this.defaultPrevented=false;this.target=null;this.currentTarget=null;this.eventPhase=0;this.timeStamp=Date.now();this._propagationStopped=false;this._immediatePropagationStopped=false; }
   get isTrusted() { return _trustedEvents.has(this); }
   preventDefault() { if (this.cancelable) this.defaultPrevented=true; } stopPropagation(){ this._propagationStopped=true; } stopImmediatePropagation(){ this._propagationStopped=true; this._immediatePropagationStopped=true; }
   initEvent(type,bubbles,cancelable) { if (arguments.length < 1) throw new TypeError("Failed to execute 'initEvent' on 'Event': 1 argument required, but only 0 present."); this.type=String(type);this.bubbles=!!bubbles;this.cancelable=!!cancelable;this.defaultPrevented=false;this._propagationStopped=false;this._immediatePropagationStopped=false; }
@@ -6144,7 +6152,7 @@ globalThis.Event = class Event {
 };
 _markNative(Event);
 globalThis.CustomEvent = class extends Event {
-  constructor(t,o={}) { super(t,o);this.detail=o.detail; }
+  constructor(t,o={}) { if (arguments.length < 1) throw new TypeError("Failed to construct 'CustomEvent': 1 argument required, but only 0 present."); super(t,o);this.detail=o.detail!==undefined?o.detail:null; }
   // Legacy DOM Level 2 init; some libraries (Starbucks China bundle, older
   // analytics shims) still call createEvent('CustomEvent') + initCustomEvent
   // instead of new CustomEvent(...). See issue #41.
@@ -6552,6 +6560,56 @@ if (typeof URLSearchParams === "undefined") globalThis.URLSearchParams = class U
 // input into a detached `<html>` element and wrap it so the common Document
 // API surface (body / head / documentElement / querySelector* / getElementById /
 // getElementsByTagName / getElementsByClassName / title / cloneNode) works.
+// Conservative XML well-formedness check. obscura has no XML parser, so this
+// only decides whether to surface a <parsererror> (it does not build an XML
+// tree). It flags clear structural errors — mismatched or unclosed tags,
+// multiple/no root elements, unterminated comment/CDATA/PI — and defaults to
+// "well-formed" whenever the scan is ambiguous, so valid XML is never falsely
+// flagged. Quoted attribute regions, comments, CDATA, PIs and the doctype are
+// skipped; a literal '<' in text (invalid in XML) reads as a bad tag.
+function _xmlWellFormed(src) {
+  const s = String(src);
+  const stack = [];
+  let rootsClosed = 0; // top-level elements fully closed (or self-closed)
+  let i = 0;
+  const n = s.length;
+  while (i < n) {
+    const lt = s.indexOf('<', i);
+    if (lt === -1) break;
+    i = lt;
+    if (s.startsWith('<!--', i)) { const e = s.indexOf('-->', i + 4); if (e === -1) return false; i = e + 3; continue; }
+    if (s.startsWith('<![CDATA[', i)) { const e = s.indexOf(']]>', i + 9); if (e === -1) return false; i = e + 3; continue; }
+    if (s.startsWith('<?', i)) { const e = s.indexOf('?>', i + 2); if (e === -1) return false; i = e + 2; continue; }
+    if (s.startsWith('<!', i)) { const e = s.indexOf('>', i + 2); if (e === -1) return false; i = e + 1; continue; }
+    // A start/end/self-closing tag: find its '>' while skipping quoted regions.
+    let j = i + 1, quote = null;
+    while (j < n) {
+      const c = s[j];
+      if (quote) { if (c === quote) quote = null; }
+      else if (c === '"' || c === "'") quote = c;
+      else if (c === '>') break;
+      j++;
+    }
+    if (j >= n) return false; // unterminated tag
+    const inner = s.slice(i + 1, j).trim();
+    i = j + 1;
+    if (!inner) return false;
+    if (inner[0] === '/') {
+      const name = inner.slice(1).trim().split(/\s/)[0];
+      if (stack.length === 0 || stack[stack.length - 1] !== name) return false;
+      stack.pop();
+      if (stack.length === 0) rootsClosed++;
+    } else if (inner[inner.length - 1] === '/') {
+      if (stack.length === 0) rootsClosed++;
+    } else {
+      const name = inner.split(/\s/)[0];
+      if (!name) return false;
+      stack.push(name);
+    }
+  }
+  return stack.length === 0 && rootsClosed === 1;
+}
+
 globalThis.DOMParser = class DOMParser {
   parseFromString(source, mimeType) {
     const html = String(source ?? "");
@@ -6562,6 +6620,15 @@ globalThis.DOMParser = class DOMParser {
     // fragment parser strips the outer `<html>` and emits its head+body
     // children, which is what callers want.
     try { root.innerHTML = html; } catch (e) { /* leave empty on parse error */ }
+
+    // For XML mime types, surface a <parsererror> on clearly-malformed input so
+    // error-detection code (doc.querySelector('parsererror')) works, matching
+    // Chrome. obscura has no XML parser, so the tree stays HTML-parsed.
+    if (isXml && !_xmlWellFormed(html)) {
+      try {
+        root.innerHTML = '<parsererror xmlns="http://www.w3.org/1999/xhtml">This page contains the following errors:<div>error while parsing XML</div></parsererror>';
+      } catch (e) { /* ignore */ }
+    }
 
     // Helper: depth-first walk to find an element by predicate.
     const walk = (node, pred) => {
@@ -7359,6 +7426,12 @@ _markNative(globalThis.HTMLDocument);
 Object.defineProperty(globalThis.HTMLDocument.prototype, Symbol.toStringTag, {
   value: 'HTMLDocument', configurable: true,
 });
+// CSSStyleDeclaration is the type of element.style and getComputedStyle(); it is
+// pre-declared non-enumerable in _preHideInternals, but unlike the other WebIDL
+// interfaces it had no value assignment, leaving `window.CSSStyleDeclaration`
+// undefined (so `el.style instanceof CSSStyleDeclaration` threw). Assigning here
+// only fills the value; the property stays enumerable:false, matching Chrome.
+globalThis.CSSStyleDeclaration = CSSStyleDeclaration;
 globalThis.XPathResult = globalThis.XPathResult || class XPathResult {};
 Object.assign(globalThis.XPathResult, {
   ANY_TYPE: 0,
