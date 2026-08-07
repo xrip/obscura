@@ -7,10 +7,11 @@
 //     --match <regexp>   list responses whose URL matches this
 //     --only <engine>    "chrome" or "obscura"
 //     --wait <seconds>   how long to wait for the needle (default 20)
+//     --proxy <url>      send both engines through the same proxy
 //     --headed           show the Chrome window
 //
 // Obscura is launched with --stealth on a free port and killed afterwards.
-// OBSCURA_PROXY is honoured if set. Nothing is written to disk.
+// OBSCURA_PROXY is used when --proxy is absent. Nothing is written to disk.
 //
 // Both sides go through Playwright so the scenario cannot drift between them,
 // and so that anything Obscura fails to report over CDP shows up as a
@@ -38,6 +39,7 @@ function parseArgs(argv) {
     else if (arg === '--match') opts.match = new RegExp(argv[++i]);
     else if (arg === '--only') opts.only = argv[++i];
     else if (arg === '--wait') opts.wait = Number(argv[++i]);
+    else if (arg === '--proxy') opts.proxy = argv[++i];
     else rest.push(arg);
   }
   opts.url = rest[0];
@@ -47,7 +49,7 @@ function parseArgs(argv) {
 const opts = parseArgs(process.argv.slice(2));
 if (!opts.url) {
   console.error('usage: node tools/ab/ab.mjs <url> [--needle text] [--match regexp]' +
-                ' [--only chrome|obscura] [--wait seconds] [--headed]');
+                ' [--only chrome|obscura] [--wait seconds] [--proxy url] [--headed]');
   process.exit(2);
 }
 
@@ -107,8 +109,21 @@ async function scenario(page) {
   return { needleAfter, bodyLength, requests, traffic, errors, elapsed: Date.now() - started };
 }
 
+function proxyForPlaywright(raw) {
+  if (!raw) return undefined;
+  const parsed = new URL(raw);
+  const proxy = { server: `${parsed.protocol}//${parsed.host}` };
+  if (parsed.username) proxy.username = decodeURIComponent(parsed.username);
+  if (parsed.password) proxy.password = decodeURIComponent(parsed.password);
+  return proxy;
+}
+
 async function withChrome() {
-  const browser = await chromium.launch({ channel: 'chrome', headless: !opts.headed });
+  const browser = await chromium.launch({
+    channel: 'chrome',
+    headless: !opts.headed,
+    proxy: proxyForPlaywright(opts.proxy || process.env.OBSCURA_PROXY),
+  });
   try {
     const context = await browser.newContext();
     return await scenario(await context.newPage());
@@ -132,7 +147,11 @@ async function withObscura() {
   const port = await freePort();
   const child = spawn(obscuraBin, ['--stealth', 'serve', '--port', String(port)], {
     cwd: root,
-    env: { ...process.env, OBSCURA_NAV_TIMEOUT_MS: '90000' },
+    env: {
+      ...process.env,
+      OBSCURA_NAV_TIMEOUT_MS: '90000',
+      ...(opts.proxy ? { OBSCURA_PROXY: opts.proxy } : {}),
+    },
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,
   });
