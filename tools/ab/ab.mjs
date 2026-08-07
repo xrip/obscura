@@ -122,7 +122,7 @@ async function withChrome() {
   const browser = await chromium.launch({
     channel: 'chrome',
     headless: !opts.headed,
-    proxy: proxyForPlaywright(opts.proxy || process.env.OBSCURA_PROXY),
+    proxy: proxyForPlaywright(opts.proxy),
   });
   try {
     const context = await browser.newContext();
@@ -147,11 +147,15 @@ async function withObscura() {
   const port = await freePort();
   const child = spawn(obscuraBin, ['--stealth', 'serve', '--port', String(port)], {
     cwd: root,
-    env: {
-      ...process.env,
-      OBSCURA_NAV_TIMEOUT_MS: '90000',
-      ...(opts.proxy ? { OBSCURA_PROXY: opts.proxy } : {}),
-    },
+    // Explicit, not inherited. OBSCURA_PROXY sitting in the shell would send a
+    // run through a proxy it never asked for, and the result would read as the
+    // site treating this machine differently rather than as a different exit.
+    env: (() => {
+      const env = { ...process.env, OBSCURA_NAV_TIMEOUT_MS: '90000' };
+      if (opts.proxy) env.OBSCURA_PROXY = opts.proxy;
+      else delete env.OBSCURA_PROXY;
+      return env;
+    })(),
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,
   });

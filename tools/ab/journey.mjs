@@ -2,7 +2,7 @@
 //
 //   node tools/ab/journey.mjs [options]
 //
-//     --site <name>      wb (default) or ozon
+//     --site <name>      wb (default), ozon or avito
 //     --cards <n>        product cards to visit (default 3)
 //     --only <engine>    "chrome" or "obscura"
 //     --proxy <url>      send both engines through the same proxy
@@ -55,6 +55,15 @@ const SITES = {
     onCard: id => `-${id}`,
     cardLinkFor: id => `a[href*="-${id}"]`,
   },
+  avito: {
+    home: 'https://www.avito.ru/',
+    // Item links are ordinary hrefs; what marks them is the trailing id, so the
+    // selector is deliberately loose and idFrom does the filtering.
+    cardLink: 'a[href*="_"]',
+    idFrom: url => (url.match(/_(\d{6,})(?:[/?#]|$)/) || [])[1],
+    onCard: id => `_${id}`,
+    cardLinkFor: id => `a[href*="_${id}"]`,
+  },
 };
 
 function parseArgs(argv) {
@@ -102,6 +111,18 @@ async function journey(page, log) {
   let requests = 0;
   page.on('request', () => { requests += 1; });
 
+  // Which IP the site actually sees. A blocked run and a proxied run look the
+  // same from here otherwise, and guessing which one happened wastes far more
+  // time than asking.
+  try {
+    await page.goto('https://api.ipify.org/?format=json', { waitUntil: 'load', timeout: 30000 });
+    const seen = await tryEvaluate(page, () => document.body.innerText.trim().slice(0, 80));
+    log(`exit ip: ${seen}`);
+  } catch (error) {
+    log(`exit ip: unavailable (${String(error).split('\n')[0].slice(0, 60)})`);
+  }
+  requests = 0;
+
   await page.goto(HOME, { waitUntil: 'load', timeout: 90000 });
   // The home page fills its rails after hydration, so wait for links rather
   // than assuming the first paint has them.
@@ -135,13 +156,21 @@ async function journey(page, log) {
           return r.width > 0 && r.height > 0;
         })
         .map(a => a.href), site.cardLink) || [])
-      .filter(u => productId(u) && !visited.has(productId(u)));
-    if (!candidates.length) {
-      steps.push({ step: 'card', ok: false, failure: 'no unvisited card on the page' });
-      log('card: none available on the home page');
+      .filter(u => productId(u));
+    const fresh = candidates.filter(u => !visited.has(productId(u)));
+    if (!fresh.length) {
+      // Distinguish "the page came back empty" from "we have already used
+      // everything it offered". The first is the site refusing us and the
+      // second is the journey running out of material; they need opposite
+      // reactions and used to print the same line.
+      const reason = candidates.length
+        ? `all ${candidates.length} cards already visited`
+        : 'the home page came back with no cards';
+      steps.push({ step: 'card', ok: false, failure: reason });
+      log(`card: skipped, ${reason}`);
       continue;
     }
-    const url = candidates[Math.floor(Math.random() * candidates.length)];
+    const url = fresh[Math.floor(Math.random() * fresh.length)];
     const id = productId(url);
     visited.add(id);
 
@@ -217,7 +246,7 @@ async function withChrome(log) {
   const browser = await chromium.launch({
     channel: 'chrome',
     headless: !opts.headed,
-    proxy: proxyForPlaywright(opts.proxy || process.env.OBSCURA_PROXY),
+    proxy: proxyForPlaywright(opts.proxy),
   });
   try {
     const context = await browser.newContext();
@@ -231,11 +260,15 @@ async function withObscura(log) {
   const port = await freePort();
   const child = spawn(obscuraBin, ['--stealth', 'serve', '--port', String(port)], {
     cwd: root,
-    env: {
-      ...process.env,
-      OBSCURA_NAV_TIMEOUT_MS: '90000',
-      ...(opts.proxy ? { OBSCURA_PROXY: opts.proxy } : {}),
-    },
+    // Explicit, not inherited. OBSCURA_PROXY sitting in the shell would send a
+    // run through a proxy it never asked for, and the result would read as the
+    // site treating this machine differently rather than as a different exit.
+    env: (() => {
+      const env = { ...process.env, OBSCURA_NAV_TIMEOUT_MS: '90000' };
+      if (opts.proxy) env.OBSCURA_PROXY = opts.proxy;
+      else delete env.OBSCURA_PROXY;
+      return env;
+    })(),
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,
   });
