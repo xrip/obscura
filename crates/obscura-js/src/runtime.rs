@@ -5450,6 +5450,30 @@ mod tests {
         );
     }
 
+    /// `__obscura_core_handoff` carries the entire op table, so page script must
+    /// never reach it. `__obscura_init` happens to clear internal globals, which
+    /// makes a check after page setup pass even when the handoff is left in
+    /// place; the window that actually matters is before init, because preload
+    /// scripts run there. Assert on a bare runtime, which is the only state
+    /// where this can fail.
+    #[test]
+    fn ops_handoff_is_removed_before_any_script_can_run() {
+        let mut rt = ObscuraJsRuntime::new();
+        assert_eq!(
+            rt.evaluate("typeof globalThis.__obscura_core_handoff").unwrap(),
+            serde_json::json!("undefined"),
+            "the op table is reachable from script before page init"
+        );
+        // The runtime still kept it for frame realms, so it was taken and not
+        // merely never produced.
+        let realm = rt.create_realm_context().expect("snapshot context");
+        assert!(rt.share_ops_with_realm(&realm));
+        assert_eq!(
+            rt.eval_in_realm(&realm, "typeof Deno.core.ops.op_dom").unwrap(),
+            "function"
+        );
+    }
+
     #[test]
     fn location_navigation_accepts_url_objects() {
         let mut rt = setup_runtime("<html><body></body></html>");
