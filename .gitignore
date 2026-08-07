@@ -1,5 +1,6 @@
 target/
 .DS_Store
+geoip.mmdb
 /webgl/window.json
 /webgl/profiles/
 /webgl/.obscura-runtime/

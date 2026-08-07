@@ -22,12 +22,21 @@ pub struct GeoIdentity {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct BotBrowserGeoRecord {
-    country_code: String,
-    lat: f64,
-    lon: f64,
-    timezone: String,
+struct GeoRecord {
+    country: GeoCountry,
+    location: GeoLocation,
+}
+
+#[derive(Deserialize)]
+struct GeoCountry {
+    iso_code: String,
+}
+
+#[derive(Deserialize)]
+struct GeoLocation {
+    latitude: f64,
+    longitude: f64,
+    time_zone: String,
 }
 
 pub fn resolve(proxy: &str, explicit_database: Option<&Path>) -> Result<Option<GeoIdentity>> {
@@ -40,10 +49,10 @@ pub fn resolve(proxy: &str, explicit_database: Option<&Path>) -> Result<Option<G
     Ok(Some(GeoIdentity {
         database,
         ip,
-        country_code: record.country_code,
-        latitude: record.lat,
-        longitude: record.lon,
-        timezone: record.timezone,
+        country_code: record.country.iso_code,
+        latitude: record.location.latitude,
+        longitude: record.location.longitude,
+        timezone: record.location.time_zone,
     }))
 }
 
@@ -103,27 +112,27 @@ fn parse_exit_ip(mut input: impl Read) -> Result<IpAddr> {
         .context("ifconfig.io did not return a valid IP address")
 }
 
-fn lookup(database: &Path, ip: IpAddr) -> Result<BotBrowserGeoRecord> {
+fn lookup(database: &Path, ip: IpAddr) -> Result<GeoRecord> {
     let reader = maxminddb::Reader::open_readfile(database)
         .with_context(|| format!("failed to open GeoIP database {}", database.display()))?;
     let value = reader
         .lookup(ip)?
         .decode::<serde_json::Value>()?
         .with_context(|| format!("GeoIP database has no record for {ip}"))?;
-    serde_json::from_value(value).context("GeoIP record has an invalid BotBrowser shape")
+    serde_json::from_value(value).context("GeoIP record has an invalid shape")
 }
 
-fn validate_record(record: &BotBrowserGeoRecord) -> Result<()> {
-    if record.country_code.trim().is_empty() {
+fn validate_record(record: &GeoRecord) -> Result<()> {
+    if record.country.iso_code.trim().is_empty() {
         bail!("GeoIP record has an empty country code");
     }
-    if record.timezone.trim().is_empty() {
+    if record.location.time_zone.trim().is_empty() {
         bail!("GeoIP record has an empty timezone");
     }
-    if !record.lat.is_finite() || !(-90.0..=90.0).contains(&record.lat) {
+    if !record.location.latitude.is_finite() || !(-90.0..=90.0).contains(&record.location.latitude) {
         bail!("GeoIP record has an invalid latitude");
     }
-    if !record.lon.is_finite() || !(-180.0..=180.0).contains(&record.lon) {
+    if !record.location.longitude.is_finite() || !(-180.0..=180.0).contains(&record.location.longitude) {
         bail!("GeoIP record has an invalid longitude");
     }
     Ok(())
@@ -153,26 +162,32 @@ mod tests {
     }
 
     #[test]
-    fn reads_and_validates_botbrowser_record_shape() {
-        let record: BotBrowserGeoRecord = serde_json::from_value(serde_json::json!({
-            "countryCode": "RU",
-            "lat": 55.7558,
-            "lon": 37.6173,
-            "timezone": "Europe/Moscow"
+    fn reads_and_validates_nested_geoip_record_shape() {
+        let record: GeoRecord = serde_json::from_value(serde_json::json!({
+            "country": { "iso_code": "RU" },
+            "location": {
+                "latitude": 55.7558,
+                "longitude": 37.6173,
+                "time_zone": "Europe/Moscow"
+            }
         }))
         .unwrap();
         validate_record(&record).unwrap();
-        assert_eq!(record.country_code, "RU");
-        assert_eq!(record.timezone, "Europe/Moscow");
+        assert_eq!(record.country.iso_code, "RU");
+        assert_eq!(record.location.time_zone, "Europe/Moscow");
     }
 
     #[test]
-    fn rejects_invalid_botbrowser_coordinates() {
-        let record = BotBrowserGeoRecord {
-            country_code: "RU".to_string(),
-            lat: 91.0,
-            lon: 37.6173,
-            timezone: "Europe/Moscow".to_string(),
+    fn rejects_invalid_nested_coordinates() {
+        let record = GeoRecord {
+            country: GeoCountry {
+                iso_code: "RU".to_string(),
+            },
+            location: GeoLocation {
+                latitude: 91.0,
+                longitude: 37.6173,
+                time_zone: "Europe/Moscow".to_string(),
+            },
         };
         assert!(validate_record(&record).is_err());
     }
