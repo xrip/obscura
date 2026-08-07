@@ -3283,28 +3283,53 @@ function _getElementSrc() {
   try { return new URL(value, globalThis.location?.href || 'about:blank').href; }
   catch (_) { return value; }
 }
+const _BLANK_DOCUMENT = '<!DOCTYPE html><html><head></head><body></body></html>';
+
+// Fetch a frame document the way the browser would navigate to it: as a
+// Document request, not a `no-cors` subresource fetch. The header sets differ
+// enough (accept, sec-fetch-dest: iframe, sec-fetch-mode: navigate,
+// upgrade-insecure-requests, no Origin) that anti-bot edges treat the two as
+// different clients. This calls the op directly rather than globalThis.fetch,
+// so a page that replaces fetch neither sees nor shapes its own frame loads.
+async function _fetchFrameDocument(url) {
+  const pageOrigin = (function() {
+    try { return new URL(_domParse('document_url') || 'about:blank').origin; }
+    catch (_) { return ''; }
+  })();
+  const raw = await _denoCore.ops.op_fetch_url(
+    url, 'GET', '{}', '', pageOrigin, 'navigate', 'iframe');
+  const parsed = JSON.parse(raw);
+  if (parsed.blocked || parsed.corsBlocked) {
+    throw new TypeError('net::ERR_FAILED');
+  }
+  const bytes = parsed.bodyBase64
+    ? _base64ToUint8Array(parsed.bodyBase64)
+    : new TextEncoder().encode(parsed.body || '');
+  const headers = parsed.headers || {};
+  const html = _decodeBodyWithCharset(bytes, {
+    get(name) { return headers[String(name).toLowerCase()] || ''; },
+  });
+  return { status: parsed.status, url: parsed.url || url, html };
+}
+
 function _loadIframeSrc(el, url) {
   let fullUrl = url;
   if (!url.includes('://')) {
     try { fullUrl = new URL(url, _domParse('document_url') || 'about:blank').href; } catch (_) {}
   }
-  const blank = '<!DOCTYPE html><html><head></head><body></body></html>';
-  fetch(fullUrl, {mode: 'no-cors'}).then(async response => {
-    const html = response.ok || response.type === 'opaque'
-      ? await response.text()
-      : blank;
+  _fetchFrameDocument(fullUrl).then(result => {
     // Record the outcome. A failed frame load used to be indistinguishable from
     // a successful one, because both ended in an empty document and a `load`
     // event, which made frame problems invisible when debugging.
     el._iframeLoadInfo = {
-      ok: true, status: response.status, type: response.type, length: html.length,
+      ok: true, status: result.status, url: result.url, length: result.html.length,
     };
-    el._iframeDoc = new _IframeDocument(html, fullUrl, el);
-    el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
+    el._iframeDoc = new _IframeDocument(result.html, result.url, el);
+    el._iframeWin = new _IframeWindow(el._iframeDoc, result.url);
     el.dispatchEvent(new Event('load'));
   }).catch(error => {
     el._iframeLoadInfo = { ok: false, error: String(error && error.message || error) };
-    el._iframeDoc = new _IframeDocument(blank, fullUrl, el);
+    el._iframeDoc = new _IframeDocument(_BLANK_DOCUMENT, fullUrl, el);
     el._iframeWin = new _IframeWindow(el._iframeDoc, fullUrl);
     el.dispatchEvent(new Event('load'));
   });

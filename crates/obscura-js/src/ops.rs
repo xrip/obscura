@@ -1331,6 +1331,9 @@ fn resource_type_from_kind(kind: &str) -> ResourceType {
         "image" => ResourceType::Image,
         "font" => ResourceType::Font,
         "xhr" => ResourceType::Xhr,
+        // A frame document load is a navigation, not a subresource fetch, and
+        // Chrome sends a completely different header set for it.
+        "iframe" | "document" => ResourceType::Document,
         "other" => ResourceType::Other,
         _ => ResourceType::Fetch,
     }
@@ -1367,11 +1370,18 @@ fn insert_scripted_fetch_metadata(
 ) {
     let (_, resource_mode, resource_dest) = obscura_net::resource_request_headers(resource_type);
     let fetch_mode = match resource_type {
-        ResourceType::Script | ResourceType::Stylesheet => resource_mode,
+        ResourceType::Script | ResourceType::Stylesheet | ResourceType::Document => resource_mode,
         _ if mode.is_empty() => "cors",
         _ => mode,
     };
-    headers.insert("sec-fetch-dest".to_string(), resource_dest.to_string());
+    // This path never runs a top level navigation, so a Document here is always
+    // a nested browsing context. Chrome labels those `iframe`, not `document`,
+    // and adds the same upgrade hint it sends on any navigation.
+    let dest = if resource_type == ResourceType::Document { "iframe" } else { resource_dest };
+    if resource_type == ResourceType::Document {
+        headers.insert("upgrade-insecure-requests".to_string(), "1".to_string());
+    }
+    headers.insert("sec-fetch-dest".to_string(), dest.to_string());
     headers.insert("sec-fetch-mode".to_string(), fetch_mode.to_string());
     headers.insert(
         "sec-fetch-site".to_string(),
@@ -1426,6 +1436,11 @@ async fn stealth_fetch_all(
                 .cloned()
                 .unwrap_or_else(|| resource_accept.to_string()),
         );
+        // Chrome sends Accept-Language on every request, scripted ones included.
+        // send_single leaves it to the caller, so without this line no fetch,
+        // XHR or frame navigation carries one at all. A custom header of the
+        // same name still wins, in the loop below.
+        req_headers.insert("accept-language".to_string(), "en-US,en;q=0.9".to_string());
         insert_scripted_fetch_metadata(
             &mut req_headers,
             fetch_mode,
@@ -1437,6 +1452,8 @@ async fn stealth_fetch_all(
         // token to the page origin.
         let sends_origin = match resource_type {
             ResourceType::Script | ResourceType::Stylesheet => false,
+            // A GET navigation carries no Origin; only form posts into a frame do.
+            ResourceType::Document => current_method != "GET" && current_method != "HEAD",
             _ => (!is_cross_origin && current_method != "GET" && current_method != "HEAD")
                 || is_cross_origin,
         };
@@ -1582,6 +1599,23 @@ mod tests {
         assert_eq!(headers.get("sec-fetch-dest").map(String::as_str), Some("empty"));
         assert_eq!(headers.get("sec-fetch-mode").map(String::as_str), Some("no-cors"));
         assert_eq!(headers.get("sec-fetch-site").map(String::as_str), Some("cross-site"));
+    }
+
+    #[cfg(feature = "stealth")]
+    #[test]
+    fn a_frame_document_is_requested_as_a_navigation() {
+        use super::resource_type_from_kind;
+        assert_eq!(resource_type_from_kind("iframe"), ResourceType::Document);
+
+        let mut headers = std::collections::HashMap::new();
+        insert_scripted_fetch_metadata(&mut headers, "navigate", true, ResourceType::Document);
+        assert_eq!(headers.get("sec-fetch-dest").map(String::as_str), Some("iframe"));
+        assert_eq!(headers.get("sec-fetch-mode").map(String::as_str), Some("navigate"));
+        assert_eq!(headers.get("sec-fetch-site").map(String::as_str), Some("cross-site"));
+        assert_eq!(
+            headers.get("upgrade-insecure-requests").map(String::as_str),
+            Some("1"),
+        );
     }
 
     #[test]
