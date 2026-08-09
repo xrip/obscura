@@ -37,6 +37,28 @@ function _makeNativeFunction(fn, name, length, source) {
 const _navigatorInstances = new WeakSet();
 if (typeof navigator !== 'undefined' && navigator) _navigatorInstances.add(navigator);
 
+// Interface objects on the global are `enumerable: false` per WebIDL, so
+// Object.keys(window) does not list them. Upstream gets this for the names in
+// its _preHideInternals list, which pre-declares them non-enumerable so a later
+// plain assignment only updates the value. Names outside that list, including
+// WebGLRenderingContext and every WebGPU interface, would land enumerable and
+// show up in Object.keys(window) - a one-line detection.
+//
+// Everything graphics.js puts on the global goes through here instead.
+function _graphicsDefineGlobal(name, value) {
+  try {
+    Object.defineProperty(globalThis, name, {
+      value,
+      writable: true,
+      enumerable: false,
+      configurable: true,
+    });
+  } catch (_) {
+    globalThis[name] = value;
+  }
+  return value;
+}
+
 // Upstream installs `navigator.gpu` as an own data property returning a stub
 // whose requestAdapter always resolves null. graphics.js replaces it with a
 // real accessor on Navigator.prototype; an own property on the instance would

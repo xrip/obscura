@@ -33,19 +33,23 @@ this list is ours.
 `live_product_smoke` is not in this list because it is a fork test and has not
 landed yet. It was already failing before this work, verified at `f508c5b`.
 
-### Run the suite with `--test-threads 8`
+### `obscura-cli::mcp_client` is flaky under load
 
-On this 16-core box the full-parallel run starves
-`obscura-cli::mcp_client test_wait_for_selector`. That test spawns the binary,
-navigates, and polls for an `h1` on a hardcoded 5 second budget. Alone it takes
-0.04s; at full parallelism it lands at position ~1103 of 1105, beside the 5-6s
-`obscura-js runtime::tests`, and expires at exactly 5.132s.
+The whole binary is timing-sensitive, not one test in it. Each test spawns the
+`obscura` binary, drives it over MCP, and asserts on a page it just navigated
+to. Under a saturated box the navigation has not finished when the next command
+runs. Two different tests have flaked so far:
 
-It is contention, not a regression. Run standalone, the `mcp_client` binary is
-16/16 five times in a row; in the full run it flakes at 8 threads too, just less
-often. Treat it as a known flake, not a signal. Compare failure *sets* against
-the baseline rather than counts, and re-run this one test alone before believing
-it.
+- `test_wait_for_selector` polls for an `h1` on a hardcoded 5 second budget.
+  Alone it takes 0.04s; at full parallelism it lands near position 1103 of 1109,
+  beside the 5-6s `obscura-js runtime::tests`, and expires at exactly 5.132s.
+- `test_evaluate` reads `document.title` from a local `TestPageServer` page and
+  gets `""` instead of `"Example Domain"`.
+
+It is contention, not a regression: run alone the binary has been 16/16 on eight
+consecutive runs. It flakes at `--test-threads 8` too, just less often. Compare
+failure *sets* against the baseline rather than counts, and re-run the binary
+alone before treating anything in it as a signal.
 
 ### Stage 2 result (profiles, workbench, GeoIP, transport identity)
 
@@ -129,8 +133,27 @@ present, and `navigator.gpu` is likewise absent. Upstream's test constructs a
 runtime with no profile, so it passes unchanged, and `runtime.rs` needed no edit
 at all. `crates/obscura-browser/tests/fork_graphics_identity.rs` covers our half.
 
-Also noted while testing: `isSecureContext` is missing from the engine entirely.
-Chrome has it on every page. Not a stage 3 problem, but it is a fingerprint gap.
+#### Interface objects must not be enumerable
+
+Everything graphics.js puts on the global goes through `_graphicsDefineGlobal`
+in `js/graphics_shim.js`, which defines it `enumerable: false` as WebIDL
+requires. A plain `globalThis.X = C` lands enumerable, and
+`Object.keys(window)` containing `WebGLRenderingContext` or `GPUAdapter` is a
+one-line detection.
+
+Upstream gets this only for the names in its `_preHideInternals` list, which
+pre-declares them non-enumerable so a later plain assignment updates the value
+alone. `WebGL2RenderingContext` is in that list; `WebGLRenderingContext` is not,
+and neither is any WebGPU interface. `HTMLImageElement` is enumerable upstream
+today and we do not touch it.
+
+Verified: `Object.keys(globalThis)` leaks none of the graphics interfaces.
+
+Two other observations from the same probe, neither a stage 3 problem:
+
+- `isSecureContext` is missing from the engine entirely. Chrome has it on every
+  page. Deliberately left alone until the stealth tests are green.
+- `HTMLImageElement` is enumerable on the global, which is upstream's.
 
 #### Deferred to stage 5: hiding `Deno` from the page
 

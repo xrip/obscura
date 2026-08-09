@@ -228,7 +228,7 @@ _graphicsTag(_ObscuraHTMLCanvasElement.prototype, 'HTMLCanvasElement');
 // Replaces upstream's HTMLCanvasElement. _elementClassFor already resolves
 // "CANVAS" through globalThis.HTMLCanvasElement, so every canvas built after
 // this point is ours without touching the element factory.
-globalThis.HTMLCanvasElement = _ObscuraHTMLCanvasElement;
+_graphicsDefineGlobal('HTMLCanvasElement', _ObscuraHTMLCanvasElement);
 
 class OffscreenCanvas {
   constructor(width, height) {
@@ -247,13 +247,13 @@ class OffscreenCanvas {
   }
 }
 _graphicsTag(OffscreenCanvas.prototype, 'OffscreenCanvas');
-globalThis.OffscreenCanvas = OffscreenCanvas;
+_graphicsDefineGlobal('OffscreenCanvas', OffscreenCanvas);
 
 function CanvasRenderingContext2D() { _graphicsIllegalConstructor(); }
 CanvasRenderingContext2D.prototype = _Canvas2D.prototype;
 Object.defineProperty(CanvasRenderingContext2D.prototype, 'constructor', {value:CanvasRenderingContext2D, writable:true, configurable:true});
 _graphicsTag(CanvasRenderingContext2D.prototype, 'CanvasRenderingContext2D');
-globalThis.CanvasRenderingContext2D = CanvasRenderingContext2D;
+_graphicsDefineGlobal('CanvasRenderingContext2D', CanvasRenderingContext2D);
 
 class ImageBitmap {
   constructor(token, width, height, bytes) {
@@ -263,11 +263,11 @@ class ImageBitmap {
   close() { this._closed = true; this.width = 0; this.height = 0; this._graphicsBytes = null; }
 }
 _graphicsTag(ImageBitmap.prototype, 'ImageBitmap');
-globalThis.ImageBitmap = ImageBitmap;
-globalThis.createImageBitmap = function createImageBitmap(source) {
+_graphicsDefineGlobal('ImageBitmap', ImageBitmap);
+_graphicsDefineGlobal('createImageBitmap', function createImageBitmap(source) {
   const s = source && _canvasSlots.get(source);
   return Promise.resolve(new ImageBitmap(_graphicsObjectToken, s ? s.width : 0, s ? s.height : 0, s ? _surfaceMaterialize(s.surface, true) : null));
-};
+});
 
 for (const pair of [[_ObscuraHTMLCanvasElement,'HTMLCanvasElement'],[OffscreenCanvas,'OffscreenCanvas'],[CanvasRenderingContext2D,'CanvasRenderingContext2D'],[ImageBitmap,'ImageBitmap']]) _markNative(pair[0]);
 for (const pair of [[_ObscuraHTMLCanvasElement.prototype,'getContext',2],[_ObscuraHTMLCanvasElement.prototype,'toDataURL',0],[_ObscuraHTMLCanvasElement.prototype,'toBlob',1],[_ObscuraHTMLCanvasElement.prototype,'transferControlToOffscreen',0],[OffscreenCanvas.prototype,'getContext',2],[OffscreenCanvas.prototype,'convertToBlob',0],[OffscreenCanvas.prototype,'transferToImageBitmap',0],[ImageBitmap.prototype,'close',0]]) {
@@ -315,7 +315,7 @@ function _newWebglResource(C, s, kind, extra) {
 }
 function _webglResourceClass(name) {
   const C = class { constructor(token) { if (token !== _graphicsObjectToken) _graphicsIllegalConstructor(); } };
-  Object.defineProperty(C, 'name', {value:name}); _graphicsTag(C.prototype, name); _markNative(C); globalThis[name] = C; return C;
+  Object.defineProperty(C, 'name', {value:name}); _graphicsTag(C.prototype, name); _markNative(C); _graphicsDefineGlobal(name, C); return C;
 }
 const WebGLBuffer = _webglResourceClass('WebGLBuffer');
 const WebGLTexture = _webglResourceClass('WebGLTexture');
@@ -335,11 +335,11 @@ class WebGLActiveInfo {
 class WebGLShaderPrecisionFormat {
   constructor(token, min, max, precision) { if (token !== _graphicsObjectToken) _graphicsIllegalConstructor(); this.rangeMin=min;this.rangeMax=max;this.precision=precision; }
 }
-for (const C of [WebGLActiveInfo,WebGLShaderPrecisionFormat]) { _graphicsTag(C.prototype,C.name);_markNative(C);globalThis[C.name]=C; }
+for (const C of [WebGLActiveInfo,WebGLShaderPrecisionFormat]) { _graphicsTag(C.prototype,C.name);_markNative(C);_graphicsDefineGlobal(C.name,C); }
 
 class WebGLRenderingContext { constructor(token, canvas, attrs) { if (token !== _graphicsObjectToken) _graphicsIllegalConstructor(); _initWebgl(this, canvas, attrs, 1); } }
 class WebGL2RenderingContext { constructor(token, canvas, attrs) { if (token !== _graphicsObjectToken) _graphicsIllegalConstructor(); _initWebgl(this, canvas, attrs, 2); } }
-for (const C of [WebGLRenderingContext,WebGL2RenderingContext]) { _graphicsTag(C.prototype,C.name);_markNative(C);globalThis[C.name]=C; }
+for (const C of [WebGLRenderingContext,WebGL2RenderingContext]) { _graphicsTag(C.prototype,C.name);_markNative(C);_graphicsDefineGlobal(C.name,C); }
 _graphicsDefineConstants(WebGLRenderingContext, _WEBGL1_CONSTANTS);
 _graphicsDefineConstants(WebGL2RenderingContext, _WEBGL2_CONSTANTS);
 
@@ -641,7 +641,7 @@ const _gpuCanvasSlots = new WeakMap();
 function _gpuBrand(self,kind){const s=_gpuSlots.get(self);if(!s||(kind&&s.kind!==kind))throw new TypeError('Illegal invocation');return s;}
 function _gpuClass(name) {
   const C=class{constructor(token,state){if(token!==_graphicsObjectToken)_graphicsIllegalConstructor();_gpuSlots.set(this,Object.assign({kind:name,label:'',destroyed:false},state||{}));}};
-  Object.defineProperty(C,'name',{value:name});_graphicsTag(C.prototype,name);_markNative(C);globalThis[name]=C;return C;
+  Object.defineProperty(C,'name',{value:name});_graphicsTag(C.prototype,name);_markNative(C);_graphicsDefineGlobal(name,C);return C;
 }
 const _gpuClasses={};
 for(const name of Object.keys(_WEBGPU_INTERFACES))_gpuClasses[name]=_gpuClass(name);
@@ -667,7 +667,7 @@ class _GPUSupportedSet {
 class GPUSupportedFeatures extends _GPUSupportedSet {constructor(token,values){super(token,values,'GPUSupportedFeatures');}}
 class WGSLLanguageFeatures extends _GPUSupportedSet {constructor(token,values){super(token,values,'WGSLLanguageFeatures');}}
 class GPUSupportedLimits {constructor(token,values){if(token!==_graphicsObjectToken)_graphicsIllegalConstructor();for(const k of Object.keys(values||{}))Object.defineProperty(this,k,{value:values[k],enumerable:true});Object.freeze(this);}}
-for(const C of [GPUSupportedFeatures,WGSLLanguageFeatures,GPUSupportedLimits]){_markNative(C);globalThis[C.name]=C;}
+for(const C of [GPUSupportedFeatures,WGSLLanguageFeatures,GPUSupportedLimits]){_markNative(C);_graphicsDefineGlobal(C.name,C);}
 
 class GPUError extends Error {constructor(token,message){if(token!==_graphicsObjectToken)_graphicsIllegalConstructor();super(String(message||''));this.name=this.constructor.name;}}
 class GPUValidationError extends GPUError {constructor(message){super(_graphicsObjectToken,message);}}
@@ -676,9 +676,9 @@ class GPUInternalError extends GPUError {constructor(message){super(_graphicsObj
 class GPUDeviceLostInfo {constructor(token,reason,message){if(token!==_graphicsObjectToken)_graphicsIllegalConstructor();this.reason=reason;this.message=message;}}
 class GPUCompilationMessage {constructor(token,message,type,lineNum,linePos,offset,length){if(token!==_graphicsObjectToken)_graphicsIllegalConstructor();Object.assign(this,{message,type,lineNum,linePos,offset,length});}}
 class GPUCompilationInfo {constructor(token,messages){if(token!==_graphicsObjectToken)_graphicsIllegalConstructor();this.messages=Object.freeze(messages.slice());}}
-for(const C of [GPUError,GPUValidationError,GPUOutOfMemoryError,GPUInternalError,GPUDeviceLostInfo,GPUCompilationMessage,GPUCompilationInfo]){_graphicsTag(C.prototype,C.name);_markNative(C);globalThis[C.name]=C;}
+for(const C of [GPUError,GPUValidationError,GPUOutOfMemoryError,GPUInternalError,GPUDeviceLostInfo,GPUCompilationMessage,GPUCompilationInfo]){_graphicsTag(C.prototype,C.name);_markNative(C);_graphicsDefineGlobal(C.name,C);}
 
-for(const name of Object.keys(_WEBGPU_CONSTANTS)){const o={};for(const k of Object.keys(_WEBGPU_CONSTANTS[name]))Object.defineProperty(o,k,{value:_WEBGPU_CONSTANTS[name][k],enumerable:true});globalThis[name]=Object.freeze(o);}
+for(const name of Object.keys(_WEBGPU_CONSTANTS)){const o={};for(const k of Object.keys(_WEBGPU_CONSTANTS[name]))Object.defineProperty(o,k,{value:_WEBGPU_CONSTANTS[name][k],enumerable:true});_graphicsDefineGlobal(name,Object.freeze(o));}
 
 function _gpuSecureContext(){let url='about:blank';try{url=__currentUrl();}catch(_){}try{const u=new URL(url);if(u.protocol==='https:'||u.protocol==='wss:'||u.protocol==='file:'||u.protocol==='about:')return true;if(u.protocol==='http:'&&(u.hostname==='localhost'||u.hostname==='127.0.0.1'||u.hostname==='[::1]'))return true;}catch(_){}return false;}
 function _gpuProfile(){return _fingerprintProfile&&_fingerprintProfile.graphics&&_fingerprintProfile.graphics.webgpu||{adapters:{}};}

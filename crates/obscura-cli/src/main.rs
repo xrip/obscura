@@ -287,6 +287,31 @@ fn is_quiet_command(cmd: &Option<Command>) -> bool {
     )
 }
 
+/// Fork: run a `--eval` expression and, if it evaluates to a promise, wait for
+/// it to settle before reporting.
+///
+/// `Page::evaluate_with_timeout` returns the raw completion value, so an async
+/// expression reported `{}` (the unresolved Promise serialized) instead of its
+/// result, silently. Upstream already has the awaiting path; CDP's
+/// Runtime.evaluate uses it via `awaitPromise`. This routes `--eval` through the
+/// same one rather than adding a second mechanism.
+async fn eval_awaiting_promise(
+    page: &mut Page,
+    expression: &str,
+    timeout_secs: u64,
+) -> serde_json::Value {
+    match page
+        .evaluate_for_cdp_with_timeout(expression, true, true, timeout_secs.saturating_mul(1000))
+        .await
+    {
+        Ok(info) => info.value.unwrap_or(serde_json::Value::Null),
+        Err(error) => {
+            tracing::debug!("JS eval error/timeout: {}", error);
+            serde_json::Value::Null
+        }
+    }
+}
+
 fn merge_proxy(global_proxy: Option<String>, command_proxy: Option<String>) -> Option<String> {
     command_proxy.or(global_proxy)
 }
@@ -998,7 +1023,7 @@ async fn run_fetch(
         if let Some(ref expr) = eval {
             // Bound the eval by the same budget as navigation so a runaway
             // expression (infinite loop, never-settling sync work) cannot hang.
-            let result = page.evaluate_with_timeout(expr, Duration::from_secs(timeout_secs));
+            let result = eval_awaiting_promise(&mut page, expr, timeout_secs).await;
 
             // A bare --eval (no --selector, --dump, or --screenshot) returns the
             // eval value directly, so synchronous expressions
@@ -1122,7 +1147,7 @@ async fn run_fetch(
             if eval_at_capture_boundary {
                 if let Some(ref expr) = eval {
                     deferred_eval_output =
-                        Some(page.evaluate_with_timeout(expr, Duration::from_secs(timeout_secs)));
+                        Some(eval_awaiting_promise(&mut page, expr, timeout_secs).await);
                 }
             }
             let capture_state = deferred_eval_output.as_ref().map(|_| {
