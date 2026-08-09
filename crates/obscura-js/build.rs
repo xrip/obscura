@@ -25,6 +25,11 @@ fn splice_fork_modules(bootstrap: &str) -> String {
             "/* __OBSCURA_GRAPHICS_PAGE_INIT__ */",
             &[include_str!("js/graphics_page_init.js")],
         ),
+        // Last statement of __obscura_init, after upstream's own hide-list loop.
+        (
+            "/* __OBSCURA_FORK_PAGE_INIT_END__ */",
+            &[include_str!("js/fork_hide_globals.js")],
+        ),
         // Top level, before upstream's `performance = performance || {...}`,
         // so that assignment short-circuits onto ours.
         (

@@ -13957,6 +13957,7 @@ globalThis.__obscura_init = function() {
   for (let i = 0; i < toHide.length; i++) {
     try { Object.defineProperty(globalThis, toHide[i], { enumerable: false }); } catch(e) {}
   }
+  /* __OBSCURA_FORK_PAGE_INIT_END__ */
   delete globalThis.__obscura_init;
 };
 

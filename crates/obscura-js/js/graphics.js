@@ -264,10 +264,12 @@ class ImageBitmap {
 }
 _graphicsTag(ImageBitmap.prototype, 'ImageBitmap');
 _graphicsDefineGlobal('ImageBitmap', ImageBitmap);
-_graphicsDefineGlobal('createImageBitmap', function createImageBitmap(source) {
+// A Window *method*, not an interface object: Chrome lists it in
+// Object.keys(window), so it stays a plain enumerable assignment.
+globalThis.createImageBitmap = function createImageBitmap(source) {
   const s = source && _canvasSlots.get(source);
   return Promise.resolve(new ImageBitmap(_graphicsObjectToken, s ? s.width : 0, s ? s.height : 0, s ? _surfaceMaterialize(s.surface, true) : null));
-});
+};
 
 for (const pair of [[_ObscuraHTMLCanvasElement,'HTMLCanvasElement'],[OffscreenCanvas,'OffscreenCanvas'],[CanvasRenderingContext2D,'CanvasRenderingContext2D'],[ImageBitmap,'ImageBitmap']]) _markNative(pair[0]);
 for (const pair of [[_ObscuraHTMLCanvasElement.prototype,'getContext',2],[_ObscuraHTMLCanvasElement.prototype,'toDataURL',0],[_ObscuraHTMLCanvasElement.prototype,'toBlob',1],[_ObscuraHTMLCanvasElement.prototype,'transferControlToOffscreen',0],[OffscreenCanvas.prototype,'getContext',2],[OffscreenCanvas.prototype,'convertToBlob',0],[OffscreenCanvas.prototype,'transferToImageBitmap',0],[ImageBitmap.prototype,'close',0]]) {
