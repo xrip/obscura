@@ -254,12 +254,40 @@ Eliminated by measurement, each with the command that did it:
 | frames / shadow DOM | counted on the live page | 0 iframes, 0 shadow hosts |
 | feature/version gate | read `IS_OUTDATED_BROWSER` and its source | false, not a gate |
 
-**Next diagnostic, not a next fix.** The machinery runs and produces nothing, so
-the question is what `__vmfp.run()` computes and what the solver does with it.
-Instrument it directly: wrap `__vmfp.run` and log its result, and watch for the
-request the solver posts and the response it gets. That distinguishes "the
-fingerprint is rejected" from "the submission never happens", which are
-different bugs. Do that before porting anything else.
+### The block is transport-level, not JavaScript
+
+The controlled comparison, run from the same exit IP within the same minute,
+using the journey the fork's own harness defines (home page, then click three
+product cards):
+
+```
+node tools/ab/chrome-raw.mjs --cards 3 --headed     28 product links, 3/3 cards
+node tools/ab/journey.mjs --site wb --cards 3 --only obscura      0 links
+```
+
+Real Chrome passes and Obscura does not, at the same moment from the same
+address, so this is not throttling and not the IP.
+
+**And Obscura receives the 773-byte challenge page as the initial HTML
+response**, before a single line of page script runs. The server decides on the
+request. That rules out the entire JavaScript surface as the cause: the DOM
+work, the interface shapes, the codec answers, `__vmfp`, the settle loop and the
+frame realms are all downstream of a decision that has already been made.
+
+So the discriminator is in what goes on the wire: the TLS ClientHello, the
+HTTP/2 settings and pseudo-header order, or the request headers themselves.
+`crates/obscura-net/src/wreq_client.rs` and `transport_profile.rs` are where
+that lives.
+
+**Next diagnostic.** Capture and compare the two requests rather than guessing:
+the JA3/JA4 and HTTP/2 fingerprint of Chrome versus the wreq emulation profile
+we select, and the exact header list and order each sends. `chrome_transport_profile`
+maps the profile's Chrome major to the nearest wreq profile and warns when it is
+not exact, so start by checking whether the selected profile's major has an
+exact wreq transport at all.
+
+The JavaScript surface work in this branch is still correct and still needed -
+it is what the probe diff measures - but it cannot move this test.
 
 Plain `ab.mjs` is a weaker control and should not be read as "we beat Chrome":
 it launches Chrome through Playwright with the automation tells left on. Under
