@@ -9703,6 +9703,7 @@ globalThis.XMLSerializer = class XMLSerializer {
     return "";
   }
 };
+/* __OBSCURA_FORK_EARLY_MODULE__ */
 globalThis.performance = globalThis.performance || {
   now: (function() {
     // Monotonically non-decreasing: return the wall-clock offset, but never a
@@ -13377,7 +13378,7 @@ if (typeof MediaQueryList === 'undefined') {
   };
 }
 
-/* __OBSCURA_GRAPHICS_MODULE__ */
+/* __OBSCURA_FORK_LATE_MODULE__ */
 
 if (typeof ImageData === 'undefined') {
   globalThis.ImageData = class ImageData {
@@ -13942,7 +13943,6 @@ globalThis.__obscura_init = function() {
     usedJSHeapSize: Math.floor(_totalHeap * (0.3 + _fpRand(621) * 0.5)),
   };
   globalThis.Notification.permission = "default";
-  /* __OBSCURA_FORK_LATE_PAGE_INIT__ */
 
   // userAgentData brands and getHighEntropyValues now derive the Chrome
   // version from navigator.userAgent and read the platform from the page

@@ -13,21 +13,22 @@ use std::path::PathBuf;
 fn splice_fork_modules(bootstrap: &str) -> String {
     const MODULES: &[(&str, &[&str])] = &[
         (
-            "/* __OBSCURA_GRAPHICS_MODULE__ */",
+            "/* __OBSCURA_FORK_LATE_MODULE__ */",
             &[
                 include_str!("js/graphics_shim.js"),
                 include_str!("js/graphics_api_v145.js"),
                 include_str!("js/graphics.js"),
+                include_str!("js/fork_interfaces.js"),
             ],
         ),
         (
             "/* __OBSCURA_GRAPHICS_PAGE_INIT__ */",
             &[include_str!("js/graphics_page_init.js")],
         ),
-        // Runs later in __obscura_init than the marker above: these need
-        // upstream's per-page performance.timeOrigin/.timing/.memory to exist.
+        // Top level, before upstream's `performance = performance || {...}`,
+        // so that assignment short-circuits onto ours.
         (
-            "/* __OBSCURA_FORK_LATE_PAGE_INIT__ */",
+            "/* __OBSCURA_FORK_EARLY_MODULE__ */",
             &[include_str!("js/fork_performance.js")],
         ),
     ];

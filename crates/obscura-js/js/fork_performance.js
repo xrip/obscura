@@ -1,96 +1,124 @@
-// Fork-only. Spliced into bootstrap.js at
-// /* __OBSCURA_FORK_LATE_PAGE_INIT__ */, inside __obscura_init and after
-// upstream has assigned performance.timeOrigin, .timing and .memory.
+// Fork-only. Spliced into bootstrap.js at /* __OBSCURA_FORK_EARLY_MODULE__ */,
+// immediately before upstream's
+//   globalThis.performance = globalThis.performance || { ... }
+// so that assignment short-circuits and upstream's object literal never runs.
 //
-// Upstream builds `performance` as a plain object literal with every method as
-// an own property. In Chrome it is a `Performance` instance: the methods live on
-// Performance.prototype, `constructor.name` is "Performance",
-// Object.prototype.toString reports "[object Performance]", and `toJSON` exists
-// on Performance, PerformanceTiming and PerformanceNavigation.
+// Upstream's `performance` is a plain object with every method as an own
+// property: `constructor.name` is "Object", there is no `toJSON` anywhere, and
+// `timing` carries three fields instead of the twenty-one a browser reports.
+// Ozon's anti-bot challenge calls `performance[...].toJSON()` and dies with
+// "TypeError: performance[b[127]].toJSON is not a function".
 //
-// This is not cosmetic. Ozon's anti-bot challenge calls
-// `performance[...].toJSON()` and dies with
-// "TypeError: performance[b[127]].toJSON is not a function", so the challenge
-// never completes and the page stays on "Please enable JavaScript".
-//
-// The object is reshaped in place, never replaced: bootstrap hands the same
-// reference to workers and other realms, and __obscura_init reassigns
-// timeOrigin/timing/memory on it every navigation.
-
-(function _forkUpgradePerformance() {
-  const perf = globalThis.performance;
-  if (!perf || typeof perf !== 'object') return;
-
-  // Classes are built once and reused across navigations, so `Performance`
-  // keeps a stable identity for the life of the isolate, as it does in a
-  // browser tab.
-  if (!globalThis.Performance) {
-    const _defineIface = (name, members) => {
-      const C = function () { throw new TypeError('Illegal constructor'); };
-      Object.defineProperty(C, 'name', { value: name, configurable: true });
-      _markNative(C);
-      C.prototype = Object.create(Object.prototype);
-      Object.defineProperty(C.prototype, 'constructor', {
-        value: C, writable: true, configurable: true,
-      });
-      // Backs Object.prototype.toString.call(x) === "[object <name>]".
-      Object.defineProperty(C.prototype, Symbol.toStringTag, {
-        value: name, configurable: true,
-      });
-      for (const key of Object.keys(members)) {
-        Object.defineProperty(C.prototype, key, {
-          value: _markNative(members[key]), writable: true, configurable: true,
-        });
-      }
-      Object.defineProperty(globalThis, name, {
-        value: C, writable: true, enumerable: false, configurable: true,
-      });
-      return C;
-    };
-
-    // PerformanceTiming and PerformanceNavigation serialize every own numeric
-    // field, which is what toJSON does in Chrome.
-    const _plainToJSON = function toJSON() {
-      const out = {};
-      for (const key of Object.keys(this)) {
-        const value = this[key];
-        if (typeof value !== 'function') out[key] = value;
-      }
-      return out;
-    };
-    _defineIface('PerformanceTiming', { toJSON: _plainToJSON });
-    _defineIface('PerformanceNavigation', { toJSON: _plainToJSON });
-
-    // Move the object literal's own methods onto the prototype, so a page sees
-    // them inherited exactly as in Chrome rather than as own properties.
-    const members = {};
-    for (const key of Object.keys(perf)) {
-      if (typeof perf[key] === 'function') members[key] = perf[key];
+// Ported from fork commit c59cd68 "Harden browser compatibility for challenge
+// flows". The `timing` setter is the load-bearing part: upstream's
+// __obscura_init assigns a three-field object literal every navigation, and the
+// setter widens it to a full PerformanceTiming, so that line needs no edit.
+const _performanceSlots = new WeakMap();
+const _performanceTimingToken = {};
+const _performanceTimingFields = [
+  'navigationStart', 'unloadEventStart', 'unloadEventEnd',
+  'redirectStart', 'redirectEnd', 'fetchStart',
+  'domainLookupStart', 'domainLookupEnd', 'connectStart', 'connectEnd',
+  'secureConnectionStart', 'requestStart', 'responseStart', 'responseEnd',
+  'domLoading', 'domInteractive', 'domContentLoadedEventStart',
+  'domContentLoadedEventEnd', 'domComplete', 'loadEventStart', 'loadEventEnd',
+];
+class PerformanceTiming {
+  constructor(token, values={}) {
+    if (token !== _performanceTimingToken) throw new TypeError('Illegal constructor');
+    for (const field of _performanceTimingFields) {
+      const value = Number(values[field]);
+      this[field] = Number.isFinite(value) ? value : 0;
     }
-    members.toJSON = function toJSON() {
-      return {
-        timeOrigin: this.timeOrigin,
-        timing: this.timing && typeof this.timing.toJSON === 'function'
-          ? this.timing.toJSON() : this.timing,
-        navigation: this.navigation && typeof this.navigation.toJSON === 'function'
-          ? this.navigation.toJSON() : this.navigation,
-      };
-    };
-    _defineIface('Performance', members);
   }
+  toJSON() {
+    const result = {};
+    for (const field of _performanceTimingFields) result[field] = this[field];
+    return result;
+  }
+}
+_markNative(PerformanceTiming);
+_markNative(PerformanceTiming.prototype.toJSON);
+Object.defineProperty(PerformanceTiming.prototype, Symbol.toStringTag, {
+  value: 'PerformanceTiming', configurable: true,
+});
+// Non-enumerable, as WebIDL requires of an interface object: anything that
+// shows up in Object.keys(window) is a one-line detection.
+Object.defineProperty(globalThis, 'PerformanceTiming', {
+  value: PerformanceTiming, writable: true, enumerable: false, configurable: true,
+});
+const _newPerformanceTiming = values => new PerformanceTiming(_performanceTimingToken, values);
 
-  // Reshape, per navigation.
-  for (const key of Object.keys(perf)) {
-    if (typeof perf[key] === 'function') delete perf[key];
+class Performance {
+  constructor() {
+    _performanceSlots.set(this, {
+      timeOrigin: 0,
+      timing: _newPerformanceTiming({}),
+      navigation: { type: 0, redirectCount: 0 },
+      memory: {
+        jsHeapSizeLimit: 4294705152,
+        totalJSHeapSize: 19321856,
+        usedJSHeapSize: 16781520,
+      },
+      lastNow: -Infinity,
+    });
   }
-  Object.setPrototypeOf(perf, globalThis.Performance.prototype);
-
-  // Chrome always exposes performance.navigation; upstream never sets it.
-  if (!perf.navigation || typeof perf.navigation !== 'object') {
-    perf.navigation = { type: 0, redirectCount: 0 };
+  get timeOrigin() { return _performanceSlots.get(this).timeOrigin; }
+  set timeOrigin(value) { _performanceSlots.get(this).timeOrigin = Number(value) || 0; }
+  get timing() { return _performanceSlots.get(this).timing; }
+  set timing(value) {
+    _performanceSlots.get(this).timing = value instanceof PerformanceTiming
+      ? value
+      : _newPerformanceTiming(value || {});
   }
-  if (perf.timing && typeof perf.timing === 'object') {
-    Object.setPrototypeOf(perf.timing, globalThis.PerformanceTiming.prototype);
+  get navigation() { return _performanceSlots.get(this).navigation; }
+  set navigation(value) { _performanceSlots.get(this).navigation = value; }
+  get memory() { return _performanceSlots.get(this).memory; }
+  set memory(value) { _performanceSlots.get(this).memory = value; }
+  get eventCounts() { return new Map(); }
+  get interactionCount() { return 0; }
+  get onresourcetimingbufferfull() { return null; }
+  set onresourcetimingbufferfull(_) {}
+  now() {
+    // Monotonically non-decreasing: return the wall-clock offset, but never a
+    // value below the last one. Equal readings are allowed, and avoiding a
+    // synthetic per-call increment keeps tight loops from advancing the clock
+    // faster than real elapsed time.
+    const slot = _performanceSlots.get(this);
+    const ms = Date.now() - slot.timeOrigin;
+    if (ms < slot.lastNow) return slot.lastNow;
+    slot.lastNow = ms;
+    return slot.lastNow;
   }
-  Object.setPrototypeOf(perf.navigation, globalThis.PerformanceNavigation.prototype);
-})();
+  mark() {}
+  measure() {}
+  clearMarks() {}
+  clearMeasures() {}
+  clearResourceTimings() {}
+  getEntries() { return []; }
+  getEntriesByName() { return []; }
+  getEntriesByType() { return []; }
+  setResourceTimingBufferSize() {}
+  toJSON() { return {}; }
+}
+_markNative(Performance);
+for (const _performanceMethod of [
+  'now', 'mark', 'measure', 'clearMarks', 'clearMeasures',
+  'clearResourceTimings', 'getEntries', 'getEntriesByName',
+  'getEntriesByType', 'setResourceTimingBufferSize', 'toJSON',
+]) _markNative(Performance.prototype[_performanceMethod]);
+for (const _performanceGetter of [
+  'timeOrigin', 'timing', 'navigation', 'memory',
+  'eventCounts', 'interactionCount', 'onresourcetimingbufferfull',
+]) {
+  const _descriptor = Object.getOwnPropertyDescriptor(Performance.prototype, _performanceGetter);
+  if (_descriptor?.get) _markNativeAs(_descriptor.get, `function get ${_performanceGetter}() { [native code] }`);
+  if (_descriptor?.set) _markNativeAs(_descriptor.set, `function set ${_performanceGetter}() { [native code] }`);
+}
+Object.defineProperty(Performance.prototype, Symbol.toStringTag, {
+  value: 'Performance', configurable: true,
+});
+Object.defineProperty(globalThis, 'Performance', {
+  value: Performance, writable: true, enumerable: false, configurable: true,
+});
+globalThis.performance = new Performance();

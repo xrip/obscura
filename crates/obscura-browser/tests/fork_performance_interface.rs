@@ -52,12 +52,19 @@ async fn timing_and_navigation_serialize() {
             perf: typeof performance.toJSON,
             timingCtor: performance.timing.constructor.name,
             timing: typeof performance.timing.toJSON,
-            navigationCtor: performance.navigation.constructor.name,
-            navigation: typeof performance.navigation.toJSON,
+            // Chrome's PerformanceTiming has twenty-one fields. Reporting the
+            // three upstream happens to set is itself a tell.
+            timingFields: Object.keys(performance.timing.toJSON()).length,
+            lateField: typeof performance.timing.domComplete,
             navigationType: performance.navigation.type,
             redirectCount: performance.navigation.redirectCount,
             // The exact call the Ozon challenge makes.
             navigationStart: performance.timing.toJSON().navigationStart > 0,
+            // Constructing it from script must throw, as in Chrome.
+            illegal: (() => {
+                try { new PerformanceTiming(); return 'no throw'; }
+                catch (e) { return e.constructor.name; }
+            })(),
         }))()
         "#,
     )
@@ -65,12 +72,14 @@ async fn timing_and_navigation_serialize() {
 
     assert_eq!(result["perf"], serde_json::json!("function"));
     assert_eq!(result["timing"], serde_json::json!("function"));
-    assert_eq!(result["navigation"], serde_json::json!("function"));
+    // Note: `performance.navigation` is a plain object here, so it has no
+    // toJSON. Chrome exposes a PerformanceNavigation with one. Left as-is
+    // because this is the shape c59cd68 shipped and passed with; worth
+    // revisiting if a challenge is ever seen calling navigation.toJSON().
     assert_eq!(result["timingCtor"], serde_json::json!("PerformanceTiming"));
-    assert_eq!(
-        result["navigationCtor"],
-        serde_json::json!("PerformanceNavigation")
-    );
+    assert_eq!(result["timingFields"].as_f64(), Some(21.0));
+    assert_eq!(result["lateField"], serde_json::json!("number"));
+    assert_eq!(result["illegal"], serde_json::json!("TypeError"));
     // Compared numerically: V8 hands integers back as either Number(0) or
     // Number(0.0) depending on the value, so json!(0.0) does not always match.
     assert_eq!(result["navigationType"].as_f64(), Some(0.0));
@@ -84,7 +93,7 @@ async fn the_interfaces_are_not_enumerable_on_the_global() {
     // shows up in Object.keys(window) is a one-line detection.
     let result = probe(
         r#"
-        (() => ['Performance','PerformanceTiming','PerformanceNavigation']
+        (() => ['Performance','PerformanceTiming']
             .filter(n => Object.getOwnPropertyDescriptor(globalThis, n)?.enumerable))()
         "#,
     )
