@@ -20,6 +20,7 @@ fn splice_fork_modules(bootstrap: &str) -> String {
                 include_str!("js/graphics.js"),
                 include_str!("js/fork_interfaces.js"),
                 include_str!("js/fork_media_codecs.js"),
+                include_str!("js/fork_console.js"),
             ],
         ),
         (
