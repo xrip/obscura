@@ -40,6 +40,10 @@ pub async fn handle(
             }
             Ok(json!({}))
         }
+        "clearCookies" => {
+            cookie_jar_for(ctx, params, session_id)?.clear();
+            Ok(json!({}))
+        }
         "deleteCookies" => {
             if let Some(filter) = parse_delete_cookies_params(params) {
                 cookie_jar_for(ctx, params, session_id)?.delete_cookies_filtered(
@@ -51,5 +55,52 @@ pub async fn handle(
             Ok(json!({}))
         }
         _ => Ok(json!({})),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn playwright_cookie_methods_are_scoped_to_browser_context() {
+        let mut ctx = CdpContext::new();
+        let browser_context_id = ctx.create_browser_context();
+        let params = json!({
+            "browserContextId": browser_context_id,
+            "cookies": [{
+                "name": "sid",
+                "value": "account",
+                "domain": "example.com",
+                "path": "/",
+                "expires": -1,
+                "httpOnly": true,
+                "secure": true,
+                "sameSite": "Lax"
+            }]
+        });
+        handle("setCookies", &params, &mut ctx, &None).await.unwrap();
+
+        let result = handle(
+            "getCookies",
+            &json!({ "browserContextId": browser_context_id }),
+            &mut ctx,
+            &None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result["cookies"].as_array().unwrap().len(), 1);
+        assert!(ctx.default_context.cookie_jar.get_all_cookies().is_empty());
+
+        handle(
+            "clearCookies",
+            &json!({ "browserContextId": browser_context_id }),
+            &mut ctx,
+            &None,
+        )
+        .await
+        .unwrap();
+        let context = ctx.browser_context(&browser_context_id).unwrap();
+        assert!(context.cookie_jar.get_all_cookies().is_empty());
     }
 }

@@ -24,6 +24,9 @@ use tokio::sync::Mutex;
 use serde::Deserialize;
 
 use crate::import_map::ImportMap;
+// Fork: re-exported here so `obscura_js::ops::OriginStorage` keeps resolving for
+// obscura-browser, which is where the BrowserContext owns the store.
+pub use crate::origin_storage::OriginStorage;
 
 pub type InterceptCallback = Arc<
     Mutex<
@@ -110,6 +113,8 @@ pub struct ObscuraState {
     pub referrer: String,
     pub blocked_urls: Vec<String>,
     pub cookie_jar: Option<Arc<CookieJar>>,
+    /// Fork: BrowserContext-scoped localStorage. See `crate::origin_storage`.
+    pub local_storage: Option<Arc<OriginStorage>>,
     pub http_client: Option<Arc<ObscuraHttpClient>>,
     /// The owning page's passive on_request/on_response callbacks (issue
     /// #408). Page-scoped, so scripted fetch()/XHR observation stays local to
@@ -238,6 +243,7 @@ impl ObscuraState {
             referrer: String::new(),
             blocked_urls: Vec::new(),
             cookie_jar: None,
+            local_storage: Some(Arc::new(OriginStorage::default())),
             http_client: None,
             callbacks: None,
             #[cfg(feature = "stealth")]
@@ -4041,6 +4047,8 @@ pub fn build_extension() -> Extension {
         op_text_decode(),
         op_url_encode_query(),
     ];
+    // Fork: localStorage, implemented in crate::origin_storage.
+    ops.push(crate::origin_storage::op_local_storage());
     // Only registered when the render feature is compiled in. bootstrap.js
     // probes with typeof before calling, so the op's absence is a clean fallback.
     #[cfg(feature = "render")]

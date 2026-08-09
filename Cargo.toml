@@ -55,6 +55,8 @@ uuid = { version = "1", features = ["v4"] }
 thiserror = "2"
 anyhow = "1"
 base64 = "0.22"
+# GeoIP lookup that aligns timezone and geolocation with the proxy exit IP.
+maxminddb = "0.30"
 
 [patch.crates-io]
 # Keep the grid shrink-to-fit correction local until it lands upstream.

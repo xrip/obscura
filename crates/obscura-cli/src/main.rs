@@ -7,6 +7,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command as TokioCommand;
 use tokio::time::{timeout, Duration};
 
+mod geoip;
+
 #[derive(Parser)]
 #[command(
     name = "obscura",
@@ -25,6 +27,12 @@ struct Args {
 
     #[arg(long, global = true)]
     proxy: Option<String>,
+
+    /// BotBrowser GeoIP database used to align timezone and location with the
+    /// configured proxy exit IP. When omitted, Obscura looks next to the
+    /// executable and then in the current directory.
+    #[arg(long, global = true, value_name = "PATH")]
+    geoip_db: Option<std::path::PathBuf>,
 
     /// Enable stealth mode (consistent browser fingerprint, and with the
     /// `stealth` build feature, TLS impersonation plus tracker blocking).
@@ -58,6 +66,12 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Command {
+    /// List and inspect the embedded browser fingerprint profiles.
+    Profiles {
+        #[command(subcommand)]
+        command: ProfilesCommand,
+    },
+
     Serve {
         #[arg(short, long, default_value_t = 9222)]
         port: u16,
@@ -94,6 +108,12 @@ enum Command {
 
         #[arg(long)]
         storage_dir: Option<std::path::PathBuf>,
+
+        /// Serve the local Chrome profile workbench and save checked captures
+        /// under this source directory. The save route accepts loopback clients
+        /// only. This option needs --workers 1.
+        #[arg(long, value_name = "DIR")]
+        profile_workbench_dir: Option<std::path::PathBuf>,
 
         /// Suppress all logs (same as on `fetch`). Useful when scraping pages
         /// that flood the console with per-page script warnings (issue #264).
@@ -198,6 +218,16 @@ enum Command {
     },
 }
 
+#[derive(Subcommand)]
+enum ProfilesCommand {
+    /// Print the selectable base, graphics, and screen rows as JSON.
+    List,
+    /// Print one exact composed profile as JSON.
+    Show { id: String },
+    /// Print the profile selected by the current environment as JSON.
+    Current,
+}
+
 #[derive(Clone, Debug, clap::ValueEnum, PartialEq, Eq)]
 enum DumpFormat {
     Html,
@@ -261,6 +291,37 @@ fn merge_proxy(global_proxy: Option<String>, command_proxy: Option<String>) -> O
     command_proxy.or(global_proxy)
 }
 
+fn validate_serve_workers(
+    workers: u16,
+    profile_workbench_dir: &Option<std::path::PathBuf>,
+) -> anyhow::Result<()> {
+    if workers > 1 && profile_workbench_dir.is_some() {
+        anyhow::bail!("--profile-workbench-dir needs --workers 1");
+    }
+    Ok(())
+}
+
+fn resolved_profile_json(
+    profile: &obscura_browser::profiles::ResolvedFingerprintProfile,
+) -> anyhow::Result<String> {
+    let value: serde_json::Value = serde_json::from_str(profile.runtime_json())?;
+    Ok(serde_json::to_string_pretty(&value)?)
+}
+
+fn profiles_output(command: ProfilesCommand) -> anyhow::Result<String> {
+    match command {
+        ProfilesCommand::List => Ok(obscura_browser::profiles::catalog()?.index_json()?),
+        ProfilesCommand::Show { id } => {
+            let profile = obscura_browser::profiles::resolve_profile_id(&id)?;
+            resolved_profile_json(&profile)
+        }
+        ProfilesCommand::Current => {
+            let profile = obscura_browser::profiles::resolve_profile()?;
+            resolved_profile_json(&profile)
+        }
+    }
+}
+
 /// Normalize a raw `--v8-flags` value into the string we'll hand to V8.
 /// Returns `None` when the user didn't pass the flag, passed an empty string,
 /// or passed only whitespace; in those cases V8 is left untouched.
@@ -299,31 +360,83 @@ fn effective_v8_flags(user: Option<&str>) -> String {
     }
 }
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> anyhow::Result<()> {
-    let args = Args::parse();
+/// Fork: which proxy, if any, a GeoIP lookup should follow at startup.
+fn startup_proxy(args: &Args) -> Option<String> {
+    match &args.command {
+        Some(Command::Profiles { .. }) => None,
+        Some(Command::Serve { proxy, .. }) => merge_proxy(args.proxy.clone(), proxy.clone())
+            .or_else(|| std::env::var("OBSCURA_PROXY").ok().filter(|s| !s.is_empty())),
+        Some(Command::Mcp { proxy, .. }) => merge_proxy(args.proxy.clone(), proxy.clone()),
+        _ => args.proxy.clone(),
+    }
+}
 
-    // Pin the process timezone before V8/ICU reads it. V8 sources the zone for
-    // both Date (getTimezoneOffset, toString) and Intl.DateTimeFormat from TZ; left
-    // unset it defaults to UTC for Date while the page layer advertised a different
-    // zone, a cross-surface mismatch fingerprinting scripts flag. Default to
-    // Europe/Berlin; set OBSCURA_TIMEZONE to match the exit IP's region. An existing
-    // TZ from the host is respected.
-    // SAFETY: runs before any V8 isolate or worker thread starts, so the env is
-    // effectively single threaded here.
-    if let Some(tz) = std::env::var("OBSCURA_TIMEZONE")
+/// Pin the process timezone before V8/ICU reads it. V8 sources the zone for
+/// both Date (getTimezoneOffset, toString) and Intl.DateTimeFormat from TZ; left
+/// unset it defaults to UTC for Date while the page layer advertised a different
+/// zone, a cross-surface mismatch fingerprinting scripts flag.
+///
+/// Fork: a GeoIP hit for the proxy exit IP supplies the zone and location, so
+/// they agree with the exit address. A manual OBSCURA_TIMEZONE still wins, and
+/// with no lookup the old host-or-Europe/Berlin behaviour is unchanged.
+fn configure_geo_environment(identity: Option<&geoip::GeoIdentity>) {
+    let manual_timezone = std::env::var("OBSCURA_TIMEZONE")
         .ok()
-        .filter(|s| !s.trim().is_empty())
-    {
-        unsafe {
-            std::env::set_var("TZ", tz);
-        }
-    } else if std::env::var_os("TZ").is_none() {
-        unsafe {
-            std::env::set_var("TZ", "Europe/Berlin");
-        }
+        .filter(|value| !value.trim().is_empty());
+    let timezone = if let Some(timezone) = manual_timezone {
+        timezone
+    } else if let Some(identity) = identity {
+        identity.timezone.clone()
+    } else {
+        std::env::var("TZ")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "Europe/Berlin".to_string())
+    };
+    // SAFETY: main calls this before its Tokio runtime or any V8 isolate is
+    // created. The temporary blocking HTTP client has already been dropped.
+    unsafe {
+        std::env::set_var("TZ", &timezone);
     }
 
+    if std::env::var_os("OBSCURA_GEOLOCATION").is_none() {
+        if let Some(identity) = identity {
+            // SAFETY: see above. Worker processes inherit this value.
+            unsafe {
+                std::env::set_var(
+                    "OBSCURA_GEOLOCATION",
+                    format!("{},{}", identity.latitude, identity.longitude),
+                );
+            }
+        }
+    }
+}
+
+// Fork: not #[tokio::main]. The GeoIP lookup is a blocking HTTP call that has to
+// finish, and its client be dropped, before TZ is set and any V8 isolate starts.
+fn main() -> anyhow::Result<()> {
+    let args = Args::parse();
+    let geo_result = startup_proxy(&args)
+        .as_deref()
+        .map(|proxy| geoip::resolve(proxy, args.geoip_db.as_deref()))
+        .transpose();
+    let (geo_identity, geo_error) = match geo_result {
+        Ok(value) => (value.flatten(), None),
+        Err(error) => (None, Some(error)),
+    };
+    configure_geo_environment(geo_identity.as_ref());
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(run(args, geo_identity, geo_error))
+}
+
+async fn run(
+    args: Args,
+    geo_identity: Option<geoip::GeoIdentity>,
+    geo_error: Option<anyhow::Error>,
+) -> anyhow::Result<()> {
     let quiet = is_quiet_command(&args.command);
     let filter = select_log_filter(args.verbose, quiet);
     tracing_subscriber::fmt()
@@ -333,6 +446,21 @@ async fn main() -> anyhow::Result<()> {
         )
         .with_writer(std::io::stderr)
         .init();
+
+    if let Some(identity) = geo_identity {
+        tracing::info!(
+            exit_ip = %identity.ip,
+            country = identity.country_code,
+            timezone = identity.timezone,
+            latitude = identity.latitude,
+            longitude = identity.longitude,
+            database = %identity.database.display(),
+            "GeoIP identity applied"
+        );
+    }
+    if let Some(error) = geo_error {
+        tracing::warn!(%error, "GeoIP lookup failed; using manual or default location settings");
+    }
 
     let v8_flags = effective_v8_flags(args.v8_flags.as_deref());
     tracing::debug!("V8 flags: {}", v8_flags);
@@ -355,6 +483,9 @@ async fn main() -> anyhow::Result<()> {
     let stealth = args.stealth;
 
     match args.command {
+        Some(Command::Profiles { command }) => {
+            println!("{}", profiles_output(command)?);
+        }
         Some(Command::Serve {
             port,
             host,
@@ -364,8 +495,10 @@ async fn main() -> anyhow::Result<()> {
             max_connections,
             allow_file_access,
             storage_dir,
+            profile_workbench_dir,
             quiet: _,
         }) => {
+            validate_serve_workers(workers, &profile_workbench_dir)?;
             // Fall back to OBSCURA_PROXY so a proxy can be supplied without
             // putting credentials on the command line. The multi-worker load
             // balancer passes the proxy to each worker this way (issue #366).
@@ -375,6 +508,15 @@ async fn main() -> anyhow::Result<()> {
                     .filter(|s| !s.is_empty())
             });
             print_banner(port);
+            if let Some(ref dir) = profile_workbench_dir {
+                println!(
+                    "  Profile workbench: http://127.0.0.1:{}/obscura/profiles/
+  Profile source dir: {}
+",
+                    port,
+                    dir.display()
+                );
+            }
             if let Some(ref dir) = storage_dir {
                 tracing::info!("Storage dir: {}", dir.display());
             }
@@ -397,7 +539,7 @@ async fn main() -> anyhow::Result<()> {
                 tracing::info!("{} worker processes", workers);
                 run_multi_worker_serve(port, host, workers, proxy, stealth, user_agent).await?;
             } else {
-                obscura_cdp::start_with_serve_options_and_limit(
+                obscura_cdp::start_with_profile_workbench_options_and_limit(
                     port,
                     &host,
                     proxy,
@@ -407,6 +549,7 @@ async fn main() -> anyhow::Result<()> {
                     storage_dir,
                     args.allow_private_network,
                     max_connections,
+                    profile_workbench_dir,
                 )
                 .await?;
             }
