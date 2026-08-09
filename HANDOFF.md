@@ -279,6 +279,35 @@ HTTP/2 settings and pseudo-header order, or the request headers themselves.
 `crates/obscura-net/src/wreq_client.rs` and `transport_profile.rs` are where
 that lives.
 
+#### Measured header differences
+
+Against a local echo server, real Chrome versus Obscura `--stealth`. Caveat
+before acting on any of it: this was **HTTP/1.1 to a plain server**, while
+Wildberries is HTTP/2 over TLS, and both header order and presence differ by
+protocol. Re-measure over HTTP/2 before treating these as the cause.
+
+| header | Chrome | Obscura |
+|---|---|---|
+| `accept-encoding` | `gzip, deflate, br, zstd` | `zstd,gzip,deflate,br` |
+| `accept-language` | `ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7` | `en-US,en;q=0.9` |
+| `connection` | `keep-alive` | absent |
+| `priority` | absent | present |
+| `sec-ch-ua` GREASE | `"Not=A?Brand"` | `"Not:A-Brand"` |
+
+**`accept-encoding` is the strongest lead.** Order and spacing are exactly what
+transport fingerprinting reads, and ours is both reordered and unspaced. It
+comes from the wreq emulation profile, not from our code, so check whether
+wreq's Chrome145 emulation is what emits it before changing anything.
+
+Do **not** "fix" the GREASE brand from this table. The local Chrome is version
+151 and our profile claims 145; Chromium's GREASE punctuation is derived per
+major version, so a difference here is expected and `chrome_client_hints`
+already implements that algorithm. Verify against a real Chrome 145 before
+touching it.
+
+`priority` on HTTP/1.1 and the missing `connection` header are both
+protocol-shape mismatches worth checking over HTTP/2.
+
 **Next diagnostic.** Capture and compare the two requests rather than guessing:
 the JA3/JA4 and HTTP/2 fingerprint of Chrome versus the wreq emulation profile
 we select, and the exact header list and order each sends. `chrome_transport_profile`
