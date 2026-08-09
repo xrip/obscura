@@ -179,6 +179,39 @@ exactly like a fingerprinting failure. Before drawing any conclusion from these
 three sites, let the IP cool down or use another exit, and always read the
 returned body rather than a link count.
 
+#### What Wildberries actually runs, and why this is not a quick fix
+
+Obscura loads the challenge page and every one of its scripts, with **no
+console errors**, and is issued the `x_wbaas_token` cookie:
+
+```
+__wbaas/challenges/antibot/__static/v2/index-Bob5L-dt.js
+__wbaas/challenges/antibot/statics/challenge-solver_v1.0.8.js
+__wbaas/challenges/antibot/statics/behavior-tracker_v1.0.3.js
+__wbaas/challenges/antibot/statics/challenge_vm_fp_v1.8.0_68686d45.js
+__wbaas/challenges/antibot/__static/v2/browser-check.js
+```
+
+So this is not the Ozon situation, where a missing `toJSON` threw and stopped
+the challenge dead. The scripts run to completion and the verdict is still no.
+
+Three named components, and they want different things:
+
+- `challenge_vm_fp` is a VM-based fingerprint, a bytecode interpreter probing
+  many surfaces at once. This is what the measured surface work targets, and
+  where further probe-driven fixes pay off.
+- `behavior-tracker` wants mouse movement, scrolling and timing. The engine
+  emits none: there is no synthetic input at all outside an explicit CDP
+  `Input.dispatchMouseEvent`. Headful Chrome passes partly because a real
+  window produces incidental input; headless Chrome does not pass either.
+- `challenge-solver` presumably gates on both.
+
+**`live_product_smoke` therefore cannot be made green by fingerprint surface
+work alone.** Wildberries wants behaviour, which is a feature the fork has never
+had, not a port of an existing fix. Treat that test as blocked on a behavioural
+input layer and judge the surface work by the probe diff instead, which is
+deterministic, offline and already close to zero.
+
 Plain `ab.mjs` is a weaker control and should not be read as "we beat Chrome":
 it launches Chrome through Playwright with the automation tells left on. Under
 it, Chrome got HTTP 403 from Ozon (186 byte body) and HTTP 498 from Wildberries
