@@ -277,7 +277,45 @@ and reloads into the real page, and this one does not. That is consistent with
 everything observed: the challenge scripts run here, `__vmfp` is present, the
 `x_wbaas_token` cookie is set, and the body simply never advances past 773 bytes.
 
-**So the original diagnostic is the right one after all:** wrap `__vmfp.run` and
+#### Proven: the old build solves the challenge, this one does not
+
+Same URL, same minute, same TLS fingerprint:
+
+| build | body | product links | on challenge page |
+|---|---|---|---|
+| old (`pre-rebuild`) | 2,792,132 | **295** | no |
+| this branch | 773 | 0 | yes |
+
+So the old engine runs the challenge to a pass and reloads into the real shop
+page. This is an engine behaviour difference, and the remaining unported fork
+commits are where it lives.
+
+#### Prime suspect: `764298d` "fix stealth challenge token generation"
+
+The name is literal, and Wildberries' cookie is `x_wbaas_token`. It is large -
+534 lines of `bootstrap.js` plus `page.rs`, `module_loader.rs`, `ops.rs`,
+`runtime.rs` and `wreq_client.rs` - so it needs a session of its own. Three
+pieces visible in it are directly anti-detection:
+
+1. **`Error.stack` is no longer read when the page logs an Error.** Its own
+   comment: *"Chrome's console transport does not read Error.stack while the
+   page logs an Error. Reading it here triggers the common DevTools/CDP getter
+   probe before any inspector is involved."* A page can install a getter on
+   `Error.prototype.stack` and learn that something automated is watching. This
+   engine still reads it.
+2. **`Deno` is made non-enumerable rather than deleted.** That is the cheap
+   version of the problem that was deferred earlier in this rebuild: it hides
+   the global from enumeration without breaking the ~33 `Deno.core` call sites
+   in `runtime.rs`. Worth revisiting with this approach instead.
+3. **`console` gains the methods Chrome has** - `dirxml`, `timeStamp`,
+   `profile`, `profileEnd`, `context`, `createTask`. A short console object is
+   trivially checkable.
+
+Port that commit next, in pieces, measuring after each with
+`node tools/ab/journey.mjs --site wb --cards 3 --only obscura` against the old
+build as the control.
+
+**The `__vmfp` diagnostic remains the fallback if that does not do it:** wrap `__vmfp.run` and
 log what it returns, and watch the request the solver posts and the response it
 gets. That separates "the fingerprint is computed and rejected" from "the
 submission never happens". Do that first.
