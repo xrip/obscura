@@ -69,8 +69,43 @@ upstream now does the same work under different names (`ResourceRequest`,
 That also means our old call sites in `page.rs`, `module_loader.rs`, `ops.rs`
 and `runtime.rs` need no porting at all, which shrinks stages 4 and 5.
 
-Still open in stage 2: `cdp/domains/runtime.rs`, and landing
-`live_product_smoke.rs` and `playwright_storage_state.mjs`.
+Stage 2 is closed. Final run: **1106 tests, 1076 passed, 30 failed, 4 skipped**,
+the same count as the baseline. The set differs by two: the gzip test is fixed,
+and our own `live_product_smoke` now runs and fails (see below).
+
+#### `live_product_smoke` needs stage 4, not stage 2
+
+All three sites answer with an anti-bot challenge: Wildberries a browser check,
+Ozon a JavaScript proof-of-work, Avito a SHA-256 proof-of-work with
+`blocked: true`. None of them is a profile problem, and the identity on the wire
+was verified correct.
+
+The measurable cause is the settle. The test asks for `page.settle(10_000)` but
+the whole three-site run finishes in 5.4s, so settle is returning after roughly
+1.5s per site: it exits as soon as V8 is momentarily idle, long before a
+challenge script has run its timers and promises. The settle loop that drives
+the event loop in slices is in `ce18b78`, which lands in stage 4. Expect this
+test to stay red until then.
+
+Note the Wildberries exit was IPv6 on a Hurricane Electric tunnel
+(`2001:470:...`). Results from that address are not representative.
+
+#### Deferred to stage 5: hiding `Deno` from the page
+
+A page that can see `Deno` is not Chrome. The fork used to delete
+`globalThis.Deno`, which needs bootstrap's own `Deno.core` calls to resolve
+through an alias. That part is cheap: bootstrap's IIFE takes one `const Deno =
+globalThis.Deno;` and the whole change is two marker comments plus a fork-owned
+module, with no rename of bootstrap's ~80 call sites.
+
+What blocks it is `runtime.rs`, which injects 33 scripts referencing
+`Deno.core.ops` into the global scope, outside the IIFE. Eight upstream tests
+fail immediately, and the render-gated instrumentation at `runtime.rs`
+9098-9477 would break under `--features render` in stage 6. Making it work
+means editing ~33 sites in a file upstream rewrites constantly, which is the
+opposite of what this rebuild is for. It was implemented, measured, and
+reverted. Revisit in stage 5 with a single Rust-side choke point for injected
+scripts, not a rename.
 
 ---
 
