@@ -41,15 +41,36 @@ navigates, and polls for an `h1` on a hardcoded 5 second budget. Alone it takes
 0.04s; at full parallelism it lands at position ~1103 of 1105, beside the 5-6s
 `obscura-js runtime::tests`, and expires at exactly 5.132s.
 
-It is contention, not a regression: with `--test-threads 8` the fork's failure
-set is byte-identical to the 30 above. Adding fork tests shifts the schedule, so
-use `--test-threads 8` for any comparison against the baseline.
+It is contention, not a regression. Run standalone, the `mcp_client` binary is
+16/16 five times in a row; in the full run it flakes at 8 threads too, just less
+often. Treat it as a known flake, not a signal. Compare failure *sets* against
+the baseline rather than counts, and re-run this one test alone before believing
+it.
 
-### Stage 2 result (profiles, workbench, GeoIP)
+### Stage 2 result (profiles, workbench, GeoIP, transport identity)
 
 `cargo nextest run --release --workspace --features stealth --no-fail-fast
---test-threads 8`: **1105 tests, 1075 passed, 30 failed, 4 skipped.** The 30 are
-the same 30. Thirty fork tests added, zero new failures.
+--test-threads 8`: **1105 tests run, 30 failed.** Same count as the baseline,
+and the set differs by exactly two entries, both in our favour:
+
+- `stealth_client_decodes_gzip_response` is now **fixed**. The stealth path
+  hardcoded `validate_url(url, false)`, so `--allow-private-network` never
+  reached it and its own `127.0.0.1` fixture was unreachable. It now passes the
+  client's flag, and `obscura-net` is 83/83.
+- `mcp_client test_wait_for_selector` appears, and is the known flake above.
+
+Identity verified on the wire against a local echo server: the plain and the
+stealth path both send the profile's Windows Chrome 145 `user-agent`,
+`sec-ch-ua` and `sec-ch-ua-platform`. No Linux Chrome string on either path.
+
+Roughly 400 lines of fork code were **deleted rather than ported**, because
+upstream now does the same work under different names (`ResourceRequest`,
+`fetch_with_profile`, `request_referrer`, `request_fetch_site`, gzip decoding).
+That also means our old call sites in `page.rs`, `module_loader.rs`, `ops.rs`
+and `runtime.rs` need no porting at all, which shrinks stages 4 and 5.
+
+Still open in stage 2: `cdp/domains/runtime.rs`, and landing
+`live_product_smoke.rs` and `playwright_storage_state.mjs`.
 
 ---
 
