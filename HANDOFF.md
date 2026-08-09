@@ -206,11 +206,35 @@ Three named components, and they want different things:
   window produces incidental input; headless Chrome does not pass either.
 - `challenge-solver` presumably gates on both.
 
-**`live_product_smoke` therefore cannot be made green by fingerprint surface
-work alone.** Wildberries wants behaviour, which is a feature the fork has never
-had, not a port of an existing fix. Treat that test as blocked on a behavioural
-input layer and judge the surface work by the probe diff instead, which is
-deterministic, offline and already close to zero.
+**That "needs a behavioural layer" reading was also wrong.** Running
+`live_product_smoke` against the *old fork build* settles it:
+
+| | Wildberries | Ozon | Avito | wall |
+|---|---|---|---|---|
+| old fork (`pre-rebuild`) | **passes** | fails | fails | 58s |
+| this branch | fails | fails | fails | 9s, 36s with strict settle |
+
+Wildberries passed on the fork with no behavioural input, so it is reachable by
+porting, not by new features. Note also that the fork's own suite never had this
+test fully green: Ozon and Avito failed there too, which is what its HANDOFF
+recorded. Parity with the fork means Wildberries green and the other two red.
+
+Two candidates were tested and eliminated:
+
+- **Settle budget.** `OBSCURA_STRICT_SETTLE=1` takes the run from 9s to 36s of
+  real page time and Wildberries still fails, so the sliced settle loop alone is
+  not the difference.
+- **Self-routing.** `d7dca7a` is now ported (`fork_virtual_url.rs`) and
+  `clicklocal.mjs` is green on both steps offline, but Wildberries is unchanged.
+
+**What is left, and the next thing to try: frame realms.** Wildberries serves
+`challenge_vm_fp`, `behavior-tracker` and `challenge-solver`, all of which load
+and run without a console error, and the widget stack is the same shape as
+Turnstile's. The fork's whole frame-realm effort (`bc1cd60`, `e43e651`,
+`f11e748`, `ba3d9d8`, `99426aa`, `ce18b78`) is still unported, including
+"make shadow roots real nodes and load iframe src attributes". If the challenge
+runs inside an iframe, nothing in it executes here today. Port that next and
+re-measure before considering anything else.
 
 Plain `ab.mjs` is a weaker control and should not be read as "we beat Chrome":
 it launches Chrome through Playwright with the automation tells left on. Under
