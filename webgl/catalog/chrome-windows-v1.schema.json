@@ -1,0 +1,596 @@
+{
+  "$defs": {
+    "baseProfile": {
+      "additionalProperties": false,
+      "properties": {
+        "architecture": {
+          "const": "x86"
+        },
+        "bitness": {
+          "const": "64"
+        },
+        "brands": {
+          "items": {
+            "$ref": "#/$defs/brand"
+          },
+          "type": "array"
+        },
+        "browserVersion": {
+          "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$",
+          "type": "string"
+        },
+        "deviceMemory": {
+          "exclusiveMinimum": 0,
+          "type": "number"
+        },
+        "fullVersionList": {
+          "items": {
+            "$ref": "#/$defs/brand"
+          },
+          "type": "array"
+        },
+        "hardwareConcurrency": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "languages": {
+          "items": {
+            "type": "string"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "maxTouchPoints": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "platform": {
+          "const": "Windows"
+        },
+        "platformVersion": {
+          "type": "string"
+        },
+        "userAgent": {
+          "type": "string"
+        },
+        "weight": {
+          "$ref": "#/$defs/weight"
+        }
+      },
+      "required": [
+        "id",
+        "browserVersion",
+        "userAgent",
+        "brands",
+        "fullVersionList",
+        "platform",
+        "platformVersion",
+        "architecture",
+        "bitness",
+        "languages",
+        "hardwareConcurrency",
+        "deviceMemory",
+        "maxTouchPoints",
+        "weight"
+      ],
+      "type": "object"
+    },
+    "brand": {
+      "additionalProperties": false,
+      "properties": {
+        "brand": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "brand",
+        "version"
+      ],
+      "type": "object"
+    },
+    "components": {
+      "additionalProperties": false,
+      "properties": {
+        "webgl1": {
+          "items": {
+            "$ref": "#/$defs/webgl"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "webgl2": {
+          "items": {
+            "$ref": "#/$defs/webgl"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "webgpu": {
+          "items": {
+            "$ref": "#/$defs/webgpu"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "webgpuAdapters": {
+          "items": {
+            "$ref": "#/$defs/webgpuAdapter"
+          },
+          "minItems": 1,
+          "type": "array"
+        },
+        "webgpuLimits": {
+          "items": {
+            "$ref": "#/$defs/webgpuLimits"
+          },
+          "minItems": 1,
+          "type": "array"
+        }
+      },
+      "required": [
+        "webgl1",
+        "webgl2",
+        "webgpu",
+        "webgpuAdapters",
+        "webgpuLimits"
+      ],
+      "type": "object"
+    },
+    "composition": {
+      "additionalProperties": false,
+      "properties": {
+        "baseId": {
+          "$ref": "#/$defs/id"
+        },
+        "graphicsId": {
+          "$ref": "#/$defs/id"
+        },
+        "screenId": {
+          "$ref": "#/$defs/id"
+        }
+      },
+      "required": [
+        "baseId",
+        "graphicsId",
+        "screenId"
+      ],
+      "type": "object"
+    },
+    "graphicsProfile": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "maskedRenderer": {
+          "type": "string"
+        },
+        "maskedVendor": {
+          "type": "string"
+        },
+        "observationsByBrowserVersion": {
+          "additionalProperties": {
+            "$ref": "#/$defs/weight"
+          },
+          "minProperties": 1,
+          "propertyNames": {
+            "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$"
+          },
+          "type": "object"
+        },
+        "preferredCanvasFormat": {
+          "enum": [
+            "bgra8unorm",
+            "rgba8unorm"
+          ]
+        },
+        "unmaskedRenderer": {
+          "type": "string"
+        },
+        "unmaskedVendor": {
+          "type": "string"
+        },
+        "webgl1Id": {
+          "$ref": "#/$defs/id"
+        },
+        "webgl2Id": {
+          "$ref": "#/$defs/id"
+        },
+        "webgpuId": {
+          "$ref": "#/$defs/id"
+        },
+        "weight": {
+          "$ref": "#/$defs/weight"
+        },
+        "wgslLanguageFeatures": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "id",
+        "maskedVendor",
+        "maskedRenderer",
+        "unmaskedVendor",
+        "unmaskedRenderer",
+        "webgl1Id",
+        "webgl2Id",
+        "webgpuId",
+        "preferredCanvasFormat",
+        "wgslLanguageFeatures",
+        "observationsByBrowserVersion",
+        "weight"
+      ],
+      "type": "object"
+    },
+    "id": {
+      "pattern": "^[0-9a-f]{32}$",
+      "type": "string"
+    },
+    "parameter": {
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "enum": [
+            "Array",
+            "Boolean",
+            "Float32Array",
+            "Int32Array",
+            "Number",
+            "String",
+            "Uint32Array"
+          ]
+        },
+        "value": {}
+      },
+      "required": [
+        "type",
+        "value"
+      ],
+      "type": "object"
+    },
+    "screenProfile": {
+      "additionalProperties": false,
+      "properties": {
+        "availHeight": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "availLeft": {
+          "type": "integer"
+        },
+        "availTop": {
+          "type": "integer"
+        },
+        "availWidth": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "colorDepth": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "devicePixelRatio": {
+          "exclusiveMinimum": 0,
+          "type": "number"
+        },
+        "height": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "innerHeight": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "innerWidth": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "outerHeight": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "outerWidth": {
+          "minimum": 0,
+          "type": "integer"
+        },
+        "pixelDepth": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "screenX": {
+          "type": "integer"
+        },
+        "screenY": {
+          "type": "integer"
+        },
+        "weight": {
+          "$ref": "#/$defs/weight"
+        },
+        "width": {
+          "minimum": 1,
+          "type": "integer"
+        }
+      },
+      "required": [
+        "id",
+        "width",
+        "height",
+        "availWidth",
+        "availHeight",
+        "availLeft",
+        "availTop",
+        "colorDepth",
+        "pixelDepth",
+        "devicePixelRatio",
+        "innerWidth",
+        "innerHeight",
+        "outerWidth",
+        "outerHeight",
+        "screenX",
+        "screenY",
+        "weight"
+      ],
+      "type": "object"
+    },
+    "sourceDigests": {
+      "additionalProperties": false,
+      "properties": {
+        "profilesBytes": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "profilesFiles": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "profilesSha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "windowsBytes": {
+          "minimum": 1,
+          "type": "integer"
+        },
+        "windowsSha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "windowsSha256",
+        "windowsBytes",
+        "profilesSha256",
+        "profilesFiles",
+        "profilesBytes"
+      ],
+      "type": "object"
+    },
+    "target": {
+      "additionalProperties": false,
+      "properties": {
+        "browser": {
+          "const": "Chrome"
+        },
+        "defaultBrowserMajor": {
+          "const": 145
+        },
+        "graphicsApiBrowserMajor": {
+          "const": 145
+        },
+        "graphicsApiRevision": {
+          "const": "145.0.7632.75"
+        },
+        "graphicsBackend": {
+          "const": "ANGLE/D3D11"
+        },
+        "os": {
+          "const": "Windows"
+        },
+        "transportBrowserMajors": {
+          "items": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "minItems": 1,
+          "type": "array",
+          "uniqueItems": true
+        }
+      },
+      "required": [
+        "browser",
+        "defaultBrowserMajor",
+        "graphicsApiBrowserMajor",
+        "graphicsApiRevision",
+        "transportBrowserMajors",
+        "os",
+        "graphicsBackend"
+      ],
+      "type": "object"
+    },
+    "webgl": {
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "initialState": {
+          "additionalProperties": {
+            "$ref": "#/$defs/parameter"
+          },
+          "type": "object"
+        },
+        "parameters": {
+          "additionalProperties": {
+            "$ref": "#/$defs/parameter"
+          },
+          "type": "object"
+        }
+      },
+      "required": [
+        "id",
+        "contextAttributes",
+        "parameters",
+        "initialState",
+        "extensions",
+        "supportedExtensions",
+        "shaderPrecisionFormats",
+        "version",
+        "shadingLanguageVersion",
+        "maxAnisotropy"
+      ],
+      "type": "object"
+    },
+    "webgpu": {
+      "additionalProperties": false,
+      "properties": {
+        "adapters": {
+          "additionalProperties": false,
+          "properties": {
+            "default": {
+              "$ref": "#/$defs/id"
+            },
+            "highPerformance": {
+              "$ref": "#/$defs/id"
+            },
+            "lowPower": {
+              "$ref": "#/$defs/id"
+            }
+          },
+          "required": [
+            "default"
+          ],
+          "type": "object"
+        },
+        "id": {
+          "$ref": "#/$defs/id"
+        }
+      },
+      "required": [
+        "id",
+        "adapters"
+      ],
+      "type": "object"
+    },
+    "webgpuAdapter": {
+      "additionalProperties": false,
+      "properties": {
+        "defaultDeviceLimitsId": {
+          "$ref": "#/$defs/id"
+        },
+        "features": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array",
+          "uniqueItems": true
+        },
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "info": {
+          "type": "object"
+        },
+        "limitsId": {
+          "$ref": "#/$defs/id"
+        }
+      },
+      "required": [
+        "id",
+        "info",
+        "features",
+        "limitsId",
+        "defaultDeviceLimitsId"
+      ],
+      "type": "object"
+    },
+    "webgpuLimits": {
+      "additionalProperties": false,
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/id"
+        },
+        "values": {
+          "type": "object"
+        }
+      },
+      "required": [
+        "id",
+        "values"
+      ],
+      "type": "object"
+    },
+    "weight": {
+      "minimum": 1,
+      "type": "integer"
+    }
+  },
+  "$id": "https://obscura.dev/schema/chrome-windows-v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "baseProfiles": {
+      "items": {
+        "$ref": "#/$defs/baseProfile"
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "catalogId": {
+      "const": "chrome-windows-v1"
+    },
+    "components": {
+      "$ref": "#/$defs/components"
+    },
+    "defaultComposition": {
+      "$ref": "#/$defs/composition"
+    },
+    "graphicsProfiles": {
+      "items": {
+        "$ref": "#/$defs/graphicsProfile"
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "schemaVersion": {
+      "const": 1
+    },
+    "screenProfiles": {
+      "items": {
+        "$ref": "#/$defs/screenProfile"
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "sourceDigests": {
+      "$ref": "#/$defs/sourceDigests"
+    },
+    "target": {
+      "$ref": "#/$defs/target"
+    }
+  },
+  "required": [
+    "schemaVersion",
+    "catalogId",
+    "target",
+    "sourceDigests",
+    "defaultComposition",
+    "baseProfiles",
+    "screenProfiles",
+    "graphicsProfiles",
+    "components"
+  ],
+  "title": "Obscura Chrome Windows fingerprint catalog",
+  "type": "object"
+}

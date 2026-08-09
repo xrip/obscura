@@ -1,2 +1,10 @@
 target/
 .DS_Store
+
+# fork-only: local capture output and the GeoIP database
+geoip.mmdb
+/webgl/window.json
+/webgl/profiles/
+/webgl/.obscura-runtime/
+/webgl/window.json.obscura-new
+/webgl/window.json.obscura-backup

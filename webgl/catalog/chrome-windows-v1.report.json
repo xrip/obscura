@@ -1,0 +1,171 @@
+{
+  "accepted": {
+    "baseObservations": 602,
+    "defaultMajorGraphicsObservations": 100,
+    "graphicsObservations": 592,
+    "windowGroups": 92
+  },
+  "assumptions": [
+    "Chrome 145 remains the fixed default browser major",
+    "every valid Windows Chrome profile is selectable",
+    "a browser major without an exact wreq transport uses the nearest available transport and emits a runtime warning",
+    "the graphics API shape remains pinned to Chromium 145 and non-145 profiles emit a runtime warning"
+  ],
+  "bannedFieldScan": {
+    "fields": [
+      "clientName",
+      "subscriptionExpires",
+      "chargeMoney",
+      "profileExpires",
+      "textureHashs",
+      "computeBenchmark",
+      "raytraceBenchmark",
+      "advancedFingerprint2025"
+    ],
+    "passed": true
+  },
+  "browserMajorObservations": {
+    "143": 100,
+    "144": 100,
+    "145": 100,
+    "147": 100,
+    "148": 100,
+    "150": 102
+  },
+  "browserVersionObservations": {
+    "143.0.7499.109": 15,
+    "143.0.7499.110": 14,
+    "143.0.7499.111": 19,
+    "143.0.7499.146": 11,
+    "143.0.7499.147": 14,
+    "143.0.7499.40": 13,
+    "143.0.7499.41": 6,
+    "143.0.7499.42": 8,
+    "144.0.7559.59": 51,
+    "144.0.7559.60": 49,
+    "145.0.7632.109": 4,
+    "145.0.7632.110": 10,
+    "145.0.7632.111": 9,
+    "145.0.7632.116": 7,
+    "145.0.7632.117": 4,
+    "145.0.7632.118": 8,
+    "145.0.7632.26": 5,
+    "145.0.7632.45": 6,
+    "145.0.7632.46": 7,
+    "145.0.7632.68": 8,
+    "145.0.7632.75": 14,
+    "145.0.7632.76": 8,
+    "145.0.7632.77": 10,
+    "147.0.7727.101": 13,
+    "147.0.7727.102": 5,
+    "147.0.7727.103": 11,
+    "147.0.7727.116": 14,
+    "147.0.7727.117": 10,
+    "147.0.7727.118": 5,
+    "147.0.7727.24": 7,
+    "147.0.7727.49": 5,
+    "147.0.7727.50": 7,
+    "147.0.7727.55": 6,
+    "147.0.7727.56": 4,
+    "147.0.7727.57": 13,
+    "148.0.7778.167": 5,
+    "148.0.7778.168": 7,
+    "148.0.7778.169": 7,
+    "148.0.7778.178": 5,
+    "148.0.7778.179": 7,
+    "148.0.7778.180": 9,
+    "148.0.7778.181": 11,
+    "148.0.7778.216": 8,
+    "148.0.7778.217": 9,
+    "148.0.7778.218": 8,
+    "148.0.7778.56": 3,
+    "148.0.7778.96": 6,
+    "148.0.7778.97": 6,
+    "148.0.7778.98": 9,
+    "150.0.7871.101": 6,
+    "150.0.7871.102": 12,
+    "150.0.7871.114": 26,
+    "150.0.7871.116": 12,
+    "150.0.7871.124": 6,
+    "150.0.7871.125": 6,
+    "150.0.7871.127": 13,
+    "150.0.7871.187": 2,
+    "150.0.7871.24": 6,
+    "150.0.7871.47": 13
+  },
+  "catalogBytes": 1446621,
+  "catalogId": "chrome-windows-v1",
+  "catalogLimitBytes": 2097152,
+  "exactOverlap": {
+    "baseProfiles": 602,
+    "fullProfiles": 306,
+    "screenProfiles": 310
+  },
+  "input": {
+    "profileFiles": 612,
+    "profileRecords": 612,
+    "windowGroups": 92,
+    "windowObservations": 227
+  },
+  "rejected": {
+    "profiles": [
+      {
+        "reason": "record 0 graphics: default WebGPU adapter is missing",
+        "sourceIndex": 335
+      },
+      {
+        "reason": "record 0 graphics: missing adapter",
+        "sourceIndex": 365
+      },
+      {
+        "reason": "record 0 graphics: default WebGPU adapter is missing",
+        "sourceIndex": 384
+      },
+      {
+        "reason": "record 0 graphics: default WebGPU adapter is missing",
+        "sourceIndex": 400
+      },
+      {
+        "reason": "record 0 graphics: default WebGPU adapter is missing",
+        "sourceIndex": 413
+      },
+      {
+        "reason": "record 0 graphics: default WebGPU adapter is missing",
+        "sourceIndex": 431
+      },
+      {
+        "reason": "record 0 graphics: default WebGPU adapter is missing",
+        "sourceIndex": 445
+      },
+      {
+        "reason": "record 0 graphics: default WebGPU adapter is missing",
+        "sourceIndex": 483
+      },
+      {
+        "reason": "record 0 graphics: default WebGPU adapter is missing",
+        "sourceIndex": 490
+      },
+      {
+        "reason": "record 0 graphics: default WebGPU adapter is missing",
+        "sourceIndex": 492
+      }
+    ],
+    "windows": []
+  },
+  "schemaValidation": "passed",
+  "schemaVersion": 1,
+  "skipped": {
+    "nonWindowsProfiles": 10
+  },
+  "status": "valid",
+  "unique": {
+    "baseProfiles": 367,
+    "graphicsProfiles": 427,
+    "screenProfiles": 226,
+    "webgl1Components": 10,
+    "webgl2Components": 19,
+    "webgpuAdapterComponents": 561,
+    "webgpuComponents": 360,
+    "webgpuLimitsComponents": 16
+  }
+}

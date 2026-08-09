@@ -1,0 +1,16 @@
+{
+  "adapterInfo": {
+    "vendor": "intel",
+    "architecture": "gen-12lp",
+    "device": "",
+    "description": ""
+  },
+  "info": {},
+  "isFallbackAdapter": false,
+  "features": ["texture-compression-bc", "shader-f16"],
+  "limits": {"maxBufferSize": 268435456, "minUniformBufferOffsetAlignment": 256},
+  "deviceLimits": {"maxBufferSize": 268435456, "minUniformBufferOffsetAlignment": 256},
+  "textureHashs": [
+    {"format": "bc1-rgba-unorm", "supported": false, "usage": 3}
+  ]
+}
