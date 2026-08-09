@@ -159,11 +159,25 @@ Chrome over raw CDP using `Page.navigate` and `Runtime.evaluate` only, never
 | **Chrome headful, same flags** | **28 product links** | **2/2 opened** |
 | Obscura `--stealth` | 0 product links, 40 requests | 0/0 |
 
-Only headless versus headful changed between the first two rows. Wildberries
-serves the challenge to headless Chrome and to Obscura, and the real page to
-headful Chrome. So `live_product_smoke` is not currently measuring whether our
-fingerprint is convincing; it is measuring whether we look headful. Find the
-signal that separates those two Chrome runs before spending more on the profile.
+**That conclusion was wrong, and the correction matters more than the result.**
+Reading the actual body each engine receives, rather than counting links:
+
+| engine | what Wildberries returns |
+|---|---|
+| Chrome headful | the real shop page, 19 scripts |
+| Chrome headless | *"Подозрительная активность... Новая попытка через 00:55"* |
+| Obscura | the `no-js-title` browser-check page |
+
+The headless run is **rate limited**, not fingerprint-blocked: that page is a
+timed retry tied to the exit IP, produced after a session of repeated requests
+from this address. So headless and headful were not a controlled comparison at
+all, and "the discriminator is headless" does not follow from it. Obscura gets a
+third, different page again, so it is not the same failure either.
+
+This is exactly what `tools/ab/README.md` warns about: a throttled run looks
+exactly like a fingerprinting failure. Before drawing any conclusion from these
+three sites, let the IP cool down or use another exit, and always read the
+returned body rather than a link count.
 
 Plain `ab.mjs` is a weaker control and should not be read as "we beat Chrome":
 it launches Chrome through Playwright with the automation tells left on. Under

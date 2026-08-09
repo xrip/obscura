@@ -16,6 +16,8 @@ import { WebSocket } from 'node:http';
 
 const file = process.argv[2];
 const headed = process.argv.includes('--headed');
+const urlArg = (process.argv.includes('--url') && process.argv[process.argv.indexOf('--url') + 1]) || 'about:blank';
+const sizeArg = process.argv.includes('--window-size') && process.argv[process.argv.indexOf('--window-size') + 1];
 if (!file) { console.error('usage: probe-chrome.mjs <file.js> [--headed]'); process.exit(2); }
 const expression = readFileSync(file, 'utf8');
 
@@ -39,6 +41,7 @@ const args = [
   '--password-store=basic',
 ];
 if (!headed) args.push('--headless=new');
+if (sizeArg) args.push(`--window-size=${sizeArg}`);
 
 const chrome = spawn(chromePath, args, { stdio: 'ignore', windowsHide: true });
 const sleep = ms => new Promise(done => setTimeout(done, ms));
@@ -78,8 +81,8 @@ try {
     close: () => socket.close(),
   };
 
-  await cdp.send('Page.navigate', { url: 'about:blank' });
-  await sleep(1200);
+  await cdp.send('Page.navigate', { url: urlArg });
+  await sleep(urlArg === 'about:blank' ? 1200 : 9000);
   const result = await cdp.send('Runtime.evaluate', {
     expression, returnByValue: true, awaitPromise: true,
   });
