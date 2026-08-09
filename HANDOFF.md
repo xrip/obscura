@@ -1,5 +1,40 @@
 # Handoff
 
+## Rebuild in progress (branch `webgl+webgpu-v2`)
+
+The old branch `webgl+webgpu` is frozen at `e1562bf` (tag `pre-rebuild`). The
+abandoned merge of upstream's render drop is kept, with conflict markers, on
+branch `merge-attempt-snapshot`. The fork is being rebuilt stage by stage on top
+of upstream. Everything below this section still describes the old branch and is
+rewritten at the end of the rebuild.
+
+Ports come from tag `port-src` = `ce18b78`.
+
+### Upstream baseline, measured before any fork code landed
+
+At `97124ed`, on Windows 11:
+
+```
+cargo build --release -p obscura-cli --bins --features stealth      # exit 0
+cargo nextest run --release --workspace --features stealth --no-fail-fast
+```
+
+**1075 tests: 1045 passed, 30 failed, 4 skipped.** All 30 failures are
+upstream's, on a clean checkout, before we added anything. Any failure outside
+this list is ours.
+
+| count | failure | cause |
+|---|---|---|
+| 17 | `obscura-render dom::tests::*` | layout and text shaping differ on Windows. The vendored `taffy` and `cosmic-text` patches are active (`cargo tree` resolves taffy to `vendor/taffy`), so this is not a misconfigured checkout. |
+| 11 | `obscura-render::layout_test *` | same cause. Example: `legacy_center_keeps_block_flow_and_centers_descendants` asserts a centered table box and gets `Rect { x: 0.0, y: 80.0, width: 400.0, height: 40.0 }`. |
+| 1 | `obscura-net wreq_client::tests::stealth_client_decodes_gzip_response` | the test's own fixture is on `127.0.0.1` and the SSRF gate blocks it. `OBSCURA_ALLOW_PRIVATE_NETWORK=1` fixes this one but then breaks two `ssrf_tests`, so the gate stays on and the test needs a per-test allowance. This is what `e1562bf` fixed on the old branch; re-derive it in stage 6. |
+| 1 | `obscura-cdp::max_connections_cap max_connections_refuses_then_recovers` | pre-existing, also failed on the old branch. |
+
+`live_product_smoke` is not in this list because it is a fork test and has not
+landed yet. It was already failing before this work, verified at `f508c5b`.
+
+---
+
 Branch `webgl+webgpu`, at `6a02338`, with local child-frame CDP changes.
 
 ## What this project is
