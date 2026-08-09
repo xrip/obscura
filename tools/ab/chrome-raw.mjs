@@ -170,8 +170,28 @@ try {
     }
   }
   console.log(`${opened}/${picked.length} cards opened`);
-  cdp.close();
 } finally {
+  // Ask Chrome to shut itself down before killing anything. On Windows the
+  // spawned process is only a launcher stub: child.kill() reaps the stub and
+  // leaves the real browser running, which with --headed means a window the
+  // user has to close by hand. Browser.close takes the whole tree down.
+  try { await cdp.send('Browser.close'); } catch { /* already gone */ }
+  try { cdp.close(); } catch { /* already closed */ }
+  await sleep(500);
   chrome.kill();
+  // Backstop for the stub case: kill anything still holding this run's
+  // throwaway profile. Scoped to that directory so a user's own Chrome, and
+  // any other run of this script, are never touched.
+  if (process.platform === 'win32') {
+    try {
+      const { execFileSync } = await import('node:child_process');
+      const leaf = profileDir.split(/[\/]/).pop();
+      execFileSync('powershell', ['-NoProfile', '-Command',
+        `Get-CimInstance Win32_Process -Filter "Name='chrome.exe'" |` +
+        ` Where-Object { $_.CommandLine -like '*${leaf}*' } |` +
+        ` ForEach-Object { taskkill /PID $_.ProcessId /T /F }`,
+      ], { stdio: 'ignore' });
+    } catch { /* best effort */ }
+  }
   try { rmSync(profileDir, { recursive: true, force: true }); } catch { /* best effort */ }
 }
