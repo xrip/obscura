@@ -24,6 +24,12 @@ fn splice_fork_modules(bootstrap: &str) -> String {
             "/* __OBSCURA_GRAPHICS_PAGE_INIT__ */",
             &[include_str!("js/graphics_page_init.js")],
         ),
+        // Runs later in __obscura_init than the marker above: these need
+        // upstream's per-page performance.timeOrigin/.timing/.memory to exist.
+        (
+            "/* __OBSCURA_FORK_LATE_PAGE_INIT__ */",
+            &[include_str!("js/fork_performance.js")],
+        ),
     ];
     let mut spliced = bootstrap.to_string();
     for (marker, sources) in MODULES {

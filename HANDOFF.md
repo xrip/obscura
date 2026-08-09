@@ -103,6 +103,39 @@ a proof-of-work needing two seconds cannot finish. The sliced settle loop in
 gate. It is `#[ignore]`d, so it stays out of the failure set; drop the attribute
 when stage 4 lands.
 
+**But the settle is not the whole story.** Upstream already ships the escape
+hatch: `OBSCURA_STRICT_SETTLE=1` swaps the quiescence heuristic for the full
+budget, and it works - the same fixture goes from 57 ticks in 647ms to 434 ticks
+in 5001ms. Yet with strict settle on, Ozon and Wildberries still return their
+challenge pages. The fork's sliced settle loop may therefore be unnecessary:
+test against `OBSCURA_STRICT_SETTLE` before porting it.
+
+#### What actually blocked Ozon: `performance` was an object literal
+
+With strict settle on, the Ozon challenge threw:
+
+```
+TypeError: performance[b[127]].toJSON is not a function
+```
+
+Upstream builds `performance` as a plain object with every method as an own
+property, so `constructor.name` was `Object`, `Object.prototype.toString` gave
+`[object Object]`, and no `toJSON` existed on `performance`, `.timing` or
+`.navigation`. Chrome has all of them. `performance.navigation` was missing
+outright.
+
+`js/fork_performance.js` reshapes the object in place at the new
+`/* __OBSCURA_FORK_LATE_PAGE_INIT__ */` marker, after upstream assigns
+`timeOrigin`/`timing`/`memory` per page. In place, never replaced: bootstrap
+hands the same reference to other realms and reassigns those fields on every
+navigation. Covered by
+`crates/obscura-browser/tests/fork_performance_interface.rs`.
+
+Result: the exception is gone, the console is clean, and Ozon's challenge now
+runs to completion and clears its own challenge element. It still does not pass
+- the page ends on Ozon's "Похоже, нет соединения" with no clearance cookie -
+so there is at least one more gap behind this one. Wildberries is unchanged.
+
 The identity itself is not implicated. Verified directly with proxies cleared:
 exit IP `46.160.251.166` on both the plain and stealth paths, and a
 cross-surface probe in which `userAgent`, `appVersion`, `platform`, `vendor`,

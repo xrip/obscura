@@ -13942,6 +13942,7 @@ globalThis.__obscura_init = function() {
     usedJSHeapSize: Math.floor(_totalHeap * (0.3 + _fpRand(621) * 0.5)),
   };
   globalThis.Notification.permission = "default";
+  /* __OBSCURA_FORK_LATE_PAGE_INIT__ */
 
   // userAgentData brands and getHighEntropyValues now derive the Chrome
   // version from navigator.userAgent and read the platform from the page
