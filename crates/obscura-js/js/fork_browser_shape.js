@@ -25,6 +25,10 @@ function _forkLiftToPrototype(Ctor, instance, brand) {
   if (typeof Ctor !== 'function' || !instance) return;
   const store = new Map();
   for (const key of Object.getOwnPropertyNames(instance)) {
+    // Engine privates stay on the instance. Lifting `_w`/`_availH` onto
+    // Screen.prototype would publish upstream's internals under a name no
+    // browser has, which is worse than the own-property shape being fixed.
+    if (key.startsWith('_')) continue;
     const d = Object.getOwnPropertyDescriptor(instance, key);
     if (!d || !d.configurable) continue;
     if (typeof d.value === 'function') {
@@ -94,6 +98,13 @@ if (globalThis.screen) {
   }
   _forkLiftToPrototype(globalThis.Screen, globalThis.screen, 'Screen');
 }
+
+// These three still carried their members as own properties of the instance;
+// fork_interfaces.js only moved methods. Same treatment as navigator and screen:
+// in Chrome every one of them is an accessor on the interface prototype.
+_forkLiftToPrototype(globalThis.NavigatorUAData, globalThis.navigator && navigator.userAgentData, 'NavigatorUAData');
+_forkLiftToPrototype(globalThis.ScreenOrientation, globalThis.screen && screen.orientation, 'ScreenOrientation');
+_forkLiftToPrototype(globalThis.MediaDevices, globalThis.navigator && navigator.mediaDevices, 'MediaDevices');
 
 // Every page in Chrome has isSecureContext. Derived from the document's own
 // origin, matching the rule WebGPU already uses in graphics.js.
