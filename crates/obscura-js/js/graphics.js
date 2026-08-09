@@ -189,6 +189,12 @@ const _ObscuraHTMLCanvasElement = class HTMLCanvasElement extends Element {
   // token. Taking a plain nid here keeps those three sites untouched. Upstream
   // does not guard its element constructors either, so this matches it.
   constructor(nid) {
+    // Chrome throws for `new HTMLCanvasElement()`. Upstream's element factory
+    // always passes the numeric node id, so the argument type separates an
+    // engine construction from a page one without needing a private token.
+    if (typeof nid !== 'number') {
+      throw new TypeError("Failed to construct 'HTMLCanvasElement': Illegal constructor");
+    }
     super(nid);
     const w = _canvasAttributeSize(super.getAttribute('width'), 300);
     const h = _canvasAttributeSize(super.getAttribute('height'), 150);

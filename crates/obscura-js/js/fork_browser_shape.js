@@ -115,3 +115,18 @@ if (globalThis.isSecureContext === undefined) {
 if (globalThis.chrome && globalThis.chrome.runtime !== undefined) {
   try { delete globalThis.chrome.runtime; } catch (_) { /* not configurable */ }
 }
+
+// Every builtin on window reports its own name in Chrome:
+//
+//   setTimeout.toString() === 'function setTimeout() { [native code] }'
+//
+// Upstream assigns several as anonymous arrows (`globalThis.setTimeout = (...)
+// => {}`), and assigning to a member expression does not name a function, so
+// they printed as `function () { [native code] }`. Named here rather than at
+// each definition, so the fix survives upstream adding more.
+for (const _name of Object.getOwnPropertyNames(globalThis)) {
+  const _d = Object.getOwnPropertyDescriptor(globalThis, _name);
+  if (!_d || typeof _d.value !== 'function' || _d.value.name !== '') continue;
+  try { Object.defineProperty(_d.value, 'name', { value: _name, configurable: true }); }
+  catch (_) { /* frozen builtin */ }
+}

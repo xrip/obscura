@@ -63,6 +63,12 @@ _forkBrandInstance('MediaDevices', globalThis.navigator && navigator.mediaDevice
 _forkBrandInstance('NavigatorUAData', globalThis.navigator && navigator.userAgentData);
 _forkBrandInstance('ScreenOrientation', globalThis.screen && screen.orientation);
 
+// Chrome exposes these two on window with no instance behind them on an
+// ordinary page: NavigatorManagedData for enterprise policy, ProtectedAudience
+// for the Privacy Sandbox. Their absence is checkable.
+_forkInterface('NavigatorManagedData');
+_forkInterface('ProtectedAudience');
+
 // Element interfaces Chrome exposes that upstream has no class for. They are
 // real constructors in a browser, so `Element` alone is not enough.
 if (typeof Element === 'function') {
