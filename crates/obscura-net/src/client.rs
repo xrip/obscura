@@ -987,13 +987,20 @@ fn response_cache_lifetime(response: &Response) -> Option<Duration> {
 /// User-Agent string, using Chromium's per-major-version GREASE algorithm so
 /// the non-stealth HTTP path agrees with navigator.userAgentData instead of
 /// shipping a fixed Linux/Chrome-145 hint that contradicts a Windows profile.
-fn chrome_client_hints(ua: &str) -> (String, String) {
-    let major: usize = ua
+///
+/// Fork: `pub(crate)` for the stealth client, and no Chrome-145 fallback. The
+/// default UA is now empty until a profile supplies one, and inventing hints for
+/// a version nobody selected is exactly the contradiction this function exists
+/// to avoid. No UA means no hints.
+pub(crate) fn chrome_client_hints(ua: &str) -> (String, String) {
+    let Some(major) = ua
         .split("Chrome/")
         .nth(1)
         .and_then(|s| s.split('.').next())
         .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(145);
+    else {
+        return (String::new(), String::new());
+    };
     const GREASE_CHARS: [char; 11] = [' ', '(', ':', '-', '.', '/', ')', ';', '=', '?', '_'];
     const GREASE_VER: [&str; 3] = ["8", "99", "24"];
     const PERMS: [[usize; 3]; 6] = [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]];
@@ -1045,9 +1052,11 @@ impl ObscuraHttpClient {
             client: tokio::sync::OnceCell::new(),
             proxy_url: proxy_url.map(|s| s.to_string()),
             cookie_jar,
-            user_agent: RwLock::new(
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36".to_string(),
-            ),
+            // Fork: BrowserContext replaces this with the selected profile's UA
+            // before the client is used. Keep the transport identity empty until
+            // a profile supplies it rather than inventing a Linux Chrome string
+            // that contradicts the Windows profile the page reports.
+            user_agent: RwLock::new(String::new()),
             extra_headers: RwLock::new(HashMap::new()),
             interceptor: RwLock::new(None),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -1061,6 +1070,10 @@ impl ObscuraHttpClient {
     async fn get_client(&self) -> &Client {
         self.client.get_or_init(|| async {
             let mut builder = Client::builder()
+                // Fork: never inherit HTTP_PROXY/HTTPS_PROXY from the environment.
+                // A proxy left in the shell once sent a run through an exit it
+                // never asked for. A proxy arrives only via --proxy/OBSCURA_PROXY.
+                .no_proxy()
                 .redirect(Policy::none())
                 .timeout(self.timeout)
                 .danger_accept_invalid_certs(false)

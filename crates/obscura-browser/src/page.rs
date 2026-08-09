@@ -875,9 +875,20 @@ impl Page {
             // http://, which only works when the upstream happens to be a
             // Clash-style mixed-mode proxy and breaks plain SOCKS5 servers
             // like `ssh -ND` (#160).
-            Some(Arc::new(StealthHttpClient::with_proxy(
+            // Fork: the transport identity is the selected fingerprint profile's,
+            // so the TLS fingerprint, the UA on the wire, and what navigator
+            // reports all come from one source.
+            Some(Arc::new(StealthHttpClient::with_browser_identity(
                 context.cookie_jar.clone(),
                 context.proxy_url.as_deref(),
+                &context.user_agent,
+                &context.fingerprint_profile.navigator.sec_ch_ua_header(),
+                &context
+                    .fingerprint_profile
+                    .navigator
+                    .sec_ch_ua_platform_header(),
+                context.fingerprint_profile.browser.major,
+                context.allow_private_network,
             )))
         } else {
             None

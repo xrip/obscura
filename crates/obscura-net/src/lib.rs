@@ -5,6 +5,8 @@ pub mod interceptor;
 pub mod robots;
 pub mod blocklist;
 #[cfg(feature = "stealth")]
+mod transport_profile;
+#[cfg(feature = "stealth")]
 pub mod wreq_client;
 
 pub use client::{

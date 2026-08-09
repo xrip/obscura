@@ -122,6 +122,14 @@ async fn read_wreq_body_limited(
 #[cfg(feature = "stealth")]
 pub struct StealthHttpClient {
     client: wreq::Client,
+    // Fork: the wire identity comes from the selected fingerprint profile, so it
+    // is stored here rather than left to the one pinned emulation profile.
+    user_agent: String,
+    sec_ch_ua: String,
+    sec_ch_ua_platform: String,
+    accept_encoding: String,
+    allow_private_network: bool,
+    transport_browser_major: u32,
     pub cookie_jar: Arc<CookieJar>,
     pub extra_headers: RwLock<HashMap<String, String>>,
     pub in_flight: Arc<std::sync::atomic::AtomicU32>,
@@ -130,16 +138,80 @@ pub struct StealthHttpClient {
 #[cfg(feature = "stealth")]
 impl StealthHttpClient {
     pub fn new(cookie_jar: Arc<CookieJar>) -> Self {
-        Self::with_proxy(cookie_jar, None)
+        Self::with_browser_identity(cookie_jar, None, "", "", "", 0, false)
     }
 
     pub fn with_proxy(cookie_jar: Arc<CookieJar>, proxy_url: Option<&str>) -> Self {
+        Self::with_browser_identity(cookie_jar, proxy_url, "", "", "", 0, false)
+    }
+
+    /// Fork: build the client from a User-Agent, deriving the client hints and
+    /// the transport profile from it.
+    pub fn with_proxy_and_user_agent(
+        cookie_jar: Arc<CookieJar>,
+        proxy_url: Option<&str>,
+        user_agent: &str,
+    ) -> Self {
+        let (sec_ch_ua, sec_ch_ua_platform) = crate::client::chrome_client_hints(user_agent);
+        let browser_major = user_agent
+            .split("Chrome/")
+            .nth(1)
+            .and_then(|value| value.split('.').next())
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(0);
+        Self::with_browser_identity(
+            cookie_jar,
+            proxy_url,
+            user_agent,
+            &sec_ch_ua,
+            &sec_ch_ua_platform,
+            browser_major,
+            false,
+        )
+    }
+
+    /// Fork: the real constructor. Upstream pins one emulation profile; here the
+    /// transport follows the selected fingerprint profile's Chrome major, so the
+    /// TLS fingerprint and the UA on the wire agree with what the page reports.
+    #[allow(clippy::too_many_arguments)]
+    pub fn with_browser_identity(
+        cookie_jar: Arc<CookieJar>,
+        proxy_url: Option<&str>,
+        user_agent: &str,
+        sec_ch_ua: &str,
+        sec_ch_ua_platform: &str,
+        browser_major: u32,
+        allow_private_network: bool,
+    ) -> Self {
+        let (transport_browser_major, transport_profile) =
+            crate::transport_profile::chrome_transport_profile(browser_major);
+        if transport_browser_major != browser_major {
+            crate::transport_profile::warn_transport_mismatch_once(
+                browser_major,
+                transport_browser_major,
+            );
+        }
         let emulation_opts = wreq_util::Emulation::builder()
-            .profile(wreq_util::Profile::Chrome145)
+            .profile(transport_profile)
             .platform(wreq_util::Platform::Windows)
             .build();
+        // Read the emulation's own Accept-Encoding so a decoded response is
+        // reported with the encoding the transport actually advertised.
+        let accept_encoding = {
+            use wreq::IntoEmulation as _;
+            emulation_opts
+                .clone()
+                .into_emulation()
+                .headers
+                .get(wreq::header::ACCEPT_ENCODING)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_owned()
+        };
 
         let mut builder = wreq::Client::builder()
+            // Fork: never inherit a proxy from the environment. See client.rs.
+            .no_proxy()
             .emulation(emulation_opts)
             .timeout(Duration::from_secs(30))
             .redirect(wreq::redirect::Policy::none());
@@ -188,10 +260,22 @@ impl StealthHttpClient {
 
         StealthHttpClient {
             client,
+            user_agent: user_agent.to_owned(),
+            sec_ch_ua: sec_ch_ua.to_owned(),
+            sec_ch_ua_platform: sec_ch_ua_platform.to_owned(),
+            accept_encoding,
+            allow_private_network,
+            transport_browser_major,
             cookie_jar,
             extra_headers: RwLock::new(HashMap::new()),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         }
+    }
+
+    /// Fork: which wreq transport profile this client actually got. Differs from
+    /// the profile's Chrome major when the table has no exact match.
+    pub fn transport_browser_major(&self) -> u32 {
+        self.transport_browser_major
     }
 
     pub async fn fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {
@@ -222,7 +306,10 @@ impl StealthHttpClient {
         request: ResourceRequest,
         callbacks: Option<&CallbackRegistry>,
     ) -> Result<Response, ObscuraNetError> {
-        validate_url(url, false)?;
+        // Fork: honour this client's --allow-private-network instead of a hard
+        // `false`. Upstream's own gzip test serves its fixture on 127.0.0.1, so
+        // the stealth path could never reach it.
+        validate_url(url, self.allow_private_network)?;
         validate_request_mode(&request, url)?;
         if url.scheme() == "file" {
             return fetch_file_url(url, request.max_response_bytes).await;
@@ -256,6 +343,22 @@ impl StealthHttpClient {
                 .header("sec-fetch-site", request_fetch_site(&request, &current_url))
                 .header("sec-fetch-mode", request.mode.header_value())
                 .header("sec-fetch-dest", request.destination());
+
+            // Fork: the wire identity comes from the selected fingerprint
+            // profile. Each header is skipped when unset, so a client built
+            // without a profile behaves exactly as upstream's does and the
+            // emulation profile's own headers stand.
+            if !self.user_agent.is_empty() {
+                req = req.header("user-agent", self.user_agent.as_str());
+            }
+            if !self.sec_ch_ua.is_empty() {
+                req = req
+                    .header("sec-ch-ua", self.sec_ch_ua.as_str())
+                    .header("sec-ch-ua-mobile", "?0");
+            }
+            if !self.sec_ch_ua_platform.is_empty() {
+                req = req.header("sec-ch-ua-platform", self.sec_ch_ua_platform.as_str());
+            }
             if request.mode == RequestMode::Navigate {
                 req = req
                     .header("upgrade-insecure-requests", "1")
@@ -285,10 +388,23 @@ impl StealthHttpClient {
                 req = req.header("origin", &request_origin);
             }
 
+            // Fork: report the identity headers the request actually carried,
+            // not just the caller-supplied extras.
+            let mut callback_headers = self.extra_headers.read().await.clone();
+            for (name, value) in [
+                ("user-agent", &self.user_agent),
+                ("sec-ch-ua", &self.sec_ch_ua),
+                ("sec-ch-ua-platform", &self.sec_ch_ua_platform),
+                ("accept-encoding", &self.accept_encoding),
+            ] {
+                if !value.is_empty() {
+                    callback_headers.insert(name.to_string(), value.clone());
+                }
+            }
             let request_info = RequestInfo {
                 url: current_url.clone(),
                 method: "GET".to_string(),
-                headers: self.extra_headers.read().await.clone(),
+                headers: callback_headers,
                 resource_type: request.resource_type,
             };
             if !request_callback_fired {
@@ -333,7 +449,7 @@ impl StealthHttpClient {
                     let next_url = current_url.join(location_str).map_err(|e| {
                         ObscuraNetError::Network(format!("Invalid redirect URL: {}", e))
                     })?;
-                    validate_url(&next_url, false)?;
+                    validate_url(&next_url, self.allow_private_network)?;
                     validate_request_mode(&request, &next_url)?;
                     redirect_tainted |=
                         redirect_taints_origin(&request, &current_url, &next_url);
@@ -398,6 +514,18 @@ impl StealthHttpClient {
             if !cookie_header.is_empty() {
                 req = req.header("cookie", &cookie_header);
             }
+        }
+        // Fork: same profile identity on the explicit-method path.
+        if !self.user_agent.is_empty() {
+            req = req.header("user-agent", self.user_agent.as_str());
+        }
+        if !self.sec_ch_ua.is_empty() {
+            req = req
+                .header("sec-ch-ua", self.sec_ch_ua.as_str())
+                .header("sec-ch-ua-mobile", "?0");
+        }
+        if !self.sec_ch_ua_platform.is_empty() {
+            req = req.header("sec-ch-ua-platform", self.sec_ch_ua_platform.as_str());
         }
         for (k, v) in self.extra_headers.read().await.iter() {
             req = req.header(k.as_str(), v.as_str());
@@ -505,7 +633,19 @@ mod tests {
     #[tokio::test]
     async fn stealth_client_decodes_gzip_response() {
         let port = gzip_fixture().await;
-        let client = StealthHttpClient::new(Arc::new(CookieJar::new()));
+        // Fork: the fixture is on loopback and the SSRF gate blocks that by
+        // default, so build the client with allow_private_network rather than
+        // relying on a process-wide OBSCURA_ALLOW_PRIVATE_NETWORK, which would
+        // break the ssrf_tests running in the same process.
+        let client = StealthHttpClient::with_browser_identity(
+            Arc::new(CookieJar::new()),
+            None,
+            "",
+            "",
+            "",
+            0,
+            true,
+        );
         let url = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
 
         let resp = client.fetch(&url).await.expect("fixture must be reachable");
