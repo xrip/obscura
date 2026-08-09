@@ -254,7 +254,40 @@ Eliminated by measurement, each with the command that did it:
 | frames / shadow DOM | counted on the live page | 0 iframes, 0 shadow hosts |
 | feature/version gate | read `IS_OUTDATED_BROWSER` and its source | false, not a gate |
 
-### The block is transport-level, not JavaScript
+### Correction: the transports are identical, so it is not transport
+
+Measured against `https://tls.peet.ws/api/all`, old build versus this one:
+
+```
+ja4              t13d1011h1_61a7ad8aa9b6_3fcd1a44f3e3   identical
+peetprint_hash   2b6a7b012ebaa2e751d4ab91c639d1a4       identical
+http_version     HTTP/1.1                               identical
+```
+
+Same TLS fingerprint, same peetprint, same protocol version. **The build that
+passes Wildberries and the build that does not are indistinguishable on the
+wire.** So the section below, which concluded the block is transport-level, is
+wrong, and the remaining header-order and `priority` differences cannot be the
+cause either.
+
+Which means the "challenge page arrives as the initial HTML response, therefore
+JavaScript is ruled out" reasoning was also wrong. Both builds are almost
+certainly served the same challenge page; the old one **solves it in JavaScript**
+and reloads into the real page, and this one does not. That is consistent with
+everything observed: the challenge scripts run here, `__vmfp` is present, the
+`x_wbaas_token` cookie is set, and the body simply never advances past 773 bytes.
+
+**So the original diagnostic is the right one after all:** wrap `__vmfp.run` and
+log what it returns, and watch the request the solver posts and the response it
+gets. That separates "the fingerprint is computed and rejected" from "the
+submission never happens". Do that first.
+
+Separately worth fixing regardless of Wildberries: **both builds negotiate
+HTTP/1.1**, and the JA4 `h1` marker shows only `http/1.1` in ALPN. Every real
+Chrome offers `h2` first. That is a real divergence from Chrome, just not the
+one that separates these two builds.
+
+### Superseded: the block is transport-level, not JavaScript
 
 The controlled comparison, run from the same exit IP within the same minute,
 using the journey the fork's own harness defines (home page, then click three
