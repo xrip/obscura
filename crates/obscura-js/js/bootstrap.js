@@ -13377,6 +13377,8 @@ if (typeof MediaQueryList === 'undefined') {
   };
 }
 
+/* __OBSCURA_GRAPHICS_MODULE__ */
+
 if (typeof ImageData === 'undefined') {
   globalThis.ImageData = class ImageData {
     constructor(w, h) {
@@ -13891,6 +13893,7 @@ globalThis.__obscura_init = function() {
   // location.href again, including any redirect target.
   globalThis.__virtualUrl = null;
   _installWasmStreamingFallback();
+  /* __OBSCURA_GRAPHICS_PAGE_INIT__ */
 
   const documentNid = +_dom("document_node_id");
   globalThis.document = new Document(documentNid);

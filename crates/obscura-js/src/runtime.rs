@@ -81,7 +81,8 @@ pub struct RemoteObjectInfo {
 }
 
 pub struct ObscuraJsRuntime {
-    runtime: JsRuntime,
+    // pub(crate) for the fork's graphics.rs, which owns the profile handoff.
+    pub(crate) runtime: JsRuntime,
     state: Rc<RefCell<ObscuraState>>,
     object_store: HashMap<String, String>,
     object_counter: u64,

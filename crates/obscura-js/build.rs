@@ -1,13 +1,54 @@
 use std::path::PathBuf;
 
+/// Fork: the graphics identity layer lives in its own js/ files and is spliced
+/// into bootstrap.js at marker comments, so bootstrap.js carries two comment
+/// lines for the whole layer instead of ~1400 lines of fork code.
+///
+/// Splicing is textual on purpose: the modules declare bindings that must land
+/// inside bootstrap's IIFE for its own code to resolve them lexically.
+///
+/// A missing marker is a hard error. Silently dropping the splice would leave
+/// the engine advertising upstream's empty WebGL stubs under a profile that
+/// promises a real GPU, which is a worse fingerprint than either alone.
+fn splice_fork_modules(bootstrap: &str) -> String {
+    const MODULES: &[(&str, &[&str])] = &[
+        (
+            "/* __OBSCURA_GRAPHICS_MODULE__ */",
+            &[
+                include_str!("js/graphics_shim.js"),
+                include_str!("js/graphics_api_v145.js"),
+                include_str!("js/graphics.js"),
+            ],
+        ),
+        (
+            "/* __OBSCURA_GRAPHICS_PAGE_INIT__ */",
+            &[include_str!("js/graphics_page_init.js")],
+        ),
+    ];
+    let mut spliced = bootstrap.to_string();
+    for (marker, sources) in MODULES {
+        assert!(
+            spliced.contains(marker),
+            "bootstrap.js is missing the fork marker {marker}. An upstream merge \
+             probably dropped it; put it back rather than inlining the module."
+        );
+        spliced = spliced.replace(marker, &sources.join("\n"));
+    }
+    spliced
+}
+
 fn main() {
     println!("cargo:rerun-if-changed=js/bootstrap.js");
+    println!("cargo:rerun-if-changed=js/graphics_shim.js");
+    println!("cargo:rerun-if-changed=js/graphics_api_v145.js");
+    println!("cargo:rerun-if-changed=js/graphics.js");
+    println!("cargo:rerun-if-changed=js/graphics_page_init.js");
     println!("cargo:rerun-if-changed=build.rs");
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let snapshot_path = out_dir.join("OBSCURA_SNAPSHOT.bin");
 
-    let bootstrap_js = include_str!("js/bootstrap.js");
+    let bootstrap_js = splice_fork_modules(include_str!("js/bootstrap.js"));
 
     let output = deno_core::snapshot::create_snapshot(
         deno_core::snapshot::CreateSnapshotOptions {

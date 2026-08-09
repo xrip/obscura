@@ -90,6 +90,48 @@ test to stay red until then.
 Note the Wildberries exit was IPv6 on a Hurricane Electric tunnel
 (`2001:470:...`). Results from that address are not representative.
 
+### Stage 3 result (WebGL and WebGPU identity)
+
+**1109 tests, 1079 passed, 30 failed.** Same count as the baseline, same two
+differences as stage 2: the gzip test fixed, `live_product_smoke` red pending
+stage 4. Three fork tests added, no new failures.
+
+The whole graphics layer costs **three lines in `bootstrap.js`**, all comment
+markers. `crates/obscura-js/build.rs` splices the fork modules in at build time:
+
+| file | role |
+|---|---|
+| `js/graphics.js` | the facade: canvas, WebGL, WebGL2, WebGPU |
+| `js/graphics_api_v145.js` | generated Chrome 145 IDL constants and arities |
+| `js/graphics_shim.js` | the few helpers upstream's bootstrap does not have |
+| `js/graphics_page_init.js` | picks up the profile, per page |
+| `src/graphics.rs` | the Rust side of the profile handoff |
+
+Verified against a live page: WebGL reports the profile's
+`ANGLE (AMD, AMD Radeon(TM) Graphics (0x0000164C) Direct3D11 vs_5_0 ps_5_0, D3D11)`
+with 35 extensions, WebGL2 reports 32 extensions and `MAX_TEXTURE_SIZE` 16384,
+and `navigator.gpu.requestAdapter()` yields a `GPUAdapter` with 9 features,
+`maxBufferSize` 2147483648 and `info.vendor` `amd`, `architecture` `rdna-2` —
+consistent with the WebGL renderer, which is the point.
+
+#### The facade only exists when a profile does
+
+Upstream returns `null` from `getContext('webgl')` on purpose: a shim that
+reports success while every draw is a no-op makes applications take the WebGL
+path and render nothing. Their test
+`unavailable_webgl_context_does_not_claim_success` guards it.
+
+The fork reverses that, which broke the test. The fix was not to edit the test.
+Every value the facade reports is read from the fingerprint profile, so with no
+profile loaded it would be a context backed by nothing, which is exactly what
+upstream objects to. `_canvasGetContext` now returns `null` unless a profile is
+present, and `navigator.gpu` is likewise absent. Upstream's test constructs a
+runtime with no profile, so it passes unchanged, and `runtime.rs` needed no edit
+at all. `crates/obscura-browser/tests/fork_graphics_identity.rs` covers our half.
+
+Also noted while testing: `isSecureContext` is missing from the engine entirely.
+Chrome has it on every page. Not a stage 3 problem, but it is a fingerprint gap.
+
 #### Deferred to stage 5: hiding `Deno` from the page
 
 A page that can see `Deno` is not Chrome. The fork used to delete

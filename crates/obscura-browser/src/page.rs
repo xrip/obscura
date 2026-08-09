@@ -1106,33 +1106,21 @@ impl Page {
         #[cfg(feature = "stealth")]
         if self.stealth_client.is_some() {
             rt.set_stealth(true);
-            rt.set_user_agent(obscura_net::STEALTH_USER_AGENT);
-            rt.set_platform(
-                obscura_net::STEALTH_NAVIGATOR_PLATFORM,
-                obscura_net::STEALTH_UA_PLATFORM,
-                obscura_net::STEALTH_UA_PLATFORM_VERSION,
-            );
-        } else {
-            if let Ok(ua) = self.http_client.user_agent.try_read() {
-                rt.set_user_agent(&ua);
-            }
-            rt.set_platform(
-                &self.context.platform,
-                &self.context.ua_platform,
-                &self.context.ua_platform_version,
-            );
         }
-        #[cfg(not(feature = "stealth"))]
-        {
-            if let Ok(ua) = self.http_client.user_agent.try_read() {
-                rt.set_user_agent(&ua);
-            }
-            rt.set_platform(
-                &self.context.platform,
-                &self.context.ua_platform,
-                &self.context.ua_platform_version,
-            );
+        // Fork: one identity path, stealth or not. Upstream's stealth branch
+        // used the fixed STEALTH_* constants, which contradict any profile that
+        // is not the one they were written for. The context already holds the
+        // selected profile's values, and the transport was built from the same
+        // ones, so page and wire cannot disagree.
+        if let Ok(ua) = self.http_client.user_agent.try_read() {
+            rt.set_user_agent(&ua);
         }
+        rt.set_platform(
+            &self.context.platform,
+            &self.context.ua_platform,
+            &self.context.ua_platform_version,
+        );
+        rt.set_fingerprint_profile(self.context.fingerprint_profile.runtime_json());
         if let Some((lat, lon)) = env_geolocation() {
             rt.set_geolocation(lat, lon);
         }
