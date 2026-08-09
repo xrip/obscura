@@ -294,7 +294,38 @@ protocol. Re-measure over HTTP/2 before treating these as the cause.
 | `priority` | absent | present |
 | `sec-ch-ua` GREASE | `"Not=A?Brand"` | `"Not:A-Brand"` |
 
-**`accept-encoding` is the strongest lead.** Order and spacing are exactly what
+#### Over real HTTPS, old fork versus this branch
+
+The local HTTP/1.1 table above is superseded by this one. Both builds against
+`https://postman-echo.com/headers`, the old fork being the one that passes
+Wildberries:
+
+```
+OLD  host sec-ch-ua sec-ch-ua-mobile sec-fetch-user upgrade-insecure-requests
+     sec-ch-ua-platform accept-encoding accept accept-language sec-fetch-site
+     sec-fetch-mode sec-fetch-dest user-agent
+NEW  host accept-language priority accept-encoding sec-fetch-user
+     upgrade-insecure-requests sec-ch-ua sec-ch-ua-mobile sec-ch-ua-platform
+     user-agent sec-fetch-dest sec-fetch-mode sec-fetch-site accept
+```
+
+Every header *value* matches, including `sec-ch-ua`, `accept-encoding: gzip, br`
+and the user agent. Two differences remain:
+
+1. **Order.** HTTP/2 header order is part of the transport fingerprint.
+2. **`priority`.** This branch sends it, the old fork does not. It is in neither
+   `wreq_client.rs` nor `client.rs`, so it comes from wreq itself, which means
+   the two `Cargo.lock`s resolve different wreq builds or the newer request path
+   enables it.
+
+**Reordering the `.header()` calls does not change the wire order** - tried,
+measured, reverted. wreq owns the ordering, so the fix is at the wreq
+configuration level, not in how our code appends headers. Start there: compare
+the resolved wreq and wreq-util versions between the two lockfiles, and check
+whether the emulation profile is being applied identically on both paths.
+
+**`accept-encoding` is not the difference after all** (both send `gzip, br`
+over HTTPS; the local HTTP/1.1 reading was misleading). The earlier note said: Order and spacing are exactly what
 transport fingerprinting reads, and ours is both reordered and unspaced. It
 comes from the wreq emulation profile, not from our code, so check whether
 wreq's Chrome145 emulation is what emits it before changing anything.
