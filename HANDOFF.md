@@ -33,6 +33,24 @@ this list is ours.
 `live_product_smoke` is not in this list because it is a fork test and has not
 landed yet. It was already failing before this work, verified at `f508c5b`.
 
+### Run the suite with `--test-threads 8`
+
+On this 16-core box the full-parallel run starves
+`obscura-cli::mcp_client test_wait_for_selector`. That test spawns the binary,
+navigates, and polls for an `h1` on a hardcoded 5 second budget. Alone it takes
+0.04s; at full parallelism it lands at position ~1103 of 1105, beside the 5-6s
+`obscura-js runtime::tests`, and expires at exactly 5.132s.
+
+It is contention, not a regression: with `--test-threads 8` the fork's failure
+set is byte-identical to the 30 above. Adding fork tests shifts the schedule, so
+use `--test-threads 8` for any comparison against the baseline.
+
+### Stage 2 result (profiles, workbench, GeoIP)
+
+`cargo nextest run --release --workspace --features stealth --no-fail-fast
+--test-threads 8`: **1105 tests, 1075 passed, 30 failed, 4 skipped.** The 30 are
+the same 30. Thirty fork tests added, zero new failures.
+
 ---
 
 Branch `webgl+webgpu`, at `6a02338`, with local child-frame CDP changes.
