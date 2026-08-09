@@ -240,6 +240,65 @@ Two other observations from the same probe, neither a stage 3 problem:
   page. Deliberately left alone until the stealth tests are green.
 - `HTMLImageElement` is enumerable on the global, which is upstream's.
 
+### The method that works: diff the two engines
+
+Porting by reading commits missed things repeatedly. What works is measuring.
+
+```
+git worktree add /c/tmp/obscura-old pre-rebuild
+cd /c/tmp/obscura-old && CARGO_TARGET_DIR=/c/tmp/obscura-old-target   cargo build --release -p obscura-cli --bins --features stealth
+```
+
+Then run the same probe against both binaries and diff the JSON:
+
+```
+obscura fetch about:blank --eval "$(cat /c/tmp/probe/surface.js)"
+```
+
+The probe captures every own global with its descriptor, the prototype shape of
+the interfaces anti-bot code reads, navigator/screen/window values, the
+toString of the usual builtins, error stacks, and the WebGL identity. Compare
+*sets and shapes*, not values: screen size, deviceMemory, hardwareConcurrency
+and devicePixelRatio vary legitimately because the profile rotates per run.
+
+This is how the enumerability gap was found, and it is the only way to be sure a
+port is complete. Keep `/c/tmp/probe/surface.js` or rebuild it from this note.
+
+### Closed by measurement, in `js/fork_*.js`
+
+| gap | before | after |
+|---|---|---|
+| interface objects in `Object.keys(window)` | 138 | 0 |
+| `navigator` own properties | 25 | 0 |
+| `screen` own properties | 9 | 0 |
+| `toString.call(screen)` | `[object Object]` | `[object Screen]` |
+| `Navigator`, `Permissions`, `MediaDevices`, `ScreenOrientation`, `NavigatorUAData`, `Screen`, `HTMLDocument`, `HTMLEmbedElement`, `HTMLSourceElement`, `NavigatorManagedData`, `ProtectedAudience` | absent | present, non-enumerable |
+| `performance` | object literal, 3 timing fields | `Performance` + `PerformanceTiming`, 21 fields |
+| `setTimeout.toString()` | `function () {...}` | `function setTimeout() {...}` |
+| `chrome.runtime` | present | undefined |
+| `isSecureContext` | absent | boolean |
+| `new HTMLCanvasElement()` | no throw | Illegal constructor |
+
+`bootstrap.js` carries **5 marker comments** for all of it and nothing else.
+
+### Still open, measured and ranked
+
+1. **`Element.prototype` and `HTMLElement.prototype` leak 20 engine privates**
+   (`_renderBoxGeometry`, `_loadIframeSrc`, `_popoverAttrValue`, ...). Visible to
+   `Object.getOwnPropertyNames`, so hiding from enumeration is not enough; they
+   need to move off the public prototype. Upstream's, and the old fork build
+   leaked 11 of its own, so this was never solved there either.
+2. **`EventTarget.prototype` carries 51 `Node` constants and `Node.prototype`
+   carries `addEventListener`/`removeEventListener`/`dispatchEvent`.** In Chrome
+   those belong to exactly one of the two. Structural, upstream's.
+3. **`window[0]`..`window[49]`** exist as frame-index accessors with no frames.
+   Chrome has none. `Object.getOwnPropertyNames(window).filter(isNumeric)`.
+4. `Navigator.prototype` exposes 27 members against the fork's 45, because
+   upstream keeps the spoofed ones on an intermediate prototype.
+5. `history` is non-enumerable here and enumerable in Chrome.
+6. `Deno` is still reachable; see below.
+7. `Worker` is a shim that evaluates in the page isolate, not a thread.
+
 #### Deferred to stage 5: hiding `Deno` from the page
 
 A page that can see `Deno` is not Chrome. The fork used to delete
