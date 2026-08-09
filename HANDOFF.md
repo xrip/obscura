@@ -136,6 +136,41 @@ runs to completion and clears its own challenge element. It still does not pass
 - the page ends on Ozon's "Похоже, нет соединения" with no clearance cookie -
 so there is at least one more gap behind this one. Wildberries is unchanged.
 
+#### A/B against real Chrome: the discriminator is headless, not fingerprint
+
+`tools/ab` needs `playwright-core` at `target/test-fixtures/playwright`; there
+is no setup script, so install it there by hand (`npm install
+playwright-core@1.62.1`). The system Chrome is used via `channel: 'chrome'`, so
+no browser download is needed.
+
+Offline first, `clicklocal.mjs`: click geometry agrees between the main and
+utility worlds, the click navigates, and the server sees the request. One real
+failure remains, `spa route: FAILED` - a page that routes itself through
+history is not recorded as navigated. That is fork commit `d7dca7a`, still
+unported.
+
+The important run is Wildberries with `chrome-raw.mjs`, which drives the real
+Chrome over raw CDP using `Page.navigate` and `Runtime.evaluate` only, never
+`Runtime.enable`, with `--disable-blink-features=AutomationControlled`:
+
+| engine | Wildberries home | cards |
+|---|---|---|
+| Chrome `--headless=new`, tells off | 0 product links | 0/0 |
+| **Chrome headful, same flags** | **28 product links** | **2/2 opened** |
+| Obscura `--stealth` | 0 product links, 40 requests | 0/0 |
+
+Only headless versus headful changed between the first two rows. Wildberries
+serves the challenge to headless Chrome and to Obscura, and the real page to
+headful Chrome. So `live_product_smoke` is not currently measuring whether our
+fingerprint is convincing; it is measuring whether we look headful. Find the
+signal that separates those two Chrome runs before spending more on the profile.
+
+Plain `ab.mjs` is a weaker control and should not be read as "we beat Chrome":
+it launches Chrome through Playwright with the automation tells left on. Under
+it, Chrome got HTTP 403 from Ozon (186 byte body) and HTTP 498 from Wildberries
+(17 bytes) while Obscura received the full challenge documents. That says
+Playwright-Chrome is more detectable than Obscura, nothing more.
+
 The identity itself is not implicated. Verified directly with proxies cleared:
 exit IP `46.160.251.166` on both the plain and stealth paths, and a
 cross-surface probe in which `userAgent`, `appVersion`, `platform`, `vendor`,
