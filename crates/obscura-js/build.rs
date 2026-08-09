@@ -31,6 +31,7 @@ fn splice_fork_modules(bootstrap: &str) -> String {
             "/* __OBSCURA_FORK_PAGE_INIT_END__ */",
             &[
                 include_str!("js/fork_browser_shape.js"),
+                include_str!("js/fork_audio_memory.js"),
                 include_str!("js/fork_hide_globals.js"),
             ],
         ),
