@@ -227,14 +227,39 @@ Two candidates were tested and eliminated:
 - **Self-routing.** `d7dca7a` is now ported (`fork_virtual_url.rs`) and
   `clicklocal.mjs` is green on both steps offline, but Wildberries is unchanged.
 
-**What is left, and the next thing to try: frame realms.** Wildberries serves
-`challenge_vm_fp`, `behavior-tracker` and `challenge-solver`, all of which load
-and run without a console error, and the widget stack is the same shape as
-Turnstile's. The fork's whole frame-realm effort (`bc1cd60`, `e43e651`,
-`f11e748`, `ba3d9d8`, `99426aa`, `ce18b78`) is still unported, including
-"make shadow roots real nodes and load iframe src attributes". If the challenge
-runs inside an iframe, nothing in it executes here today. Port that next and
-re-measure before considering anything else.
+**Frame realms are not the answer either, and that is now measured.** The
+Wildberries challenge page has **no iframes and no shadow roots**, so the whole
+frame-realm port (`bc1cd60`, `e43e651`, `f11e748`, `ba3d9d8`, `99426aa`,
+`ce18b78`) cannot be what makes this test pass. Port it for Turnstile, not for
+this.
+
+What is actually true of the challenge page here:
+
+- All five challenge scripts load and **execute**. Their globals are present:
+  `LOAD_START`, `ANTI_SDK_WB_START_TIME`, `ANTI_SDK_WB_1695184013`,
+  `ANALY_S_WB_KEY`, and `__vmfp` with `{bundle, getExported, run}`.
+- No console errors anywhere on the page.
+- `IS_OUTDATED_BROWSER` is `false`. `browser-check.js` only tests
+  `Chrome/(\d+) < 80`, so the UA passes it.
+- The `x_wbaas_token` cookie is set.
+- `document.body` stays at 773 bytes and `readyState` reaches `complete`.
+
+Eliminated by measurement, each with the command that did it:
+
+| candidate | test | result |
+|---|---|---|
+| settle budget | `OBSCURA_STRICT_SETTLE=1`, 9s -> 36s | unchanged |
+| more time | `--wait 30` with strict settle | unchanged, still 773 bytes |
+| self-routing | `d7dca7a` ported, `clicklocal.mjs` green | unchanged |
+| frames / shadow DOM | counted on the live page | 0 iframes, 0 shadow hosts |
+| feature/version gate | read `IS_OUTDATED_BROWSER` and its source | false, not a gate |
+
+**Next diagnostic, not a next fix.** The machinery runs and produces nothing, so
+the question is what `__vmfp.run()` computes and what the solver does with it.
+Instrument it directly: wrap `__vmfp.run` and log its result, and watch for the
+request the solver posts and the response it gets. That distinguishes "the
+fingerprint is rejected" from "the submission never happens", which are
+different bugs. Do that before porting anything else.
 
 Plain `ab.mjs` is a weaker control and should not be read as "we beat Chrome":
 it launches Chrome through Playwright with the automation tells left on. Under
