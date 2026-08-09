@@ -1,877 +1,402 @@
 # Handoff
 
-## Rebuild in progress (branch `webgl+webgpu-v2`)
-
-The old branch `webgl+webgpu` is frozen at `e1562bf` (tag `pre-rebuild`). The
-abandoned merge of upstream's render drop is kept, with conflict markers, on
-branch `merge-attempt-snapshot`. The fork is being rebuilt stage by stage on top
-of upstream. Everything below this section still describes the old branch and is
-rewritten at the end of the rebuild.
-
-Ports come from tag `port-src` = `ce18b78`.
-
-### Upstream baseline, measured before any fork code landed
-
-At `97124ed`, on Windows 11:
-
-```
-cargo build --release -p obscura-cli --bins --features stealth      # exit 0
-cargo nextest run --release --workspace --features stealth --no-fail-fast
-```
-
-**1075 tests: 1045 passed, 30 failed, 4 skipped.** All 30 failures are
-upstream's, on a clean checkout, before we added anything. Any failure outside
-this list is ours.
-
-| count | failure | cause |
-|---|---|---|
-| 17 | `obscura-render dom::tests::*` | layout and text shaping differ on Windows. The vendored `taffy` and `cosmic-text` patches are active (`cargo tree` resolves taffy to `vendor/taffy`), so this is not a misconfigured checkout. |
-| 11 | `obscura-render::layout_test *` | same cause. Example: `legacy_center_keeps_block_flow_and_centers_descendants` asserts a centered table box and gets `Rect { x: 0.0, y: 80.0, width: 400.0, height: 40.0 }`. |
-| 1 | `obscura-net wreq_client::tests::stealth_client_decodes_gzip_response` | the test's own fixture is on `127.0.0.1` and the SSRF gate blocks it. `OBSCURA_ALLOW_PRIVATE_NETWORK=1` fixes this one but then breaks two `ssrf_tests`, so the gate stays on and the test needs a per-test allowance. This is what `e1562bf` fixed on the old branch; re-derive it in stage 6. |
-| 1 | `obscura-cdp::max_connections_cap max_connections_refuses_then_recovers` | pre-existing, also failed on the old branch. |
-
-`live_product_smoke` is not in this list because it is a fork test and has not
-landed yet. It was already failing before this work, verified at `f508c5b`.
-
-### `obscura-cli::mcp_client` is flaky under load
-
-The whole binary is timing-sensitive, not one test in it. Each test spawns the
-`obscura` binary, drives it over MCP, and asserts on a page it just navigated
-to. Under a saturated box the navigation has not finished when the next command
-runs. Two different tests have flaked so far:
-
-- `test_wait_for_selector` polls for an `h1` on a hardcoded 5 second budget.
-  Alone it takes 0.04s; at full parallelism it lands near position 1103 of 1109,
-  beside the 5-6s `obscura-js runtime::tests`, and expires at exactly 5.132s.
-- `test_evaluate` reads `document.title` from a local `TestPageServer` page and
-  gets `""` instead of `"Example Domain"`.
-
-It is contention, not a regression: run alone the binary has been 16/16 on eight
-consecutive runs. It flakes at `--test-threads 8` too, just less often. Compare
-failure *sets* against the baseline rather than counts, and re-run the binary
-alone before treating anything in it as a signal.
-
-### Stage 2 result (profiles, workbench, GeoIP, transport identity)
-
-`cargo nextest run --release --workspace --features stealth --no-fail-fast
---test-threads 8`: **1105 tests run, 30 failed.** Same count as the baseline,
-and the set differs by exactly two entries, both in our favour:
-
-- `stealth_client_decodes_gzip_response` is now **fixed**. The stealth path
-  hardcoded `validate_url(url, false)`, so `--allow-private-network` never
-  reached it and its own `127.0.0.1` fixture was unreachable. It now passes the
-  client's flag, and `obscura-net` is 83/83.
-- `mcp_client test_wait_for_selector` appears, and is the known flake above.
-
-Identity verified on the wire against a local echo server: the plain and the
-stealth path both send the profile's Windows Chrome 145 `user-agent`,
-`sec-ch-ua` and `sec-ch-ua-platform`. No Linux Chrome string on either path.
-
-Roughly 400 lines of fork code were **deleted rather than ported**, because
-upstream now does the same work under different names (`ResourceRequest`,
-`fetch_with_profile`, `request_referrer`, `request_fetch_site`, gzip decoding).
-That also means our old call sites in `page.rs`, `module_loader.rs`, `ops.rs`
-and `runtime.rs` need no porting at all, which shrinks stages 4 and 5.
-
-Stage 2 is closed. Final run: **1106 tests, 1076 passed, 30 failed, 4 skipped**,
-the same count as the baseline. The set differs by two: the gzip test is fixed,
-and our own `live_product_smoke` now runs and fails (see below).
-
-#### `live_product_smoke` needs stage 4, not stage 2
-
-All three sites answer with an anti-bot challenge: Wildberries a browser check,
-Ozon a JavaScript proof-of-work, Avito a SHA-256 proof-of-work with
-`blocked: true`. None of them is a profile problem, and the identity on the wire
-was verified correct.
-
-The cause is the settle, now measured offline rather than inferred. A local
-fixture whose only content is a 10ms `setTimeout` chain, so 200 ticks is about
-two seconds of page time:
-
-| budget | ticks | page time |
-|---|---|---|
-| `settle(500)` | 44 | ~440ms |
-| `settle(2000)` | 57 | ~570ms |
-| CLI, `OBSCURA_DYNAMIC_SCRIPT_SETTLE_MS` 1000 / 5000 / 15000 | 57 / 57 / 58 | ~650ms |
-
-Page time plateaus around 600ms however much is asked for. `settle` returns once
-V8 looks momentarily idle, and a pending timer chain does not count as busy, so
-a proof-of-work needing two seconds cannot finish. The sliced settle loop in
-`ce18b78` is the fix, and it lands in stage 4.
-
-`crates/obscura-browser/tests/fork_settle_budget.rs` pins this as an offline
-gate. It is `#[ignore]`d, so it stays out of the failure set; drop the attribute
-when stage 4 lands.
-
-**But the settle is not the whole story.** Upstream already ships the escape
-hatch: `OBSCURA_STRICT_SETTLE=1` swaps the quiescence heuristic for the full
-budget, and it works - the same fixture goes from 57 ticks in 647ms to 434 ticks
-in 5001ms. Yet with strict settle on, Ozon and Wildberries still return their
-challenge pages. The fork's sliced settle loop may therefore be unnecessary:
-test against `OBSCURA_STRICT_SETTLE` before porting it.
-
-#### What actually blocked Ozon: `performance` was an object literal
-
-With strict settle on, the Ozon challenge threw:
-
-```
-TypeError: performance[b[127]].toJSON is not a function
-```
-
-Upstream builds `performance` as a plain object with every method as an own
-property, so `constructor.name` was `Object`, `Object.prototype.toString` gave
-`[object Object]`, and no `toJSON` existed on `performance`, `.timing` or
-`.navigation`. Chrome has all of them. `performance.navigation` was missing
-outright.
-
-`js/fork_performance.js` reshapes the object in place at the new
-`/* __OBSCURA_FORK_LATE_PAGE_INIT__ */` marker, after upstream assigns
-`timeOrigin`/`timing`/`memory` per page. In place, never replaced: bootstrap
-hands the same reference to other realms and reassigns those fields on every
-navigation. Covered by
-`crates/obscura-browser/tests/fork_performance_interface.rs`.
-
-Result: the exception is gone, the console is clean, and Ozon's challenge now
-runs to completion and clears its own challenge element. It still does not pass
-- the page ends on Ozon's "Похоже, нет соединения" with no clearance cookie -
-so there is at least one more gap behind this one. Wildberries is unchanged.
-
-#### A/B against real Chrome: the discriminator is headless, not fingerprint
-
-`tools/ab` needs `playwright-core` at `target/test-fixtures/playwright`; there
-is no setup script, so install it there by hand (`npm install
-playwright-core@1.62.1`). The system Chrome is used via `channel: 'chrome'`, so
-no browser download is needed.
-
-Offline first, `clicklocal.mjs`: click geometry agrees between the main and
-utility worlds, the click navigates, and the server sees the request. One real
-failure remains, `spa route: FAILED` - a page that routes itself through
-history is not recorded as navigated. That is fork commit `d7dca7a`, still
-unported.
-
-The important run is Wildberries with `chrome-raw.mjs`, which drives the real
-Chrome over raw CDP using `Page.navigate` and `Runtime.evaluate` only, never
-`Runtime.enable`, with `--disable-blink-features=AutomationControlled`:
-
-| engine | Wildberries home | cards |
-|---|---|---|
-| Chrome `--headless=new`, tells off | 0 product links | 0/0 |
-| **Chrome headful, same flags** | **28 product links** | **2/2 opened** |
-| Obscura `--stealth` | 0 product links, 40 requests | 0/0 |
-
-**That conclusion was wrong, and the correction matters more than the result.**
-Reading the actual body each engine receives, rather than counting links:
-
-| engine | what Wildberries returns |
-|---|---|
-| Chrome headful | the real shop page, 19 scripts |
-| Chrome headless | *"Подозрительная активность... Новая попытка через 00:55"* |
-| Obscura | the `no-js-title` browser-check page |
-
-The headless run is **rate limited**, not fingerprint-blocked: that page is a
-timed retry tied to the exit IP, produced after a session of repeated requests
-from this address. So headless and headful were not a controlled comparison at
-all, and "the discriminator is headless" does not follow from it. Obscura gets a
-third, different page again, so it is not the same failure either.
-
-This is exactly what `tools/ab/README.md` warns about: a throttled run looks
-exactly like a fingerprinting failure. Before drawing any conclusion from these
-three sites, let the IP cool down or use another exit, and always read the
-returned body rather than a link count.
-
-#### What Wildberries actually runs, and why this is not a quick fix
-
-Obscura loads the challenge page and every one of its scripts, with **no
-console errors**, and is issued the `x_wbaas_token` cookie:
-
-```
-__wbaas/challenges/antibot/__static/v2/index-Bob5L-dt.js
-__wbaas/challenges/antibot/statics/challenge-solver_v1.0.8.js
-__wbaas/challenges/antibot/statics/behavior-tracker_v1.0.3.js
-__wbaas/challenges/antibot/statics/challenge_vm_fp_v1.8.0_68686d45.js
-__wbaas/challenges/antibot/__static/v2/browser-check.js
-```
-
-So this is not the Ozon situation, where a missing `toJSON` threw and stopped
-the challenge dead. The scripts run to completion and the verdict is still no.
-
-Three named components, and they want different things:
-
-- `challenge_vm_fp` is a VM-based fingerprint, a bytecode interpreter probing
-  many surfaces at once. This is what the measured surface work targets, and
-  where further probe-driven fixes pay off.
-- `behavior-tracker` wants mouse movement, scrolling and timing. The engine
-  emits none: there is no synthetic input at all outside an explicit CDP
-  `Input.dispatchMouseEvent`. Headful Chrome passes partly because a real
-  window produces incidental input; headless Chrome does not pass either.
-- `challenge-solver` presumably gates on both.
-
-**That "needs a behavioural layer" reading was also wrong.** Running
-`live_product_smoke` against the *old fork build* settles it:
-
-| | Wildberries | Ozon | Avito | wall |
-|---|---|---|---|---|
-| old fork (`pre-rebuild`) | **passes** | fails | fails | 58s |
-| this branch | fails | fails | fails | 9s, 36s with strict settle |
-
-Wildberries passed on the fork with no behavioural input, so it is reachable by
-porting, not by new features. Note also that the fork's own suite never had this
-test fully green: Ozon and Avito failed there too, which is what its HANDOFF
-recorded. Parity with the fork means Wildberries green and the other two red.
-
-Two candidates were tested and eliminated:
-
-- **Settle budget.** `OBSCURA_STRICT_SETTLE=1` takes the run from 9s to 36s of
-  real page time and Wildberries still fails, so the sliced settle loop alone is
-  not the difference.
-- **Self-routing.** `d7dca7a` is now ported (`fork_virtual_url.rs`) and
-  `clicklocal.mjs` is green on both steps offline, but Wildberries is unchanged.
-
-**Frame realms are not the answer either, and that is now measured.** The
-Wildberries challenge page has **no iframes and no shadow roots**, so the whole
-frame-realm port (`bc1cd60`, `e43e651`, `f11e748`, `ba3d9d8`, `99426aa`,
-`ce18b78`) cannot be what makes this test pass. Port it for Turnstile, not for
-this.
-
-What is actually true of the challenge page here:
-
-- All five challenge scripts load and **execute**. Their globals are present:
-  `LOAD_START`, `ANTI_SDK_WB_START_TIME`, `ANTI_SDK_WB_1695184013`,
-  `ANALY_S_WB_KEY`, and `__vmfp` with `{bundle, getExported, run}`.
-- No console errors anywhere on the page.
-- `IS_OUTDATED_BROWSER` is `false`. `browser-check.js` only tests
-  `Chrome/(\d+) < 80`, so the UA passes it.
-- The `x_wbaas_token` cookie is set.
-- `document.body` stays at 773 bytes and `readyState` reaches `complete`.
-
-Eliminated by measurement, each with the command that did it:
-
-| candidate | test | result |
-|---|---|---|
-| settle budget | `OBSCURA_STRICT_SETTLE=1`, 9s -> 36s | unchanged |
-| more time | `--wait 30` with strict settle | unchanged, still 773 bytes |
-| self-routing | `d7dca7a` ported, `clicklocal.mjs` green | unchanged |
-| frames / shadow DOM | counted on the live page | 0 iframes, 0 shadow hosts |
-| feature/version gate | read `IS_OUTDATED_BROWSER` and its source | false, not a gate |
-
-### Correction: the transports are identical, so it is not transport
-
-Measured against `https://tls.peet.ws/api/all`, old build versus this one:
-
-```
-ja4              t13d1011h1_61a7ad8aa9b6_3fcd1a44f3e3   identical
-peetprint_hash   2b6a7b012ebaa2e751d4ab91c639d1a4       identical
-http_version     HTTP/1.1                               identical
-```
-
-Same TLS fingerprint, same peetprint, same protocol version. **The build that
-passes Wildberries and the build that does not are indistinguishable on the
-wire.** So the section below, which concluded the block is transport-level, is
-wrong, and the remaining header-order and `priority` differences cannot be the
-cause either.
-
-Which means the "challenge page arrives as the initial HTML response, therefore
-JavaScript is ruled out" reasoning was also wrong. Both builds are almost
-certainly served the same challenge page; the old one **solves it in JavaScript**
-and reloads into the real page, and this one does not. That is consistent with
-everything observed: the challenge scripts run here, `__vmfp` is present, the
-`x_wbaas_token` cookie is set, and the body simply never advances past 773 bytes.
-
-#### Proven: the old build solves the challenge, this one does not
-
-Same URL, same minute, same TLS fingerprint:
-
-| build | body | product links | on challenge page |
-|---|---|---|---|
-| old (`pre-rebuild`) | 2,792,132 | **295** | no |
-| this branch | 773 | 0 | yes |
-
-So the old engine runs the challenge to a pass and reloads into the real shop
-page. This is an engine behaviour difference, and the remaining unported fork
-commits are where it lives.
-
-#### Prime suspect: `764298d` "fix stealth challenge token generation"
-
-The name is literal, and Wildberries' cookie is `x_wbaas_token`. It is large -
-534 lines of `bootstrap.js` plus `page.rs`, `module_loader.rs`, `ops.rs`,
-`runtime.rs` and `wreq_client.rs` - so it needs a session of its own. Three
-pieces visible in it are directly anti-detection:
-
-1. **`Error.stack` is no longer read when the page logs an Error.** Its own
-   comment: *"Chrome's console transport does not read Error.stack while the
-   page logs an Error. Reading it here triggers the common DevTools/CDP getter
-   probe before any inspector is involved."* A page can install a getter on
-   `Error.prototype.stack` and learn that something automated is watching. This
-   engine still reads it.
-2. **`Deno` is made non-enumerable rather than deleted.** That is the cheap
-   version of the problem that was deferred earlier in this rebuild: it hides
-   the global from enumeration without breaking the ~33 `Deno.core` call sites
-   in `runtime.rs`. Worth revisiting with this approach instead.
-3. **`console` gains the methods Chrome has** - `dirxml`, `timeStamp`,
-   `profile`, `profileEnd`, `context`, `createTask`. A short console object is
-   trivially checkable.
-
-Port that commit next, in pieces, measuring after each with
-`node tools/ab/journey.mjs --site wb --cards 3 --only obscura` against the old
-build as the control.
-
-**The `__vmfp` diagnostic remains the fallback if that does not do it:** wrap `__vmfp.run` and
-log what it returns, and watch the request the solver posts and the response it
-gets. That separates "the fingerprint is computed and rejected" from "the
-submission never happens". Do that first.
-
-Separately worth fixing regardless of Wildberries: **both builds negotiate
-HTTP/1.1**, and the JA4 `h1` marker shows only `http/1.1` in ALPN. Every real
-Chrome offers `h2` first. That is a real divergence from Chrome, just not the
-one that separates these two builds.
-
-### Superseded: the block is transport-level, not JavaScript
-
-The controlled comparison, run from the same exit IP within the same minute,
-using the journey the fork's own harness defines (home page, then click three
-product cards):
-
-```
-node tools/ab/chrome-raw.mjs --cards 3 --headed     28 product links, 3/3 cards
-node tools/ab/journey.mjs --site wb --cards 3 --only obscura      0 links
-```
-
-Real Chrome passes and Obscura does not, at the same moment from the same
-address, so this is not throttling and not the IP.
-
-**And Obscura receives the 773-byte challenge page as the initial HTML
-response**, before a single line of page script runs. The server decides on the
-request. That rules out the entire JavaScript surface as the cause: the DOM
-work, the interface shapes, the codec answers, `__vmfp`, the settle loop and the
-frame realms are all downstream of a decision that has already been made.
-
-So the discriminator is in what goes on the wire: the TLS ClientHello, the
-HTTP/2 settings and pseudo-header order, or the request headers themselves.
-`crates/obscura-net/src/wreq_client.rs` and `transport_profile.rs` are where
-that lives.
-
-#### Measured header differences
-
-Against a local echo server, real Chrome versus Obscura `--stealth`. Caveat
-before acting on any of it: this was **HTTP/1.1 to a plain server**, while
-Wildberries is HTTP/2 over TLS, and both header order and presence differ by
-protocol. Re-measure over HTTP/2 before treating these as the cause.
-
-| header | Chrome | Obscura |
-|---|---|---|
-| `accept-encoding` | `gzip, deflate, br, zstd` | `zstd,gzip,deflate,br` |
-| `accept-language` | `ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7` | `en-US,en;q=0.9` |
-| `connection` | `keep-alive` | absent |
-| `priority` | absent | present |
-| `sec-ch-ua` GREASE | `"Not=A?Brand"` | `"Not:A-Brand"` |
-
-#### Over real HTTPS, old fork versus this branch
-
-The local HTTP/1.1 table above is superseded by this one. Both builds against
-`https://postman-echo.com/headers`, the old fork being the one that passes
-Wildberries:
-
-```
-OLD  host sec-ch-ua sec-ch-ua-mobile sec-fetch-user upgrade-insecure-requests
-     sec-ch-ua-platform accept-encoding accept accept-language sec-fetch-site
-     sec-fetch-mode sec-fetch-dest user-agent
-NEW  host accept-language priority accept-encoding sec-fetch-user
-     upgrade-insecure-requests sec-ch-ua sec-ch-ua-mobile sec-ch-ua-platform
-     user-agent sec-fetch-dest sec-fetch-mode sec-fetch-site accept
-```
-
-Every header *value* matches, including `sec-ch-ua`, `accept-encoding: gzip, br`
-and the user agent. Two differences remain:
-
-1. **Order.** HTTP/2 header order is part of the transport fingerprint.
-2. **`priority`.** This branch sends it, the old fork does not. It is in neither
-   `wreq_client.rs` nor `client.rs`, so it comes from wreq itself, which means
-   the two `Cargo.lock`s resolve different wreq builds or the newer request path
-   enables it.
-
-#### TLS is eliminated
-
-Both builds against `https://tls.browserleaks.com/json`:
-
-```
-             OLD (passes WB)                    NEW
-ja3_hash     fa8d3d5aa8809acb30340b84c418bceb   8552117e83c7ecab5870dd57616d65ca
-ja3n_hash    24dd0f987266c37f39231f6f2130d12e   24dd0f987266c37f39231f6f2130d12e
-ja4          t13d1011h1_61a7ad8aa9b6_3fcd1a44f3e3   (identical)
-```
-
-`ja3n` and `ja4` match, so the cipher suites, curves and versions are the same;
-only extension order differs. And ja3 varies on **every run of the same binary**
-(three consecutive runs gave three hashes), because the emulation shuffles
-extensions exactly as Chrome does. The ja3 difference is therefore noise, not a
-signal: **the two builds present equivalent TLS fingerprints.**
-
-That leaves HTTP/2 and headers as the only remaining transport candidates.
-`browserleaks` returned an empty `akamai_hash` here, so the HTTP/2 SETTINGS
-fingerprint is still unmeasured; find an endpoint that reports it, since that is
-the last untested piece.
-
-**Reordering the `.header()` calls does not change the wire order** - tried,
-measured, reverted. wreq owns the ordering, so the fix is at the wreq
-configuration level, not in how our code appends headers. Start there: compare
-the resolved wreq and wreq-util versions between the two lockfiles, and check
-whether the emulation profile is being applied identically on both paths.
-
-**`accept-encoding` is not the difference after all** (both send `gzip, br`
-over HTTPS; the local HTTP/1.1 reading was misleading). The earlier note said: Order and spacing are exactly what
-transport fingerprinting reads, and ours is both reordered and unspaced. It
-comes from the wreq emulation profile, not from our code, so check whether
-wreq's Chrome145 emulation is what emits it before changing anything.
-
-Do **not** "fix" the GREASE brand from this table. The local Chrome is version
-151 and our profile claims 145; Chromium's GREASE punctuation is derived per
-major version, so a difference here is expected and `chrome_client_hints`
-already implements that algorithm. Verify against a real Chrome 145 before
-touching it.
-
-`priority` on HTTP/1.1 and the missing `connection` header are both
-protocol-shape mismatches worth checking over HTTP/2.
-
-**Next diagnostic.** Capture and compare the two requests rather than guessing:
-the JA3/JA4 and HTTP/2 fingerprint of Chrome versus the wreq emulation profile
-we select, and the exact header list and order each sends. `chrome_transport_profile`
-maps the profile's Chrome major to the nearest wreq profile and warns when it is
-not exact, so start by checking whether the selected profile's major has an
-exact wreq transport at all.
-
-The JavaScript surface work in this branch is still correct and still needed -
-it is what the probe diff measures - but it cannot move this test.
-
-Plain `ab.mjs` is a weaker control and should not be read as "we beat Chrome":
-it launches Chrome through Playwright with the automation tells left on. Under
-it, Chrome got HTTP 403 from Ozon (186 byte body) and HTTP 498 from Wildberries
-(17 bytes) while Obscura received the full challenge documents. That says
-Playwright-Chrome is more detectable than Obscura, nothing more.
-
-The identity itself is not implicated. Verified directly with proxies cleared:
-exit IP `46.160.251.166` on both the plain and stealth paths, and a
-cross-surface probe in which `userAgent`, `appVersion`, `platform`, `vendor`,
-`userAgentData` brands and platform, the WebGL ANGLE/D3D11 AMD renderer, screen
-metrics and `Europe/Moscow` all agree, with `navigator.webdriver` false, five
-plugins and `pdfViewerEnabled` true. Wildberries is reached over the IPv6 exit
-(`2001:470:...`), which is this machine's normal route.
-
-### Stage 3 result (WebGL and WebGPU identity)
-
-**1109 tests, 1079 passed, 30 failed.** Same count as the baseline, same two
-differences as stage 2: the gzip test fixed, `live_product_smoke` red pending
-stage 4. Three fork tests added, no new failures.
-
-The whole graphics layer costs **three lines in `bootstrap.js`**, all comment
-markers. `crates/obscura-js/build.rs` splices the fork modules in at build time:
-
-| file | role |
-|---|---|
-| `js/graphics.js` | the facade: canvas, WebGL, WebGL2, WebGPU |
-| `js/graphics_api_v145.js` | generated Chrome 145 IDL constants and arities |
-| `js/graphics_shim.js` | the few helpers upstream's bootstrap does not have |
-| `js/graphics_page_init.js` | picks up the profile, per page |
-| `src/graphics.rs` | the Rust side of the profile handoff |
-
-Verified against a live page: WebGL reports the profile's
-`ANGLE (AMD, AMD Radeon(TM) Graphics (0x0000164C) Direct3D11 vs_5_0 ps_5_0, D3D11)`
-with 35 extensions, WebGL2 reports 32 extensions and `MAX_TEXTURE_SIZE` 16384,
-and `navigator.gpu.requestAdapter()` yields a `GPUAdapter` with 9 features,
-`maxBufferSize` 2147483648 and `info.vendor` `amd`, `architecture` `rdna-2` —
-consistent with the WebGL renderer, which is the point.
-
-#### The facade only exists when a profile does
-
-Upstream returns `null` from `getContext('webgl')` on purpose: a shim that
-reports success while every draw is a no-op makes applications take the WebGL
-path and render nothing. Their test
-`unavailable_webgl_context_does_not_claim_success` guards it.
-
-The fork reverses that, which broke the test. The fix was not to edit the test.
-Every value the facade reports is read from the fingerprint profile, so with no
-profile loaded it would be a context backed by nothing, which is exactly what
-upstream objects to. `_canvasGetContext` now returns `null` unless a profile is
-present, and `navigator.gpu` is likewise absent. Upstream's test constructs a
-runtime with no profile, so it passes unchanged, and `runtime.rs` needed no edit
-at all. `crates/obscura-browser/tests/fork_graphics_identity.rs` covers our half.
-
-#### Interface objects must not be enumerable
-
-Everything graphics.js puts on the global goes through `_graphicsDefineGlobal`
-in `js/graphics_shim.js`, which defines it `enumerable: false` as WebIDL
-requires. A plain `globalThis.X = C` lands enumerable, and
-`Object.keys(window)` containing `WebGLRenderingContext` or `GPUAdapter` is a
-one-line detection.
-
-Upstream gets this only for the names in its `_preHideInternals` list, which
-pre-declares them non-enumerable so a later plain assignment updates the value
-alone. `WebGL2RenderingContext` is in that list; `WebGLRenderingContext` is not,
-and neither is any WebGPU interface. `HTMLImageElement` is enumerable upstream
-today and we do not touch it.
-
-Verified: `Object.keys(globalThis)` leaks none of the graphics interfaces.
-
-Two other observations from the same probe, neither a stage 3 problem:
-
-- `isSecureContext` is missing from the engine entirely. Chrome has it on every
-  page. Deliberately left alone until the stealth tests are green.
-- `HTMLImageElement` is enumerable on the global, which is upstream's.
-
-### The method that works: diff the two engines
-
-Porting by reading commits missed things repeatedly. What works is measuring.
-
-```
-git worktree add /c/tmp/obscura-old pre-rebuild
-cd /c/tmp/obscura-old && CARGO_TARGET_DIR=/c/tmp/obscura-old-target   cargo build --release -p obscura-cli --bins --features stealth
-```
-
-Then run the same probe against both binaries and diff the JSON:
-
-```
-obscura fetch about:blank --eval "$(cat /c/tmp/probe/surface.js)"
-```
-
-The probe captures every own global with its descriptor, the prototype shape of
-the interfaces anti-bot code reads, navigator/screen/window values, the
-toString of the usual builtins, error stacks, and the WebGL identity. Compare
-*sets and shapes*, not values: screen size, deviceMemory, hardwareConcurrency
-and devicePixelRatio vary legitimately because the profile rotates per run.
-
-This is how the enumerability gap was found, and it is the only way to be sure a
-port is complete. Keep `/c/tmp/probe/surface.js` or rebuild it from this note.
-
-### Closed by measurement, in `js/fork_*.js`
-
-| gap | before | after |
-|---|---|---|
-| interface objects in `Object.keys(window)` | 138 | 0 |
-| `navigator` own properties | 25 | 0 |
-| `screen` own properties | 9 | 0 |
-| `toString.call(screen)` | `[object Object]` | `[object Screen]` |
-| `Navigator`, `Permissions`, `MediaDevices`, `ScreenOrientation`, `NavigatorUAData`, `Screen`, `HTMLDocument`, `HTMLEmbedElement`, `HTMLSourceElement`, `NavigatorManagedData`, `ProtectedAudience` | absent | present, non-enumerable |
-| `performance` | object literal, 3 timing fields | `Performance` + `PerformanceTiming`, 21 fields |
-| `setTimeout.toString()` | `function () {...}` | `function setTimeout() {...}` |
-| `chrome.runtime` | present | undefined |
-| `isSecureContext` | absent | boolean |
-| `new HTMLCanvasElement()` | no throw | Illegal constructor |
-
-`bootstrap.js` carries **5 marker comments** for all of it and nothing else.
-
-### Still open, measured and ranked
-
-1. **`Element.prototype` and `HTMLElement.prototype` leak 20 engine privates**
-   (`_renderBoxGeometry`, `_loadIframeSrc`, `_popoverAttrValue`, ...). Visible to
-   `Object.getOwnPropertyNames`, so hiding from enumeration is not enough; they
-   need to move off the public prototype. Upstream's, and the old fork build
-   leaked 11 of its own, so this was never solved there either.
-2. **`EventTarget.prototype` carries 51 `Node` constants and `Node.prototype`
-   carries `addEventListener`/`removeEventListener`/`dispatchEvent`.** In Chrome
-   those belong to exactly one of the two. Structural, upstream's.
-3. **`window[0]`..`window[49]`** exist as frame-index accessors with no frames.
-   Chrome has none. `Object.getOwnPropertyNames(window).filter(isNumeric)`.
-4. `Navigator.prototype` exposes 27 members against the fork's 45, because
-   upstream keeps the spoofed ones on an intermediate prototype.
-5. `history` is non-enumerable here and enumerable in Chrome.
-6. `Deno` is still reachable; see below.
-7. `Worker` is a shim that evaluates in the page isolate, not a thread.
-
-#### Deferred to stage 5: hiding `Deno` from the page
-
-A page that can see `Deno` is not Chrome. The fork used to delete
-`globalThis.Deno`, which needs bootstrap's own `Deno.core` calls to resolve
-through an alias. That part is cheap: bootstrap's IIFE takes one `const Deno =
-globalThis.Deno;` and the whole change is two marker comments plus a fork-owned
-module, with no rename of bootstrap's ~80 call sites.
-
-What blocks it is `runtime.rs`, which injects 33 scripts referencing
-`Deno.core.ops` into the global scope, outside the IIFE. Eight upstream tests
-fail immediately, and the render-gated instrumentation at `runtime.rs`
-9098-9477 would break under `--features render` in stage 6. Making it work
-means editing ~33 sites in a file upstream rewrites constantly, which is the
-opposite of what this rebuild is for. It was implemented, measured, and
-reverted. Revisit in stage 5 with a single Rust-side choke point for injected
-scripts, not a rename.
-
----
-
-Branch `webgl+webgpu`, at `6a02338`, with local child-frame CDP changes.
-
-## What this project is
+Branch `webgl+webgpu-v2`, 36 commits on top of upstream `origin/main` at
+`97124ed`. Working tree clean apart from the files listed under
+[Intentionally uncommitted](#intentionally-uncommitted).
+
+## What this project is, and what this fork is for
 
 Obscura is a headless browser written in Rust: its own DOM, V8 through
-`deno_core`, and a CDP server so Puppeteer and Playwright can drive it as a
-drop-in for Chrome. It is aimed at scraping and agent work, so a page must not
-merely load — it must be indistinguishable enough from Chrome that anti-bot
-services treat it the same.
+`deno_core`, a CDP server so Puppeteer and Playwright drive it as a Chrome
+drop-in, and (upstream, recently) a native render layer. Upstream lives at
+`origin` = `h4ckf0r0day/obscura`; our fork pushes to `xrip` only.
 
-Crates: `obscura-dom` (tree), `obscura-js` (V8, ~9,700-line `js/bootstrap.js`
-shim, frame realms), `obscura-net` (HTTP, TLS impersonation under the `stealth`
-feature), `obscura-browser` (`Page`, lifecycle, profiles), `obscura-cdp` (CDP
-server), `obscura-cli`, `obscura` (library facade), `obscura-mcp`.
+The fork exists to add a **stealth identity layer** upstream does not want:
+a catalog of real captured Chrome-on-Windows fingerprint profiles, and the
+engine changes that make one selected profile consistent across every surface
+a site can read - TLS transport, HTTP headers, `navigator`, `screen`, WebGL,
+WebGPU, audio, codecs.
 
-## The work in this session: child frames
+**The target state**, in the project owner's words:
 
-The goal was to make Cloudflare Turnstile work. That turned out to be a frames
-problem end to end, and the fixes are general — every embedded widget uses the
-same mechanisms.
+> upstream + our profiles + stealth tests passing + easy upstream sync = WIN
 
-**Result: Turnstile issues a token**, verified against the real service,
-covered by `crates/obscura-browser/tests/live_turnstile_smoke.rs`, ~11s, 3/3
-stable. The message sequence matches Chrome's exactly:
+The fork can never be merged upstream (upstream deliberately answers "no" where
+we answer "Chrome"), but it must stay cheap to merge *from* upstream forever.
+
+## Why this branch exists
+
+The previous branch `webgl+webgpu` (frozen at tag `pre-rebuild` = `e1562bf`)
+diverged so far that upstream's render drop could not be merged: 18 conflicted
+files, `bootstrap.js` carrying **+2390/-899** and `runtime.rs` **+2014/-109** of
+fork code. The abandoned merge is preserved on branch `merge-attempt-snapshot`
+(it contains conflict markers and does not build).
+
+This branch restarts from upstream and re-applies the fork as **isolated
+modules**, so the next sync is a plain `git merge origin/main`.
+
+## Current state
+
+| goal criterion | status |
+|---|---|
+| upstream features still work | **yes** - suite at its recorded baseline every run |
+| our profiles | **yes** - 367 base / 427 graphics / 226 screen rows, consistent across surfaces |
+| easy upstream sync | **yes** - `bootstrap.js` is **+5/-0**, all fork code in `fork_*` files |
+| no duplicated work | **yes** - ~400 lines deleted after finding upstream equivalents |
+| **stealth tests passing** | **NO** - `live_product_smoke` is red. This is the open work. |
+
+Fork delta against upstream: **87 files, +16532 / -221**.
+
+## Architecture: how fork code is kept out of upstream's way
+
+This is the part that must not be eroded. Everything else can be rewritten.
+
+### JavaScript: five marker comments, nothing else
+
+`crates/obscura-js/js/bootstrap.js` is a ~14,500-line upstream file that
+upstream rewrites constantly. The fork adds **five comment lines** to it and
+nothing more:
 
 ```
-init -> requestExtraParams -> translationInit -> food -> complete{token}
+/* __OBSCURA_FORK_EARLY_MODULE__ */     before upstream's performance literal
+/* __OBSCURA_FORK_LATE_MODULE__ */      top level, after the DOM classes exist
+/* __OBSCURA_GRAPHICS_PAGE_INIT__ */    inside __obscura_init
+/* __OBSCURA_FORK_PAGE_INIT_END__ */    last statement of __obscura_init
+```
+(the fourth marker hosts two modules; five lines total including a blank)
+
+`crates/obscura-js/build.rs` splices the fork modules in at snapshot build time
+and **hard-errors if a marker is missing**, so an upstream merge that drops one
+fails the build instead of silently shipping a half-stealth engine.
+
+Fork JS modules, all under `crates/obscura-js/js/`:
+
+| file | what it does |
+|---|---|
+| `fork_performance.js` | `Performance` + `PerformanceTiming` classes, 21 timing fields, `toJSON` |
+| `graphics_shim.js` | helpers `graphics.js` needs that upstream's bootstrap lacks |
+| `graphics_api_v145.js` | generated Chrome 145 IDL constants and method arities |
+| `graphics.js` | the canvas / WebGL / WebGL2 / WebGPU facade (~780 lines) |
+| `fork_interfaces.js` | 11 interface constructors upstream never puts on `window` |
+| `fork_media_codecs.js` | `canPlayType` answering as Chrome does |
+| `fork_console.js` | stops `Error.stack` being read; adds Chrome's console methods |
+| `fork_event_target.js` | separates `EventTarget` from `Node` |
+| `graphics_page_init.js` | per-page profile hand-off |
+| `fork_browser_shape.js` | lifts `navigator`/`screen` members onto their prototypes |
+| `fork_audio_memory.js` | `AudioContext` starts suspended; `[object MemoryInfo]` |
+| `fork_hide_globals.js` | sweep making interface objects non-enumerable |
+
+### Rust: inherent impls in fork-owned modules
+
+Rust allows an inherent `impl` in any module of the defining crate, so fork
+methods live in their own files and the call site still reads naturally:
+
+- `crates/obscura-js/src/graphics.rs` - `set_fingerprint_profile`
+- `crates/obscura-js/src/origin_storage.rs` - BrowserContext-scoped localStorage
+- `crates/obscura-net/src/transport_profile.rs` - Chrome major to wreq profile
+- `crates/obscura-browser/src/fork_virtual_url.rs` - `Page::sync_virtual_url`
+
+Files upstream rewrites hardest, and what the fork costs in each:
+
+```
+obscura-js/js/bootstrap.js        +5  -0
+obscura-js/src/runtime.rs         +2  -1     (one pub(crate) on a field)
+obscura-js/src/ops.rs             +8  -0
+obscura-browser/src/page.rs       +28 -27
+obscura-js/src/module_loader.rs   +53 -11
+obscura-cdp/src/domains/input.rs  +26 -1
 ```
 
-### What was wrong, and why each fix
+Compare the old branch: `bootstrap.js` +2390/-899, `runtime.rs` +2014/-109.
 
-Ordered as they blocked. Every one of them failed *silently*, which is the
-theme: Cloudflare's script ignores what it does not trust and reports nothing.
+### Two rules that produced this, and must be kept
 
-1. **`globalThis.parent = globalThis` in every realm.** A frame's
-   `parent.postMessage(token)` was delivered to the frame itself, and
-   `parent === window` told every widget in the frame it was the top document.
-   Fixed with a host-routed cross-realm bridge: both sides hand a message to
-   the host, which dispatches it into the target realm. A frame learns its own
-   id and its parent's *before* its bootstrap runs, because `parent`/`top` are
-   installed during init and one script taking the top-level branch is enough
-   to change everything after it.
-
-2. **Frames were attached ~10s late.** They were only picked up after the
-   page's post-load settle (`OBSCURA_DYNAMIC_SCRIPT_SETTLE_MS`, default
-   10,000). The challenge frame's first message arrived long after `api.js`
-   had moved on. Frames are now attached and their messages delivered on a
-   100ms cadence *inside* both settle loops — which is why the event loop is
-   driven in slices and `self.js` is re-borrowed each turn. A page with no
-   frames settles exactly as before.
-
-3. **A frame's document never got `DOMContentLoaded` or `load`,** so anything
-   a widget defers until then never ran.
-
-4. **`event.isTrusted` was false** — the one that actually mattered. The bridge
-   built the `MessageEvent` from script. `api.js` gates every message from its
-   own frame on `isTrusted && source === iframe.contentWindow`. Fixed by
-   marking host-delivered messages trusted through the existing
-   `__obscura_markTrusted`. A script-built event must still report `false`;
-   answering `true` for everything is a trivial bot tell, and both halves are
-   tested.
-
-   This also required **stable `contentWindow` identity across the frame's
-   load**: an embedder captures that reference when it creates the iframe and
-   compares it against `event.source` later, so handing out a fresh object on
-   load broke the comparison.
-
-Supporting changes: `MessageEvent` gained `origin`/`source`/`ports`/
-`lastEventId` (a handler with none of these drops the message);
-`window.postMessage` to one's own window went from a no-op to real async
-delivery.
-
-### Design decisions worth knowing
-
-- **One isolate, many `v8::Context`s.** A frame realm is a second context in the
-  page's isolate. An earlier attempt used a second isolate and was abandoned
-  because objects cannot cross isolates. Ops resolve which realm called them
-  via `RealmStates` and `scope.get_entered_or_microtask_context()` — not
-  `get_current_context()`, which reports the realm the op was bound in.
-- **`Page::frames` is declared before `Page::js`.** A realm holds a V8 handle
-  into that isolate and fields drop in declaration order. Reordering them
-  aborts the process.
-- **Messages are JSON, not structured clone.** Structured clone cannot cross
-  realms here. JSON covers what postMessage is used for; anything it cannot
-  encode throws `DataCloneError` rather than arriving silently as `null`.
-- **Frames were unobservable**, which is how "the frame rendered nothing"
-  survived as a theory when the widget had in fact rendered. `Page::frame_urls`
-  and `Page::evaluate_in_frame` open them up, and `OBSCURA_FRAME_PRELOAD` runs
-  a script inside a frame realm before the frame's own scripts — the only point
-  an instrument can watch them. It is off unless set: it runs arbitrary source
-  inside a frame, so it is a debugging tool, not a page feature.
+1. **Before porting anything, check whether upstream already does it.**
+   ~400 lines were deleted rather than ported once upstream was found to have
+   `ResourceRequest`, `fetch_with_profile`, `request_referrer`,
+   `request_fetch_site` and gzip decoding. Their call sites in `page.rs`,
+   `ops.rs`, `runtime.rs` and `module_loader.rs` then needed no porting at all.
+2. **Where upstream and the fork disagree philosophically, gate on the
+   profile rather than editing upstream's test.** Upstream returns `null` from
+   `getContext('webgl')` and `''` from `canPlayType` on purpose: an engine with
+   no GPU or decoder that claims support makes applications take a path that
+   renders nothing. Both fork facades therefore appear **only when a fingerprint
+   profile is loaded**. Upstream's tests build a runtime without one, so
+   `unavailable_webgl_context_does_not_claim_success` and
+   `unsupported_media_capabilities_and_readiness_are_honest` both pass
+   **unedited**, and `runtime.rs` needed no change for either.
 
 ## What works
 
-- Cross-origin frames run their own scripts against their own DOM and origin,
-  inheriting the page's browser identity (a frame reporting a different UA or
-  GPU than its parent is an instant tell).
-- postMessage in both directions, with correct `origin`, `source`, `isTrusted`.
-- `parent` / `top` in a framed document; the page still reports itself as top.
-- Nested frames drain (the op queues onto the page's state whichever realm
-  called it).
-- `Page.getFrameTree` now includes the live child-frame hierarchy, and
-  navigation emits `Page.frameAttached`, `Page.frameNavigated` and
-  `Page.frameStoppedLoading` for each child. A local Playwright 1.62.1 check
-  sees both the main page and its iframe through `page.frames()`.
-- Turnstile end to end.
+Verified this session against the real Chrome on this machine, or against the
+old fork build:
 
-## What does not work, and what is unproven
+- **Profile engine.** `obscura profiles list|show|current`. Composed IDs from a
+  1.4 MB catalog baked and gzipped at build time by
+  `crates/obscura-browser/build.rs`; ~3 ms on top of a 34 ms process start.
+- **Identity is consistent across surfaces.** `userAgent`, `appVersion`,
+  `platform`, `vendor`, `userAgentData`, client hints on the wire, WebGL
+  ANGLE/D3D11 renderer, screen metrics and timezone all agree, `webdriver` is
+  false, five plugins, `pdfViewerEnabled` true.
+- **Transport identity** follows the profile's Chrome major
+  (`transport_profile.rs`), rather than upstream's pinned `Chrome145`.
+- **WebGL/WebGPU.** Real parameter tables from the profile; `requestAdapter()`
+  yields a `GPUAdapter` whose `vendor`/`architecture` agree with the WebGL
+  renderer. Secure-context gated, as in Chrome.
+- **Interface surface matches the old fork build.** The probe diff is now
+  essentially zero: no missing globals, only `history`/`isSecureContext`
+  descriptors and values that vary because the profile rotates.
+- **`canPlayType` is byte-identical to real Chrome** on six probes, positive
+  and negative.
+- Upstream's own failing test `stealth_client_decodes_gzip_response` is
+  **fixed** (the stealth path hardcoded `validate_url(url, false)` so
+  `--allow-private-network` never reached it).
 
-- **Executing a real Turnstile proof-of-work is unproven.** The always-pass
-  sitekey `1x00000000000000000000AA` **short-circuits** — verified by capturing
-  the worker from real Chrome. It serves the full 265 KB framework but returns
-  a fixed token with a trivial worker; the real PoW never launches. What is
-  proven is the protocol, the frame lifecycle and token delivery. No real
-  challenge could be observed from this machine at all: every
-  challenge-triggering sitekey returns HTTP 400 "invalid sitekey" from this IP.
-- **The managed widget** (e.g. `turnstile-test.vercel.app`) yields no token.
-  It reaches `translationInit`, passes Turnstile's whole capability gate inside
-  the frame realm, and builds its widget, then emits `overrunBegin` where
-  Chrome emits `interactiveBegin`. **Real headless Chrome gets no token there
-  either** — it waits for a human click. Next lead: `api.js` reports one caught
-  error from `runImplicitRender`, driven by our `<load-events>` script.
-- **CDP frame use is not complete.** Playwright can now see `page.frames()`,
-  but CDP execution context ids are not mapped to frame realms, so evaluation
-  through a child `Frame` still runs in the main realm. A later main-frame
-  navigation also does not emit `Page.frameDetached` for removed children.
-- **`_IframeDocument` is still what a parent reads through `contentDocument`** —
-  a regex-built shim, not the frame's real document.
-- **No same-origin synchronous DOM access between realms**, and no `frames[]`
-  indexing.
-- `_RemoteWindow` implements 12 of the 13 properties on the HTML spec's
-  cross-origin allowlist; `location` is absent, so `parent.location` is
-  `undefined` where a browser exposes a restricted Location. Small
-  fingerprinting tell.
+## What is broken or incomplete
 
-## Open question: is `"you"==="bot"` a honeypot?
+### `live_product_smoke` is red - the open work
 
-Turnstile's capability gate builds a Blob worker whose entire source is the
-string `"you"==="bot"`, constructs a `Worker` from it, revokes the URL and
-terminates it immediately. Raised as a suspicion that this is bait rather than
-a probe. **Unresolved.** The evidence, both ways:
+`crates/obscura-browser/tests/live_product_smoke.rs` drives Wildberries, Ozon
+and Avito. It is the fork's stealth gate and it fails.
 
-*Reads as a plain capability probe:* it sits inside a function whose only
-outputs are "supported"/"unsupported"; the worker is terminated at once and
-nothing reads a result; the expression evaluates to `false` and has no side
-effect; it is one link in a feature-detection chain (`ReadableStream.pipeTo`,
-`BigInt`, `crypto.getRandomValues`, `performance.getEntries`,
-`PerformanceObserver`).
+Important context: **it was never fully green on the old branch either.** The
+old build passes Wildberries and fails Ozon and Avito. Parity with the fork
+means WB green and the other two red.
 
-*Reads as bait:* a pure probe would use `0` or `''` — the taunt is a choice.
-And as a probe it is weak, because an engine that only *pretends* to support
-Workers passes it trivially, which is exactly the shape of a trap for engines
-that special-case, log, or refuse unusual worker sources.
+Proven, same URL and same minute, with an **identical TLS fingerprint**:
 
-**The real risk it points at, regardless of intent:** `globalThis.Worker` in
-`bootstrap.js` (~line 8437) is a shim that evaluates the worker source in the
-page's own isolate inside a Proxy scope. It is not a thread. Nothing today
-observes worker *behaviour* — this gate only checks constructibility — so we
-pass. Any future check that makes a worker do real work, or that times it, or
-that looks for true concurrency, would fail. Treat "our Worker is not a worker"
-as live technical debt, and do not read the current pass as evidence that
-Workers are implemented.
+| build | body | product links | on challenge page |
+|---|---|---|---|
+| old fork (`pre-rebuild`) | 2,792,132 | **295** | no |
+| this branch | 773 | 0 | yes |
 
-## Verification
+So the old engine solves Wildberries' JS challenge and reloads into the real
+page; this one does not. It is an engine behaviour difference living in the
+still-unported parts of one fork commit.
 
-Windows 11, PowerShell/Git Bash. `cargo nextest` is required.
+**Eliminated by measurement.** Do not re-investigate these without new evidence:
 
-```
-cargo build --release -p obscura-cli --features stealth      # exit 0
-cargo nextest run --workspace --features stealth --no-fail-fast
-cargo nextest run --workspace --no-fail-fast                 # live tests excluded
-```
-
-Recorded results at `cb869cb`:
-
-| run | result |
+| candidate | how it was ruled out |
 |---|---|
-| `--features stealth` | **541 tests, 538 passed, 3 failed, 3 skipped** |
-| plain | **534 tests, 532 passed, 2 failed, 3 skipped** |
+| TLS fingerprint | `ja3n` and `ja4` identical to the old build; `ja3` varies per run because the emulation shuffles extensions as Chrome does |
+| HTTP version | both negotiate HTTP/1.1 |
+| transport generally | `peetprint_hash` identical between the two builds |
+| frames / shadow DOM | the live challenge page has 0 iframes and 0 shadow roots |
+| settle budget | `OBSCURA_STRICT_SETTLE=1` takes the run 9s to 36s, unchanged |
+| more time | `--wait 30`, still 773 bytes |
+| self-routing | `d7dca7a` ported, `clicklocal.mjs` green, unchanged |
+| browser version gate | `IS_OUTDATED_BROWSER` is false; `browser-check.js` only tests Chrome < 80 |
+| wreq transport major | profile is 145 and wreq has an exact Chrome145 |
+| `accept-encoding` | identical (`gzip, br`) over HTTPS; an earlier HTTP/1.1 reading was misleading |
+| JS interface surface | probe diff against the old build is essentially zero |
+| IP / throttling | real Chrome passes from the same exit in the same minute |
 
-Current local child-frame CDP change, after `cargo clean`:
+### Other known gaps
 
-- `cargo build --release -p obscura-cli`: exit 0.
-- `cargo nextest run --workspace --no-fail-fast`: **536 tests, 534 passed,
-  2 failed, 3 skipped**. The two failures are the same CDP failures below.
-- The two new CDP frame-tree/event tests and all six `frame_messaging` tests
-  pass.
-- A local Playwright 1.62.1 check against one page with one iframe reports both
-  URLs from `page.frames()`.
-- The obstacle course was not run because the companion `obscura-benchmark`
-  checkout is not present beside this repository.
+- **`Element.prototype` and `HTMLElement.prototype` leak 20 engine privates**
+  (`_renderBoxGeometry`, `_loadIframeSrc`, `_popoverAttrValue`, ...). Visible to
+  `Object.getOwnPropertyNames`, so making them non-enumerable is not enough.
+  The old fork leaked 11 of its own and still passes WB, so this is not the
+  blocker.
+- **`window[0]`..`window[49]`** exist as frame-index accessors with no frames.
+  Chrome has none.
+- **`Deno` is reachable from the page.** `764298d` makes it non-enumerable
+  rather than deleting it, which avoids the ~33 `Deno.core` call sites in
+  `runtime.rs` that made an earlier deletion attempt fail. Not yet ported.
+- **`Worker` is a shim** that evaluates in the page isolate; it is not a thread.
+- **Both builds negotiate HTTP/1.1** and advertise only `http/1.1` in ALPN.
+  Every real Chrome offers `h2`. A genuine divergence, unrelated to WB.
+- `Navigator.prototype` exposes 27 members against the old fork's 45, because
+  upstream keeps the spoofed ones on an intermediate prototype.
+- `history` is non-enumerable here, enumerable in Chrome.
+- Frame realms are **entirely unported** (`bc1cd60`, `e43e651`, `f11e748`,
+  `ba3d9d8`, `99426aa`, `ce18b78`). Needed for `live_turnstile_smoke`, which is
+  also unported. Not needed for Wildberries.
 
-The three failures, all pre-existing and none caused by this work:
+## Build, run, test
 
-- `obscura-cdp::max_connections_cap max_connections_refuses_then_recovers`
-- `obscura-cdp::concurrent_connections_heavy_page concurrent_connections_heavy_page_do_not_abort_v8`
-- `obscura-browser::live_product_smoke live_product_cards_load_with_the_selected_profile`
-  — **verified to fail identically at `f508c5b`**, before any of this work, via
-  a baseline worktree.
+Use `cargo nextest`, never `cargo test`: the engine holds one V8 isolate per
+process and `cargo test` runs a whole binary in one process.
 
-### The live product smoke, specifically
+```bash
+cargo build --release -p obscura-cli --bins --features stealth
+cargo build --release -p obscura-cli --bins --features render,stealth
 
-Do not read it as a stealth regression. Measured this session:
+cargo nextest run --release --workspace --features stealth --no-fail-fast --test-threads 8
+cargo nextest run --release --workspace --no-fail-fast --test-threads 8
+```
 
-- Not an environment proxy leak. `HTTPS_PROXY` is set in the shell, but both
-  HTTP clients call `.no_proxy()` unconditionally
-  (`obscura-net/src/client.rs:545`, `wreq_client.rs:214`); a proxy is used only
-  when passed via `--proxy`/`OBSCURA_PROXY`. Measured: obscura's exit IP is the
-  real one with `HTTPS_PROXY` set.
-- Not the IP: through a proxy, Avito passes and Wildberries fails the same way.
-- Not timing: raising the settle from 10s to 30s changes nothing.
-- Not the fingerprint profile: pinning the test's profile over CDP still
-  renders the page correctly.
-- The engine renders that page fine over CDP (25 KB of text, product id
-  present) while **headless Chrome gets an error page** on the same URL at the
-  same moment. The failure is narrow: on the direct-library path the rendered
-  text lacks the numeric product id, which Wildberries puts further down the
-  page. Wildberries also no longer serves `application/ld+json` or an `h1`
-  there, so the test's `title` check already relies on markup that is gone.
+`--test-threads 8` matters on a 16-core box: at full parallelism the
+`obscura-cli::mcp_client` binary starves and flakes. Three different tests in it
+have flaked so far. Run that binary alone before believing any failure from it;
+it has been 16/16 on ten consecutive standalone runs.
 
-## Where to look
+**Clear the proxy environment first** for anything that must reach the network
+directly. The shell normally has `HTTPS_PROXY` set, with credentials:
+
+```bash
+unset HTTP_PROXY HTTPS_PROXY ALL_PROXY http_proxy https_proxy all_proxy
+```
+
+### Results recorded at this commit
+
+```
+cargo build --release -p obscura-cli --bins --features stealth          exit 0
+cargo build --release -p obscura-cli --bins --features render,stealth   exit 0
+
+nextest --features stealth   1112 tests: 1081 passed, 31 failed, 6 skipped
+nextest plain                1110 tests: 1081 passed, 29 failed, 6 skipped
+```
+
+Failure breakdown for the stealth run:
+
+| count | what | ours? |
+|---|---|---|
+| 28 | `obscura-render` `dom::tests` and `layout_test` | **no** - upstream's, layout and text shaping differ on Windows |
+| 1 | `obscura-cdp::max_connections_cap` | **no** - upstream's, pre-existing |
+| 1 | `obscura-cli::mcp_client test_evaluate` | **no** - the load flake; 16/16 alone |
+| 1 | `obscura-browser::live_product_smoke` | **yes** - the open work |
+
+### The upstream baseline this is compared against
+
+Measured on a clean checkout of `97124ed` **before any fork code landed**:
+**1075 tests, 1045 passed, 30 failed, 4 skipped.** Compare failure *sets*, not
+counts. Against that baseline this branch adds `live_product_smoke` and removes
+`stealth_client_decodes_gzip_response`.
+
+## How to measure, so the next session does not repeat mine
+
+Reading commits missed things repeatedly. Six hypotheses were wrong this session
+and every one was caught by measuring instead. Build the old fork and diff the
+two engines:
+
+```bash
+git worktree add /c/tmp/obscura-old pre-rebuild
+cd /c/tmp/obscura-old && CARGO_TARGET_DIR=/c/tmp/obscura-old-target \
+  cargo build --release -p obscura-cli --bins --features stealth
+```
+
+Three tools are checked in:
+
+- `tools/ab/surface-probe.js` - every own global with its descriptor, prototype
+  shapes, navigator/screen/window values, `toString` of builtins, error stacks,
+  WebGL identity. Run under `--eval` on both binaries and diff the JSON.
+  **Compare sets and shapes, not values**: the profile rotates per run, so
+  screen size, `deviceMemory` and DPR differ legitimately.
+- `tools/ab/probe-chrome.mjs <file.js> [--headed] [--url U] [--window-size W,H]` -
+  runs the same expression in the real Chrome over raw CDP, using
+  `Page.navigate` and `Runtime.evaluate` only, never `Runtime.enable`, with
+  `AutomationControlled` disabled. Always closes Chrome over CDP.
+- `tools/ab/chrome-raw.mjs` and `tools/ab/journey.mjs` - the journey the project
+  owner considers the true gate: home page, then click three product cards.
+
+**The control that matters:**
+
+```bash
+node tools/ab/chrome-raw.mjs --cards 3 --headed          # 28 links, 3/3 cards
+node tools/ab/journey.mjs --site wb --cards 3 --only obscura   # 0 links today
+```
+
+`tools/ab` needs `playwright-core` at `target/test-fixtures/playwright`; there
+is no setup script:
+
+```bash
+mkdir -p target/test-fixtures/playwright && cd target/test-fixtures/playwright
+npm install playwright-core@1.62.1
+```
+
+Live sites throttle, and a throttled run looks exactly like a fingerprinting
+failure. Always read the returned body, never a link count alone, and always run
+the Chrome control in the same minute.
+
+## Next milestones, in priority order
+
+### 1. Finish porting `764298d` "fix stealth challenge token generation"
+
+This is the prime suspect for Wildberries. The name is literal and WB's cookie
+is `x_wbaas_token`. It touches six files; **two of its three visible mechanisms
+are already ported**:
+
+- done - `Error.stack` is no longer read when a page logs an Error
+  (`fork_console.js`). Upstream's `_consoleFn` did `a.stack || a.message`; a
+  page can install a getter on `Error.prototype.stack` and detect it.
+- done - Chrome's missing console methods (`dirxml`, `timeStamp`, `profile`,
+  `profileEnd`, `context`, `createTask`).
+- **not done** - `Deno` made non-enumerable rather than deleted.
+- **not done** - `page.rs` (+102), `runtime.rs` (+101), `ops.rs` (+46).
+
+Port the remaining pieces one at a time, measuring after each with
+`node tools/ab/journey.mjs --site wb --cards 3 --only obscura` against the
+`chrome-raw.mjs` control. Keep them in `fork_*` files wherever an inherent impl
+or a spliced module can carry them.
+
+### 2. If that does not do it, instrument the challenge
+
+The WB challenge scripts all load and execute with no console errors, `__vmfp`
+is present with `{bundle, getExported, run}`, and `x_wbaas_token` is set, yet the
+body never advances past 773 bytes. Wrap `__vmfp.run` and log what it returns,
+and watch the request the solver posts and the response it gets. That separates
+"the fingerprint is computed and rejected" from "the submission never happens".
+Inject via CDP `Page.addScriptToEvaluateOnNewDocument` or Playwright
+`addInitScript` through `tools/ab/engines.mjs`.
+
+### 3. Port the frame realms, for Turnstile
+
+`bc1cd60`, `e43e651`, `f11e748`, `ba3d9d8`, `99426aa`, `ce18b78`, then land
+`live_turnstile_smoke.rs` and `crates/obscura/tests/frame_*.rs`. Two invariants
+that abort the process if broken: `Page::frames` must be declared **before**
+`Page::js` (fields drop in declaration order and a realm holds a V8 handle), and
+ops must resolve their realm with `scope.get_entered_or_microtask_context()`,
+never `get_current_context()`.
+
+### 4. Close the remaining measured gaps
+
+`Element.prototype` privates, `window[0..49]`, ALPN advertising `h2`,
+`Navigator.prototype` member count, `history` enumerability.
+
+### 5. Write the sync rules into `CLAUDE.md`
+
+Not yet done. `AGENTS.md` belongs to upstream and must be taken as-is on every
+merge. The rules to write down are the ones this branch already follows: fork
+code lives in files upstream does not have; `bootstrap.js` takes markers, not
+inline edits; never reformat inside an upstream file; sync early and often; tag
+every sync point; push to `xrip` only.
+
+## Files to read first
 
 | file | why |
 |---|---|
-| `crates/obscura-js/src/frame.rs` | `FrameRealm`: construction, load events, message delivery |
-| `crates/obscura-js/js/bootstrap.js` | the bridge (search `postMessage between browsing contexts`), `_RemoteWindow`, `_IframeWindow`, `_loadIframeSrc`, `Worker` (~8437), `_trustedEvents` (~5923) |
-| `crates/obscura-browser/src/page.rs` | `attach_pending_frames`, `deliver_frame_messages`, `settle`, and the `execute_scripts` post-load loop |
-| `crates/obscura-js/src/ops.rs` | `RealmStates`, `realm_state`, `op_frame_document_ready`, `op_post_frame_message` |
-| `crates/obscura/tests/frame_messaging.rs` | 6 offline tests; each fails without its fix |
-| `crates/obscura-browser/tests/live_turnstile_smoke.rs` | the live guard |
-| `crates/obscura/examples/turnstile_probe.rs` | diagnosis: frame internals, capability gate, config, shadow content |
-| `tools/ab/turnstile.mjs` | Chrome vs Obscura on the same widget |
-
-## Next, by priority
-
-1. **Finish CDP frame use.** Route child execution contexts to their frame
-   realms, then emit `Page.frameDetached` when a navigation removes old
-   children. Discovery is done: Playwright now sees `page.frames()`.
-2. **Replace the `_IframeDocument` shim** with the frame realm's real document
-   behind `contentDocument`, and add same-origin access. The shim regex-strips
-   `<head>` and is a visible divergence from a browser.
-3. **Decide what to do about Workers** (see the honeypot section). Either
-   implement them properly or record deliberately that they are a shim and
-   accept the ceiling.
-4. **The managed Turnstile widget**: chase the `runImplicitRender` error, and
-   note that reaching `interactiveBegin` buys parity with Chrome, not a token —
-   that widget needs an interactive click in Chrome too.
-5. **`live_product_smoke`**: either update the Wildberries case to markup the
-   site still serves, or split "did the engine render it" from "did the site
-   serve it", so the test stops being read as a stealth signal.
+| `crates/obscura-js/build.rs` | the splice mechanism the whole JS isolation rests on |
+| `crates/obscura-js/js/fork_*.js` | every JS behaviour the fork adds |
+| `crates/obscura-browser/src/profiles.rs` | the profile engine (~1,440 lines) |
+| `crates/obscura-net/src/wreq_client.rs` | transport identity, `with_browser_identity` |
+| `crates/obscura-net/src/transport_profile.rs` | Chrome major to wreq emulation |
+| `crates/obscura-browser/tests/fork_*.rs` | what the fork guarantees, as tests |
+| `PROFILES.md` | profile selection, capture and catalog workflow |
+| `tools/ab/README.md` | the A/B harness and its hard-won warnings |
+| `AGENTS.md` | upstream's build/test rules; do not edit |
 
 ## Constraints and risks
 
-- **Proxy credentials must never be written into git, logs, tests or docs.**
-  They are passed at runtime only, via `--proxy` / `OBSCURA_PROXY`. Honoured
-  throughout; the commits were scanned before this handoff.
-- Wildberries/Ozon/Avito results are heavily IP-dependent and throttle rapidly.
-  Reproduce offline before concluding anything from them.
-- `tools/ab/*` strips proxy variables from child environments deliberately; a
-  proxy left in the shell once sent a run through an exit it never asked for.
-- Live tests are gated behind `--features stealth` so they stay out of a plain
-  run. Turnstile does **not** need stealth — it passes without TLS
-  impersonation — so that gate means "live network test" here, not "needs
-  stealth".
-- The settle loop now used by every page was restructured. It preserves the old
-  early-exit semantics, but it is the highest-blast-radius change in this work.
-- Deobfuscated Turnstile sources and protocol notes were left outside the repo,
-  in `C:\Temp\turnstile-analysis`, `C:\Temp\turnstile-interactive` and
-  `C:\Temp\turnstile-wasm`. They are scratch, not dependencies.
+- **Proxy credentials must never reach git, logs, tests or docs.** They arrive
+  at runtime only, via `--proxy` / `OBSCURA_PROXY`. `tools/ab/*` strips proxy
+  variables from child environments on purpose.
+- **Never push to `origin`.** Push to `xrip`.
+- **Do not bulk-run `cargo fmt`** - the tree is not rustfmt-clean and a blanket
+  format produces a huge unrelated diff.
+- **Keep ops panic-safe**: `op_dom` is wrapped in `catch_unwind` so a DOM-op
+  panic returns null rather than aborting inside V8's FFI frame.
+- The `render` feature is opt-in (`default = []`), so stealth work does not have
+  to fight the renderer. Both feature combinations build.
+- Wildberries, Ozon and Avito results are heavily IP-dependent and throttle
+  fast. Reproduce offline where possible; `tools/ab/clicklocal.mjs` runs the
+  whole click path against a local fixture in seconds.
 
-## Settled: no WebAssembly, no GPU
+## Intentionally uncommitted
 
-Checked three independent ways, because it decides whether this line of work is
-worth continuing: the blob worker captured from real Chrome (13 bytes); the
-265 KB challenge document; and the resolved string table, which is where this
-obfuscator keeps every string it can reference. No `WebAssembly`, `wasm`,
-`WebGL`, `WebGPU`, `getContext`, `toDataURL`, `getImageData`, `readPixels` or
-`OffscreenCanvas` anywhere. The proof-of-work is plain JavaScript using
-`BigUint64` arithmetic. There is no native kernel to reimplement, and WebGPU
-support is not on the critical path for Turnstile.
+- `.idea/` - IDE settings. Not in `.gitignore`; left untracked deliberately
+  rather than committing editor state or modifying ignore rules during a
+  handoff.
+- `polymorphic-hopping-eagle.md` - the plan document from the session that
+  started this rebuild. Superseded by this file; left in place rather than
+  deleted, since it is the owner's artifact.
