@@ -84,15 +84,32 @@ Ozon a JavaScript proof-of-work, Avito a SHA-256 proof-of-work with
 `blocked: true`. None of them is a profile problem, and the identity on the wire
 was verified correct.
 
-The measurable cause is the settle. The test asks for `page.settle(10_000)` but
-the whole three-site run finishes in 5.4s, so settle is returning after roughly
-1.5s per site: it exits as soon as V8 is momentarily idle, long before a
-challenge script has run its timers and promises. The settle loop that drives
-the event loop in slices is in `ce18b78`, which lands in stage 4. Expect this
-test to stay red until then.
+The cause is the settle, now measured offline rather than inferred. A local
+fixture whose only content is a 10ms `setTimeout` chain, so 200 ticks is about
+two seconds of page time:
 
-Note the Wildberries exit was IPv6 on a Hurricane Electric tunnel
-(`2001:470:...`). Results from that address are not representative.
+| budget | ticks | page time |
+|---|---|---|
+| `settle(500)` | 44 | ~440ms |
+| `settle(2000)` | 57 | ~570ms |
+| CLI, `OBSCURA_DYNAMIC_SCRIPT_SETTLE_MS` 1000 / 5000 / 15000 | 57 / 57 / 58 | ~650ms |
+
+Page time plateaus around 600ms however much is asked for. `settle` returns once
+V8 looks momentarily idle, and a pending timer chain does not count as busy, so
+a proof-of-work needing two seconds cannot finish. The sliced settle loop in
+`ce18b78` is the fix, and it lands in stage 4.
+
+`crates/obscura-browser/tests/fork_settle_budget.rs` pins this as an offline
+gate. It is `#[ignore]`d, so it stays out of the failure set; drop the attribute
+when stage 4 lands.
+
+The identity itself is not implicated. Verified directly with proxies cleared:
+exit IP `46.160.251.166` on both the plain and stealth paths, and a
+cross-surface probe in which `userAgent`, `appVersion`, `platform`, `vendor`,
+`userAgentData` brands and platform, the WebGL ANGLE/D3D11 AMD renderer, screen
+metrics and `Europe/Moscow` all agree, with `navigator.webdriver` false, five
+plugins and `pdfViewerEnabled` true. Wildberries is reached over the IPv6 exit
+(`2001:470:...`), which is this machine's normal route.
 
 ### Stage 3 result (WebGL and WebGPU identity)
 
