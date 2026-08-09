@@ -318,6 +318,28 @@ and the user agent. Two differences remain:
    the two `Cargo.lock`s resolve different wreq builds or the newer request path
    enables it.
 
+#### TLS is eliminated
+
+Both builds against `https://tls.browserleaks.com/json`:
+
+```
+             OLD (passes WB)                    NEW
+ja3_hash     fa8d3d5aa8809acb30340b84c418bceb   8552117e83c7ecab5870dd57616d65ca
+ja3n_hash    24dd0f987266c37f39231f6f2130d12e   24dd0f987266c37f39231f6f2130d12e
+ja4          t13d1011h1_61a7ad8aa9b6_3fcd1a44f3e3   (identical)
+```
+
+`ja3n` and `ja4` match, so the cipher suites, curves and versions are the same;
+only extension order differs. And ja3 varies on **every run of the same binary**
+(three consecutive runs gave three hashes), because the emulation shuffles
+extensions exactly as Chrome does. The ja3 difference is therefore noise, not a
+signal: **the two builds present equivalent TLS fingerprints.**
+
+That leaves HTTP/2 and headers as the only remaining transport candidates.
+`browserleaks` returned an empty `akamai_hash` here, so the HTTP/2 SETTINGS
+fingerprint is still unmeasured; find an endpoint that reports it, since that is
+the last untested piece.
+
 **Reordering the `.header()` calls does not change the wire order** - tried,
 measured, reverted. wreq owns the ordering, so the fix is at the wreq
 configuration level, not in how our code appends headers. Start there: compare
