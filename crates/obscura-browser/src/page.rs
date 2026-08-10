@@ -298,6 +298,18 @@ const MAX_STYLESHEET_IMPORT_DEPTH: u8 = 4;
 const MAX_STYLESHEET_RESOURCES: usize = 128;
 const DEFAULT_NAVIGATION_TIMEOUT_MS: u64 = 30_000;
 
+/// How many child frame realms one document may hold at once.
+///
+/// Real pages use a handful; the cap exists so a page that creates iframes in a
+/// loop cannot make the engine hold an unbounded number of contexts and DOM
+/// trees. Frames are released when the document is replaced.
+fn max_live_frames() -> usize {
+    std::env::var("OBSCURA_MAX_LIVE_FRAMES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(64)
+}
+
 fn default_navigation_timeout() -> std::time::Duration {
     navigation_timeout_from_env_value(std::env::var("OBSCURA_NAV_TIMEOUT_MS").ok().as_deref())
 }
@@ -998,6 +1010,20 @@ impl Page {
         }
 
         for frame in pending {
+            // A realm is a live v8::Context plus a DOM tree, and the page realm
+            // holds its window and document, so nothing here can be collected
+            // while the document lives. Frames are released when the document
+            // is replaced, so a page that churns iframes would otherwise grow
+            // the process without bound. Refuse past the cap rather than let a
+            // page decide how much memory to take.
+            if self.frames.len() >= max_live_frames() {
+                tracing::warn!(
+                    "refusing a realm for frame {}: already at the {} live frame cap",
+                    frame.url,
+                    max_live_frames(),
+                );
+                continue;
+            }
             let realm = match self.js.as_mut().and_then(|js| {
                 FrameRealm::new(js, frame.frame_id, frame.parent_frame_id, &frame.url, &frame.html)
             }) {
@@ -1114,6 +1140,69 @@ impl Page {
         true
     }
 
+    /// Discards the realms whose iframe element has left the document.
+    ///
+    /// A browser discards a child browsing context when its element is
+    /// removed: the document and its context are torn down. Nothing here can
+    /// be collected on its own, because the page realm holds each frame's
+    /// window and document so that `contentWindow` can be the frame's real
+    /// object, so a page that replaces an iframe repeatedly would otherwise
+    /// accumulate contexts and DOM trees for the life of the document.
+    ///
+    /// A frame nested inside a discarded frame is reached on a later pass,
+    /// once its own parent is gone.
+    fn release_detached_frames(&mut self) {
+        if self.frames.is_empty() {
+            return;
+        }
+        const LIVE_FRAME_IDS: &str =
+            "[...document.querySelectorAll('iframe')].map(f => f._frameId >>> 0).filter(id => id)";
+
+        let mut live: Vec<u32> = Vec::new();
+        if let Some(js) = self.js.as_mut() {
+            if let Ok(value) = js.evaluate(LIVE_FRAME_IDS) {
+                live.extend(serde_json::from_value::<Vec<u32>>(value).unwrap_or_default());
+            }
+        }
+        // A frame's own children are in that frame's document, not the page's.
+        for index in 0..self.frames.len() {
+            let Some(js) = self.js.as_mut() else { break };
+            if let Ok(value) = self.frames[index].evaluate(js, LIVE_FRAME_IDS) {
+                live.extend(serde_json::from_value::<Vec<u32>>(value).unwrap_or_default());
+            }
+        }
+
+        let discarded: Vec<u32> = self
+            .frames
+            .iter()
+            .map(|frame| frame.frame_id())
+            .filter(|id| !live.contains(id))
+            .collect();
+        if discarded.is_empty() {
+            return;
+        }
+
+        self.frames.retain(|frame| live.contains(&frame.frame_id()));
+        // Dropping the realm is not enough: the page realm still names the
+        // frame's window and document, which would keep the whole context
+        // reachable.
+        let script: String = discarded
+            .iter()
+            .map(|id| {
+                format!(
+                    "delete globalThis.__obscura_frameObjects[{id}];\
+                     delete globalThis.__obscura_frameWindows[{id}];"
+                )
+            })
+            .collect();
+        if let Some(js) = self.js.as_mut() {
+            if let Err(error) = js.execute_script("<frame-detach>", &script) {
+                tracing::debug!("releasing detached frames failed: {error}");
+            }
+        }
+        tracing::debug!("discarded {} detached frame realm(s)", discarded.len());
+    }
+
     /// Moves the frame tree forward by one step: give any fetched frame
     /// document a realm, then hand on any message waiting for a realm.
     ///
@@ -1123,6 +1212,7 @@ impl Page {
     async fn advance_frames(&mut self) -> bool {
         let attached = self.attach_pending_frames().await;
         let delivered = self.deliver_frame_messages();
+        self.release_detached_frames();
         attached || delivered
     }
 
