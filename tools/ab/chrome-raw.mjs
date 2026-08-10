@@ -217,7 +217,7 @@ function challengeFetchTraceScript() {
             truncated: text.length > 16_384,
             stack: safeStack(),
           });
-        } else if (/^https:\/\/marketplace-sentry\.wb\.ru\/api\/(?:183|355)\/envelope\//.test(requestUrl)) {
+        } else if (/^https:\\/\\/marketplace-sentry\\.wb\\.ru\\/api\\/(?:183|355)\\/envelope\\//.test(requestUrl)) {
           const body = init?.body;
           const text = typeof body === 'string' ? body : '';
           calls.push({
@@ -1262,8 +1262,12 @@ try {
   }
 
   if (opts.traceChallenge) {
+    const source = challengeFetchTraceScript();
+    // This is a generated script, so parsing chrome-raw.mjs does not validate
+    // it. Fail here instead of silently losing the page-error evidence.
+    new Function(source);
     await pageCdp.send('Page.addScriptToEvaluateOnNewDocument', {
-      source: challengeFetchTraceScript(),
+      source,
     });
   }
   if (opts.probeWbStartup) {
@@ -1276,6 +1280,7 @@ try {
   let documentResponse;
   let documentResponseRequestId;
   const diagnosticScripts = new Map();
+  const productDetailResponses = new Map();
   const challengeRequests = new Map();
   const pageErrorReports = [];
   const watchedNetwork = new Map();
@@ -1300,6 +1305,11 @@ try {
           item.protocol = message.params.response.protocol;
           item.mimeType = message.params.response.mimeType;
         }
+      }
+      if (dumpDir && message.method === 'Network.responseReceived' &&
+          /\/__internal\/u-card\/cards\/v4\/detail(?:\?|$)/
+            .test(message.params.response.url)) {
+        productDetailResponses.set(message.params.requestId, message.params.response);
       }
       if (opts.traceNetwork && message.method === 'Network.loadingFailed') {
         const item = watchedNetwork.get(message.params.requestId);
@@ -1613,6 +1623,26 @@ try {
     }
     writeFileSync(join(resourceDir, 'manifest.json'),
       JSON.stringify(resourceManifest, null, 2), 'utf8');
+    const productDetailManifest = [];
+    for (const [requestId, response] of productDetailResponses) {
+      const item = {
+        url: response.url,
+        status: response.status,
+        protocol: response.protocol,
+      };
+      try {
+        const body = await pageCdp.send('Network.getResponseBody', { requestId });
+        const bytes = body.base64Encoded
+          ? Buffer.from(body.body, 'base64')
+          : Buffer.from(body.body, 'utf8');
+        item.file = `${stem}-product-detail-${String(productDetailManifest.length).padStart(2, '0')}.json`;
+        item.bytes = bytes.length;
+        writeFileSync(join(dumpDir, item.file), bytes);
+      } catch (error) {
+        item.error = String(error);
+      }
+      productDetailManifest.push(item);
+    }
     let responseBody;
     let responseBodyError;
     if (documentResponseRequestId) {
@@ -1646,6 +1676,7 @@ try {
       challengeFetchCalls,
       pageErrorReports,
       watchedNetwork: [...watchedNetwork.values()],
+      productDetailResponses: productDetailManifest,
     }, null, 2), 'utf8');
     console.log('capture dir:', dumpDir);
   }
@@ -1677,6 +1708,19 @@ try {
         "(document.body ? document.body.innerText.replace(/\\s+/g, ' ') : '').length");
       if (at !== null) opened += 1;
       console.log(`card ${id}: ${at !== null ? `opened after ${at}s` : 'NEVER rendered'} (${length} chars)`);
+      if (at === null) {
+        const state = await evaluate(pageCdp, `JSON.stringify({
+          url: location.href,
+          title: document.title,
+          readyState: document.readyState,
+          text: (document.body?.innerText || '').replace(/\\s+/g, ' ').slice(0, 500),
+          rootChildren: document.querySelector('#appReactRoot')?.childNodes.length ?? null,
+          rootHtmlLength: document.querySelector('#appReactRoot')?.innerHTML.length ?? null,
+          pageErrors: globalThis.__abPageErrors || [],
+          tracedFetchCalls: globalThis.__abChallengeFetchCalls || [],
+        })`);
+        console.log(`card ${id} state: ${state}`);
+      }
     } catch (error) {
       console.log(`card ${id}: FAILED ${String(error).slice(0, 140)}`);
     }
