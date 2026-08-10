@@ -26,7 +26,7 @@
     return Object.getOwnPropertyNames(C.prototype).sort().join(',');
   };
   out.prototypes = {};
-  for (const n of ['Navigator', 'Performance', 'PerformanceTiming', 'Screen', 'Document',
+  for (const n of ['Navigator', 'Performance', 'PerformanceTiming', 'PerformanceNavigation', 'Screen', 'Document',
                    'Element', 'HTMLElement', 'HTMLCanvasElement', 'WebGLRenderingContext',
                    'WebGL2RenderingContext', 'Permissions', 'MediaDevices', 'NavigatorUAData',
                    'ScreenOrientation', 'EventTarget', 'Node', 'Window', 'Worker', 'Notification']) {
@@ -56,6 +56,16 @@
   }
   out.screen['#brand'] = safe(() => Object.prototype.toString.call(screen));
   out.screen['orientation.type'] = safe(() => screen.orientation.type);
+
+  out.performance = {
+    parent: safe(() => Object.getPrototypeOf(Performance.prototype).constructor.name),
+    own: safe(() => Object.getOwnPropertyNames(performance).sort().join(',')),
+    timingOwn: safe(() => Object.getOwnPropertyNames(performance.timing).sort().join(',')),
+    timingTag: safe(() => Object.prototype.toString.call(performance.timing)),
+    navigationOwn: safe(() => Object.getOwnPropertyNames(performance.navigation).sort().join(',')),
+    navigationTag: safe(() => Object.prototype.toString.call(performance.navigation)),
+    navigationToJSON: safe(() => typeof performance.navigation.toJSON),
+  };
 
   // 4. window-level surfaces that separate a browser from an engine.
   out.window = {

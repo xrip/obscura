@@ -784,8 +784,8 @@ fn normalize_webgl(value: &Value, webgl2: bool) -> Result<WebGlContent> {
     }
 
     let mut supported_extensions = string_list(value, &["supportedExtensions"])?;
-    supported_extensions.sort();
-    supported_extensions.dedup();
+    let mut seen_extensions = std::collections::HashSet::new();
+    supported_extensions.retain(|extension| seen_extensions.insert(extension.clone()));
 
     let raw_precision = value_at(value, &["shaderPrecisionFormats"])?
         .as_array()
@@ -1945,6 +1945,14 @@ mod tests {
         let text = serde_json::to_string(&webgl).unwrap();
         assert!(!text.contains("CAPABILITY_"));
         assert!(!text.contains("TIMEOUT_IGNORED"));
+    }
+
+    #[test]
+    fn supported_extension_order_matches_the_capture() {
+        let mut captured = test_webgl(82, false);
+        captured["supportedExtensions"] = json!(["z-last", "a-first", "z-last"]);
+        let webgl = normalize_webgl(&captured, false).unwrap();
+        assert_eq!(webgl.supported_extensions, vec!["z-last", "a-first"]);
     }
 
     #[test]

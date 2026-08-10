@@ -13,7 +13,9 @@ use crate::import_map::ImportMap;
 use crate::module_loader::{ModuleLoadActivity, ObscuraModuleLoader};
 #[cfg(all(test, feature = "render"))]
 use crate::ops::ensure_prepared_render;
-use crate::ops::{build_extension, node_is_script, ObscuraState, StoredNetworkResponseBody};
+use crate::ops::{
+    build_extension, node_is_script, ObscuraState, OriginStorage, StoredNetworkResponseBody,
+};
 #[cfg(feature = "render")]
 use crate::ops::{
     begin_animation_task, clamp_scroll_offset, document_base_url, ensure_resolved_scroll,
@@ -240,6 +242,24 @@ impl ObscuraJsRuntime {
                 ..Default::default()
             });
 
+            // JsRuntime has now loaded V8's ICU data. Apply the process zone to
+            // ICU itself, then clear this isolate's date cache without asking
+            // V8 to replace it with the Windows host zone again.
+            if let Some(timezone) = std::env::var("TZ")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+            {
+                if let Err(error) = crate::timezone::set_default_timezone(&timezone) {
+                    tracing::warn!(%error, "failed to set the native V8 timezone");
+                } else {
+                    runtime
+                        .v8_isolate()
+                        .date_time_configuration_change_notification(
+                            deno_core::v8::TimeZoneDetection::Skip,
+                        );
+                }
+            }
+
             runtime.op_state().borrow_mut().put(state_clone);
 
             runtime
@@ -278,6 +298,10 @@ impl ObscuraJsRuntime {
 
     pub fn set_cookie_jar(&self, jar: std::sync::Arc<obscura_net::CookieJar>) {
         self.state.borrow_mut().cookie_jar = Some(jar);
+    }
+
+    pub fn set_local_storage(&self, storage: std::sync::Arc<OriginStorage>) {
+        self.state.borrow_mut().local_storage = Some(storage);
     }
 
     pub fn set_http_client(&self, client: std::sync::Arc<obscura_net::ObscuraHttpClient>) {
@@ -457,7 +481,9 @@ impl ObscuraJsRuntime {
                 "globalThis.__obscura_viewport_w={width};\
                  globalThis.__obscura_viewport_h={height};\
                  globalThis.innerWidth={width};globalThis.innerHeight={height};\
-                 if(globalThis.visualViewport){{\
+                 if(typeof globalThis.__obscura_set_visual_viewport_size==='function'){{\
+                   globalThis.__obscura_set_visual_viewport_size({width},{height});\
+                 }}else if(globalThis.visualViewport){{\
                    globalThis.visualViewport.width={width};\
                    globalThis.visualViewport.height={height};\
                  }}\
@@ -2551,6 +2577,21 @@ mod tests {
     }
 
     #[test]
+    fn native_date_and_intl_use_process_timezone() {
+        // SAFETY: nextest gives this test its own process and no runtime or
+        // worker thread exists before this point.
+        unsafe { std::env::set_var("TZ", "Europe/Istanbul"); }
+        let mut rt = ObscuraJsRuntime::new();
+        let value = rt
+            .evaluate(
+                "({zone:Intl.DateTimeFormat().resolvedOptions().timeZone,offset:new Date().getTimezoneOffset()})",
+            )
+            .unwrap();
+        assert_eq!(value["zone"], "Europe/Istanbul");
+        assert_eq!(value["offset"], -180);
+    }
+
+    #[test]
     fn iframe_content_window_exposes_realm_globals() {
         let mut rt = setup_runtime("<html><body></body></html>");
 
@@ -3821,6 +3862,101 @@ mod tests {
                     "HierarchyRequestError",
                     "HierarchyRequestError"
                 ]
+            ])
+        );
+    }
+
+    #[test]
+    fn slot_elements_expose_named_default_flattened_and_manual_assignments() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r##"
+                const host = document.createElement("slot-host");
+                const plain = document.createElement("span");
+                plain.id = "plain";
+                const text = document.createTextNode("text");
+                const namedA = document.createElement("b");
+                namedA.id = "named-a";
+                namedA.slot = "label";
+                const namedB = document.createElement("i");
+                namedB.id = "named-b";
+                namedB.slot = "label";
+                host.append(plain, text, namedA, namedB);
+                document.body.appendChild(host);
+
+                const root = host.attachShadow({ mode: "open" });
+                root.innerHTML =
+                    "<slot name='label'></slot>" +
+                    "<slot id='default-slot'></slot>" +
+                    "<slot name='unused'><em id='fallback'></em></slot>";
+                const named = root.querySelector("slot[name='label']");
+                const defaultSlot = root.querySelector("#default-slot");
+                const unused = root.querySelector("slot[name='unused']");
+                const initial = [
+                    named instanceof HTMLSlotElement,
+                    !(host instanceof HTMLSlotElement),
+                    named.constructor === HTMLSlotElement,
+                    named.assignedElements().map(node => node.id),
+                    namedA.assignedSlot === named,
+                    defaultSlot.assignedNodes().map(node =>
+                        node.nodeType === Node.TEXT_NODE ? node.data : node.id),
+                    plain.assignedSlot === defaultSlot,
+                    text.assignedSlot === defaultSlot,
+                    unused.assignedElements().length,
+                    unused.assignedElements({ flatten: true }).map(node => node.id),
+                    unused.firstElementChild.assignedSlot === null
+                ];
+
+                namedB.slot = "";
+                const reassigned = [
+                    named.assignedElements().map(node => node.id),
+                    defaultSlot.assignedElements().map(node => node.id),
+                    namedB.assignedSlot === defaultSlot
+                ];
+
+                const manualHost = document.createElement("manual-slot-host");
+                const first = document.createElement("u");
+                first.id = "first";
+                const second = document.createElement("u");
+                second.id = "second";
+                manualHost.append(first, second);
+                document.body.appendChild(manualHost);
+                const manualRoot = manualHost.attachShadow({
+                    mode: "open",
+                    slotAssignment: "manual"
+                });
+                manualRoot.innerHTML = "<slot></slot>";
+                const manualSlot = manualRoot.querySelector("slot");
+                manualSlot.assign(second);
+
+                return [initial, reassigned,
+                    manualSlot.assignedElements().map(node => node.id),
+                    second.assignedSlot === manualSlot,
+                    first.assignedSlot === null];
+                "##,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                [
+                    true,
+                    true,
+                    true,
+                    ["named-a", "named-b"],
+                    true,
+                    ["plain", "text"],
+                    true,
+                    true,
+                    0,
+                    ["fallback"],
+                    true
+                ],
+                [["named-a"], ["plain", "named-b"], true],
+                ["second"],
+                true,
+                true
             ])
         );
     }
@@ -10904,6 +11040,7 @@ mod tests {
                       Array.from(pixels).every((value, index) => index % 4 !== 3 || value === 0),
                       untouched.width, untouched.height,
                       defaultEncoded.startsWith('data:image/png;base64,'),
+                      defaultEncoded.length < 10000,
                       Array.from(defaultPixels),
                       Array.from(resetPixel),
                     ];
@@ -10923,6 +11060,7 @@ mod tests {
                 true,
                 300,
                 150,
+                true,
                 true,
                 [0, 0, 0, 0],
                 [0, 0, 0, 0]
@@ -12453,6 +12591,25 @@ mod tests {
     }
 
     #[test]
+    fn test_location_replace_accepts_url_object() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let href = rt
+            .evaluate(
+                "(function() { location.replace(new URL('/accepted', location.href)); return location.href; })()",
+            )
+            .unwrap();
+        assert_eq!(href, serde_json::json!("http://example.com/accepted"));
+        assert_eq!(
+            rt.take_pending_navigation(),
+            Some((
+                "http://example.com/accepted".to_string(),
+                "GET".to_string(),
+                "".to_string()
+            ))
+        );
+    }
+
+    #[test]
     fn test_submit_button_click_handler_can_prevent_default_and_navigate() {
         let mut rt =
             setup_runtime(r#"<form><button type="submit" id="submit">Submit</button></form>"#);
@@ -13730,12 +13887,20 @@ mod tests {
     }
 
     #[test]
-    fn test_create_event_unknown_type_returns_event() {
+    fn test_create_event_rejects_unsupported_types() {
         let mut rt = setup_runtime("<html><body></body></html>");
-        let kind = rt
-            .evaluate("document.createEvent('NotARealType') instanceof Event")
+        let result = rt
+            .evaluate(
+                "(function(){var out=[];for(var name of ['NotARealType','TouchEvent']){try{document.createEvent(name);out.push(null)}catch(error){out.push([error.name,error instanceof DOMException])}}return out})()",
+            )
             .unwrap();
-        assert_eq!(kind, serde_json::json!(true));
+        assert_eq!(
+            result,
+            serde_json::json!([
+                ["NotSupportedError", true],
+                ["NotSupportedError", true]
+            ])
+        );
     }
 
     #[test]

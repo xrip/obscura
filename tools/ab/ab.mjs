@@ -9,6 +9,7 @@
 //     --wait <seconds>   how long to wait for the needle (default 20)
 //     --proxy <url>      send both engines through the same proxy
 //     --headed           show the Chrome window
+//     --trace-challenge  log safe WB VM and create-token shapes
 //
 // Obscura is launched with --stealth on a free port and killed afterwards.
 // OBSCURA_PROXY is used when --proxy is absent. Nothing is written to disk.
@@ -20,6 +21,7 @@
 // until it was found.
 
 import { runIn, tryEvaluate, evaluated } from './engines.mjs';
+import { installChallengeTrace, readChallengeTrace } from './challenge-trace.mjs';
 
 function parseArgs(argv) {
   const opts = { wait: 20, headed: false };
@@ -32,6 +34,7 @@ function parseArgs(argv) {
     else if (arg === '--only') opts.only = argv[++i];
     else if (arg === '--wait') opts.wait = Number(argv[++i]);
     else if (arg === '--proxy') opts.proxy = argv[++i];
+    else if (arg === '--trace-challenge') opts.traceChallenge = true;
     else rest.push(arg);
   }
   opts.url = rest[0];
@@ -41,7 +44,8 @@ function parseArgs(argv) {
 const opts = parseArgs(process.argv.slice(2));
 if (!opts.url) {
   console.error('usage: node tools/ab/ab.mjs <url> [--needle text] [--match regexp]' +
-                ' [--only chrome|obscura] [--wait seconds] [--proxy url] [--headed]');
+                ' [--only chrome|obscura] [--wait seconds] [--proxy url] [--headed]' +
+                ' [--trace-challenge]');
   process.exit(2);
 }
 
@@ -49,6 +53,8 @@ async function scenario(page) {
   const traffic = [];
   const errors = [];
   let requests = 0;
+
+  if (opts.traceChallenge) await installChallengeTrace(page);
 
   page.on('request', () => { requests += 1; });
   page.on('response', response => {
@@ -79,10 +85,39 @@ async function scenario(page) {
     }
   }
 
+  let challenge = {};
+  if (opts.traceChallenge) {
+    for (let second = 1; second <= opts.wait; second++) {
+      await new Promise(done => setTimeout(done, 1000));
+      challenge = await readChallengeTrace(page, tryEvaluate, evaluated);
+      if (challenge.vmfp?.length && challenge.token?.length >= 2) break;
+    }
+  }
+
   const bodyLength = evaluated(await tryEvaluate(page, () =>
     (document.body ? document.body.innerText.replace(/\s+/g, ' ') : '').length));
 
-  return { needleAfter, bodyLength, requests, traffic, errors, elapsed: Date.now() - started };
+  let challengeState = null;
+  if (opts.traceChallenge) {
+    challengeState = evaluated(await tryEvaluate(page, () => {
+      const token = (`; ${document.cookie}`).split('; x_wbaas_token=')[1]?.split(';')[0] || '';
+      return {
+        url: location.href.split('?')[0],
+        title: document.title,
+        h1: document.querySelector('h1')?.innerText || '',
+        text: (document.body?.innerText || '').replace(/\s+/g, ' ').slice(0, 220),
+        readyState: document.readyState,
+        tokenCookieLength: token.length,
+        reloadType: typeof document.location.reload,
+        thresholdPresent: localStorage.getItem('x_wbaas_token_treshold') !== null,
+      };
+    }));
+  }
+
+  return {
+    needleAfter, bodyLength, requests, traffic, errors, challenge, challengeState,
+    elapsed: Date.now() - started,
+  };
 }
 
 const engines = opts.only ? [opts.only] : ['chrome', 'obscura'];
@@ -96,6 +131,10 @@ for (const engine of engines) {
       console.log(`   matched responses: ${out.traffic.length}`);
       for (const line of out.traffic.slice(0, 30)) console.log('     ' + line);
       if (out.traffic.length > 30) console.log(`     ... and ${out.traffic.length - 30} more`);
+    }
+    if (opts.traceChallenge) {
+      console.log(`   challenge trace: ${JSON.stringify(out.challenge)}`);
+      console.log(`   challenge state: ${JSON.stringify(out.challengeState)}`);
     }
     const unique = [...new Set(out.errors)];
     for (const line of unique.slice(0, 12)) console.log('   ' + line);

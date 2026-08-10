@@ -628,12 +628,31 @@ fn merge_cookie_delta(
 /// Best-effort: the socket is going away either way, so a failed write just
 /// means the client sees a reset instead of the 503.
 fn refuse_connection(stream: std::net::TcpStream) {
-    use std::io::Write;
+    use std::io::{Read, Write};
     let mut stream = stream;
     let _ = stream.set_nonblocking(false);
+
+    // The accept thread only peeked at the WebSocket handshake. Consume its
+    // bounded HTTP header before closing: Windows resets a socket closed with
+    // unread receive data, which can discard the queued 503 response.
+    let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(100)));
+    let mut request = [0u8; HTTP_PEEK_BUF];
+    let mut received = 0;
+    while received < request.len() {
+        match stream.read(&mut request[received..]) {
+            Ok(0) => break,
+            Ok(n) => {
+                received += n;
+                if request[..received].windows(4).any(|end| end == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
     let _ = stream.write_all(CONNECTION_LIMIT_RESPONSE.as_bytes());
     let _ = stream.flush();
-    let _ = stream.shutdown(std::net::Shutdown::Both);
+    let _ = stream.shutdown(std::net::Shutdown::Write);
 }
 
 const HTTP_PEEK_BUF: usize = 4096;
@@ -1044,37 +1063,48 @@ async fn pump_live_page_event_loop(ctx: &mut CdpContext) -> Result<bool, String>
 }
 
 fn sync_live_page_network_events(ctx: &mut CdpContext) {
-    let page_route = ctx.pages.iter().find(|page| page.has_js()).and_then(|page| {
-        ctx.sessions
-            .iter()
-            .find(|(_, page_id)| *page_id == &page.id)
-            .map(|(session_id, _)| {
-                (
-                    Some(session_id.clone()),
-                    page.id.clone(),
-                    page.frame_id.clone(),
-                    page.url_string(),
-                )
-            })
-    });
-    let Some((session_id, page_id, frame_id, page_url)) = page_route else {
-        return;
-    };
-    let network_events = {
-        let Some(page) = ctx.get_page_mut(&page_id) else {
-            return;
+    let page_routes = ctx
+        .pages
+        .iter()
+        .filter(|page| page.has_js())
+        .filter_map(|page| {
+            let mut session_ids = ctx
+                .sessions
+                .iter()
+                .filter(|(_, page_id)| *page_id == &page.id)
+                .map(|(session_id, _)| session_id.clone())
+                .collect::<Vec<_>>();
+            if session_ids.is_empty() {
+                return None;
+            }
+            session_ids.sort();
+            Some((
+                session_ids,
+                page.id.clone(),
+                page.frame_id.clone(),
+                page.url_string(),
+            ))
+        })
+        .collect::<Vec<_>>();
+    for (session_ids, page_id, frame_id, page_url) in page_routes {
+        let network_events = {
+            let Some(page) = ctx.get_page_mut(&page_id) else {
+                continue;
+            };
+            page.sync_js_network_events();
+            page.network_events.drain(..).collect::<Vec<_>>()
         };
-        page.sync_js_network_events();
-        page.network_events.drain(..).collect::<Vec<_>>()
-    };
-    crate::domains::page::emit_runtime_network_events(
-        ctx,
-        &session_id,
-        &frame_id,
-        &page_url,
-        &page_id,
-        &network_events,
-    );
+        for session_id in session_ids {
+            crate::domains::page::emit_runtime_network_events(
+                ctx,
+                &Some(session_id),
+                &frame_id,
+                &page_url,
+                &page_id,
+                &network_events,
+            );
+        }
+    }
 }
 
 fn take_live_pending_navigation(
@@ -1671,6 +1701,7 @@ async fn handle_connection_ws(
 mod tests {
     use super::{
         handle_fetch_resolution, is_navigate_method, merge_cookie_delta, parse_cdp_headers,
+        sync_live_page_network_events,
     };
     #[cfg(feature = "render")]
     use super::{pump_and_forward_screencast_frames, pump_live_page_event_loop};
@@ -1689,6 +1720,56 @@ mod tests {
             same_site: "Lax".to_string(),
             expires: None,
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn runtime_network_events_reach_every_page_session() {
+        let mut ctx = crate::dispatch::CdpContext::new();
+        let page_id = ctx.create_page();
+        ctx.sessions
+            .insert("managed-session".into(), page_id.clone());
+        ctx.sessions
+            .insert("explicit-session".into(), page_id.clone());
+        let page = ctx.get_page_mut(&page_id).expect("page");
+        page.navigate("data:text/html,<html><body>ready</body></html>")
+            .await
+            .expect("initialize page runtime");
+        page.network_events.clear();
+        page.network_events.push(obscura_browser::NetworkEvent {
+            request_id: "fetch-1".into(),
+            url: "https://example.test/data.json".into(),
+            method: "GET".into(),
+            resource_type: "Fetch".into(),
+            status: 200,
+            headers: HashMap::new(),
+            response_headers: std::sync::Arc::new(HashMap::from([(
+                "content-type".into(),
+                "application/json".into(),
+            )])),
+            body_size: 2,
+            timestamp: 42.0,
+        });
+
+        sync_live_page_network_events(&mut ctx);
+
+        for session_id in ["managed-session", "explicit-session"] {
+            let methods = ctx
+                .pending_events
+                .iter()
+                .filter(|event| event.session_id.as_deref() == Some(session_id))
+                .map(|event| event.method.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                methods,
+                [
+                    "Network.requestWillBeSent",
+                    "Network.responseReceived",
+                    "Network.loadingFinished",
+                ],
+                "every valid page session must observe the completed fetch",
+            );
+        }
+        assert_eq!(ctx.pending_events.len(), 6);
     }
 
     #[tokio::test(flavor = "current_thread")]

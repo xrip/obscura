@@ -97,7 +97,7 @@ mod image_capability_tests {
 mod paint;
 #[cfg(feature = "paint")]
 pub use paint::{
-    image_intrinsic_dimensions, paint_dom, paint_dom_scrolled,
+    canvas_text_metrics, draw_canvas_text_rgba, image_intrinsic_dimensions, paint_dom, paint_dom_scrolled,
     paint_dom_scrolled_at_animation_time,
     paint_dom_scrolled_at_animation_time_with_surface_color, paint_prepared,
     paint_prepared_region_with_scroll, paint_prepared_region_with_scroll_and_surface_color,

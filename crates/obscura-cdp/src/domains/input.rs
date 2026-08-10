@@ -131,7 +131,7 @@ pub async fn handle(
                     page.evaluate(&code);
                 }
             } else if event_type == "mouseReleased" {
-                if let Some(page) = ctx.get_session_page_mut(session_id) {
+                let navigation = if let Some(page) = ctx.get_session_page_mut(session_id) {
                     let code = format!(
                         "(function() {{\
                             var target = (document.elementFromPoint && document.elementFromPoint({x},{y})) || globalThis.__obscura_click_target || document.activeElement || document.body;\
@@ -211,12 +211,59 @@ pub async fn handle(
                         .process_pending_navigation()
                         .await
                         .map_err(|e| e.to_string())?;
-                    // Fork: a single page app answers a click by routing itself,
-                    // with no document fetch. The client still has to be told the
-                    // frame moved, or the click looks like it did nothing.
                     if moved {
                         let url = page.url_string();
                         let frame_id = page.frame_id.clone();
+                        let page_id = page.id.clone();
+                        let is_document_navigation = page.network_events.iter().any(|event| {
+                            event.resource_type == "Document" && event.url == url
+                        });
+                        let network_events = if is_document_navigation {
+                            page.network_events.drain(..).collect::<Vec<_>>()
+                        } else {
+                            Vec::new()
+                        };
+                        Some((
+                            url,
+                            frame_id,
+                            page_id,
+                            network_events,
+                            page.lifecycle.is_network_idle(),
+                            is_document_navigation,
+                        ))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                if let Some((
+                    url,
+                    frame_id,
+                    page_id,
+                    network_events,
+                    reached_network_idle,
+                    is_document_navigation,
+                )) = navigation
+                {
+                    if is_document_navigation {
+                        let loader_id = format!("loader-{}", uuid::Uuid::new_v4());
+                        super::page::emit_navigation_events(
+                            ctx,
+                            session_id,
+                            &frame_id,
+                            &loader_id,
+                            &url,
+                            &page_id,
+                            &network_events,
+                            obscura_browser::lifecycle::WaitUntil::Load,
+                            reached_network_idle,
+                        );
+                    } else {
+                        // A single page app may answer a click by routing itself
+                        // without replacing its realm. Report the frame move, but
+                        // keep the still-live execution contexts intact.
                         ctx.pending_events.push(crate::types::CdpEvent {
                             method: "Page.frameNavigated".into(),
                             params: json!({

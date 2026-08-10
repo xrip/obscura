@@ -49,4 +49,10 @@
   Object.defineProperty(globalThis, 'EventTarget', {
     value: EventTarget_, writable: true, enumerable: false, configurable: true,
   });
+
+  // Performance is created earlier so it can replace upstream's plain object.
+  // Re-parent it only after the real EventTarget interface exists.
+  if (typeof globalThis.Performance === 'function') {
+    try { Object.setPrototypeOf(globalThis.Performance.prototype, proto); } catch (_) {}
+  }
 })();

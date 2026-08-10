@@ -10,10 +10,15 @@ async fn serve_fixture() -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        let (mut socket, _) = listener.accept().await.unwrap();
-        let mut buf = [0u8; 2048];
-        let _ = socket.read(&mut buf).await.unwrap();
-        let body = r#"<!doctype html><html><head><style>
+        for _ in 0..2 {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 2048];
+            let read = socket.read(&mut buf).await.unwrap();
+            let request = String::from_utf8_lossy(&buf[..read]);
+            let body = if request.starts_with("GET /next ") {
+                "<!doctype html><html><body id=next-page>next document</body></html>"
+            } else {
+                r#"<!doctype html><html><head><style>
             html, body { margin: 0; }
             #page { width: 1800px; height: 2400px; }
             #box { position: absolute; left: 20px; top: 20px; width: 180px;
@@ -27,12 +32,14 @@ async fn serve_fixture() -> String {
             <input id="radio-a" type="radio" name="choice" checked>
             <input id="radio-b" type="radio" name="choice">
           </form>
-        </body></html>"#;
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-            body.len()
-        );
-        let _ = socket.write_all(response.as_bytes()).await;
+        </body></html>"#
+            };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        }
     });
     format!("http://{addr}/")
 }
@@ -93,6 +100,25 @@ async fn wheel(ctx: &mut CdpContext, id: u64, sid: &str, x: f64, y: f64, dx: f64
         id,
         "Input.dispatchMouseEvent",
         json!({"type": "mouseWheel", "x": x, "y": y, "deltaX": dx, "deltaY": dy}),
+        sid,
+    )
+    .await;
+}
+
+async fn click(ctx: &mut CdpContext, id: u64, sid: &str, x: f64, y: f64) {
+    cdp(
+        ctx,
+        id,
+        "Input.dispatchMouseEvent",
+        json!({"type": "mousePressed", "x": x, "y": y, "button": "left"}),
+        sid,
+    )
+    .await;
+    cdp(
+        ctx,
+        id + 1,
+        "Input.dispatchMouseEvent",
+        json!({"type": "mouseReleased", "x": x, "y": y, "button": "left"}),
         sid,
     )
     .await;
@@ -243,6 +269,153 @@ async fn hit_testing_clips_scrolled_children_at_overflow_padding_edge() {
     assert!(result["innerRight"].as_f64().unwrap() >= 25.0);
     assert_eq!(result["boxLeft"], 20.0);
     assert_eq!(result["hit"], "box", "content hidden behind the border cannot win hit testing");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn content_quad_centers_hit_their_dense_wrapped_inline_owners() {
+    let (mut ctx, sid) = setup().await;
+    evaluate(
+        &mut ctx,
+        2,
+        r#"(() => {
+            document.body.innerHTML = '<style>html,body,p{margin:0}p{width:800px;font:16px/20px monospace}</style><p>' +
+                Array.from({length:400}, (_, i) => '<a id="a' + i + '">a' + i + '</a>').join(' ') +
+                '</p>';
+        })()"#,
+        &sid,
+    )
+    .await;
+
+    for (request_id, id) in [(3, "a0"), (6, "a1"), (9, "a399")] {
+        let query = cdp(
+            &mut ctx,
+            request_id,
+            "DOM.querySelector",
+            json!({"nodeId": 0, "selector": format!("#{id}")}),
+            &sid,
+        )
+        .await;
+        let node_id = query["nodeId"].as_u64().expect("inline owner nodeId");
+        let quads = cdp(
+            &mut ctx,
+            request_id + 1,
+            "DOM.getContentQuads",
+            json!({"nodeId": node_id}),
+            &sid,
+        )
+        .await;
+        let quad: Vec<f64> = quads["quads"][0]
+            .as_array()
+            .expect("one content quad")
+            .iter()
+            .map(|value| value.as_f64().expect("numeric quad coordinate"))
+            .collect();
+
+        let page = evaluate(
+            &mut ctx,
+            request_id + 2,
+            &format!(
+                "(() => {{ const el = document.getElementById('{id}'); const r = el.getBoundingClientRect(); const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2); return JSON.stringify({{rect:[r.left,r.top,r.right,r.bottom],hit:hit && hit.id}}); }})()"
+            ),
+            &sid,
+        )
+        .await;
+        let page: Value =
+            serde_json::from_str(page["result"]["value"].as_str().unwrap()).unwrap();
+        let rect = page["rect"].as_array().unwrap();
+        let left = rect[0].as_f64().unwrap();
+        let top = rect[1].as_f64().unwrap();
+        let right = rect[2].as_f64().unwrap();
+        let bottom = rect[3].as_f64().unwrap();
+        let expected = [left, top, right, top, right, bottom, left, bottom];
+
+        assert_eq!(quad.len(), expected.len());
+        for (actual, expected) in quad.iter().zip(expected) {
+            assert!((actual - expected).abs() < 0.01, "{id} quad differs from its page rect");
+        }
+        assert_eq!(page["hit"], id, "{id} content-quad center hit another owner");
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn click_document_navigation_clears_and_recreates_execution_contexts() {
+    let (mut ctx, sid) = setup().await;
+    evaluate(
+        &mut ctx,
+        2,
+        r#"(() => {
+            const link = document.createElement('a');
+            link.id = 'next';
+            link.href = '/next';
+            link.textContent = 'next';
+            document.body.appendChild(link);
+            document.elementFromPoint = () => link;
+        })()"#,
+        &sid,
+    )
+    .await;
+    ctx.pending_events.clear();
+    ctx.valid_context_ids.insert(999);
+
+    click(&mut ctx, 3, &sid, 10.0, 10.0).await;
+
+    let methods: Vec<&str> = ctx.pending_events.iter().map(|event| event.method.as_str()).collect();
+    let cleared = methods
+        .iter()
+        .position(|method| *method == "Runtime.executionContextsCleared")
+        .expect("document click navigation must clear old contexts");
+    let navigated = methods
+        .iter()
+        .position(|method| *method == "Page.frameNavigated")
+        .expect("document click navigation must report the new frame");
+    let created = methods
+        .iter()
+        .position(|method| *method == "Runtime.executionContextCreated")
+        .expect("document click navigation must create the new default context");
+    assert!(cleared < navigated && navigated < created, "wrong context event order: {methods:?}");
+    assert!(!ctx.valid_context_ids.contains(&999), "stale click-navigation context survived");
+    assert!(ctx.valid_context_ids.contains(&2), "new default context was not registered");
+
+    let page = ctx.get_session_page_mut(&Some(sid.clone())).unwrap();
+    assert_eq!(page.url.as_ref().unwrap().path(), "/next");
+    assert!(page.evaluate("document.body.id") == "next-page");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn click_push_state_navigation_keeps_the_live_execution_context() {
+    let (mut ctx, sid) = setup().await;
+    evaluate(
+        &mut ctx,
+        2,
+        r#"(() => {
+            const link = document.createElement('a');
+            link.id = 'spa';
+            link.href = '/spa';
+            link.textContent = 'spa';
+            link.addEventListener('click', event => {
+                event.preventDefault();
+                history.pushState({}, '', '/spa');
+            });
+            document.body.appendChild(link);
+            document.elementFromPoint = () => link;
+        })()"#,
+        &sid,
+    )
+    .await;
+    ctx.pending_events.clear();
+    ctx.valid_context_ids.insert(999);
+
+    click(&mut ctx, 3, &sid, 10.0, 10.0).await;
+
+    let methods: Vec<&str> = ctx.pending_events.iter().map(|event| event.method.as_str()).collect();
+    assert!(methods.contains(&"Page.frameNavigated"), "SPA click did not report its URL: {methods:?}");
+    assert!(
+        !methods.contains(&"Runtime.executionContextsCleared"),
+        "pushState must not clear a still-live realm: {methods:?}"
+    );
+    assert!(ctx.valid_context_ids.contains(&999), "pushState pruned a live execution context");
+    let page = ctx.get_session_page_mut(&Some(sid.clone())).unwrap();
+    assert_eq!(page.url.as_ref().unwrap().path(), "/spa");
 }
 
 #[tokio::test(flavor = "current_thread")]

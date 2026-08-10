@@ -1933,6 +1933,61 @@ fn fetch_timeout() -> std::time::Duration {
     std::time::Duration::from_millis(timeout_ms)
 }
 
+/// Record one scripted fetch/XHR response for CDP Network events and
+/// Network.getResponseBody. Both the ordinary and stealth transports must use
+/// this path so enabling stealth does not hide the page's own traffic.
+fn record_scripted_request(
+    state: &Rc<RefCell<OpState>>,
+    url: &str,
+    method: &str,
+    status: u16,
+    resp_headers: &HashMap<String, String>,
+    resp_bytes: &[u8],
+    resp_body: &str,
+) -> String {
+    let state_borrow = state.borrow();
+    let gs = state_borrow.borrow::<SharedState>().clone();
+    let mut gs = gs.borrow_mut();
+    gs.network_response_body_counter += 1;
+    let request_id = format!("fetch-{}", gs.network_response_body_counter);
+    let max_entries = response_body_entry_limit();
+    let max_bytes = response_body_byte_limit();
+    if max_entries > 0 && max_bytes > 0 && resp_bytes.len() <= max_bytes {
+        gs.network_response_bodies.insert(
+            request_id.clone(),
+            StoredNetworkResponseBody {
+                body: resp_body.to_string(),
+                base64_encoded: false,
+            },
+        );
+        gs.network_response_body_order.push_back(request_id.clone());
+        while gs.network_response_body_order.len() > max_entries {
+            if let Some(oldest) = gs.network_response_body_order.pop_front() {
+                gs.network_response_bodies.remove(&oldest);
+            }
+        }
+    }
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
+    gs.js_network_events.push(JsNetworkEvent {
+        request_id: request_id.clone(),
+        url: url.to_string(),
+        method: method.to_string(),
+        status,
+        response_headers: resp_headers.clone(),
+        body_size: resp_bytes.len(),
+        timestamp,
+    });
+    const MAX_JS_NETWORK_EVENTS: usize = 4096;
+    if gs.js_network_events.len() > MAX_JS_NETWORK_EVENTS {
+        let overflow = gs.js_network_events.len() - MAX_JS_NETWORK_EVENTS;
+        gs.js_network_events.drain(0..overflow);
+    }
+    request_id
+}
+
 /// Cap on the number of redirect hops op_fetch_url will follow.
 /// Matches reqwest's default policy of 10.
 const FETCH_REDIRECT_LIMIT: usize = 10;
@@ -1994,6 +2049,7 @@ async fn op_fetch_url(
     #[string] origin: String,
     #[string] mode: String,
     #[string] credentials: String,
+    #[string] document_url: String,
 ) -> Result<String, deno_error::JsErrorBox> {
     tracing::debug!(
         "op_fetch_url called: {} {} (intercept check pending)",
@@ -2280,6 +2336,7 @@ async fn op_fetch_url(
         };
         if let Some(stealth) = stealth {
             return stealth_fetch_all(
+                state.clone(),
                 stealth,
                 url.clone(),
                 req_method.as_str().to_string(),
@@ -2288,6 +2345,7 @@ async fn op_fetch_url(
                 page_origin.clone(),
                 mode.clone(),
                 credentials,
+                document_url.clone(),
                 callbacks.clone(),
                 allow_private_network,
             )
@@ -2494,53 +2552,15 @@ async fn op_fetch_url(
             cbs.fire_response(&info, &resp).await;
         }
     }
-    let response_request_id = {
-        let state_borrow = state.borrow();
-        let gs = state_borrow.borrow::<SharedState>().clone();
-        let mut gs = gs.borrow_mut();
-        gs.network_response_body_counter += 1;
-        let request_id = format!("fetch-{}", gs.network_response_body_counter);
-        let max_entries = response_body_entry_limit();
-        let max_bytes = response_body_byte_limit();
-        if max_entries > 0 && max_bytes > 0 && resp_bytes.len() <= max_bytes {
-            gs.network_response_bodies.insert(
-                request_id.clone(),
-                StoredNetworkResponseBody {
-                    body: resp_body.clone(),
-                    base64_encoded: false,
-                },
-            );
-            gs.network_response_body_order.push_back(request_id.clone());
-            while gs.network_response_body_order.len() > max_entries {
-                if let Some(oldest) = gs.network_response_body_order.pop_front() {
-                    gs.network_response_bodies.remove(&oldest);
-                }
-            }
-        }
-        // Record a network event so the CDP layer emits requestWillBeSent /
-        // responseReceived for this script-initiated request (#406). Keyed by
-        // the same fetch-{N} id as the stored body so Network.getResponseBody
-        // resolves. Capped to keep a long-lived page from growing unbounded.
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
-        gs.js_network_events.push(JsNetworkEvent {
-            request_id: request_id.clone(),
-            url: url.clone(),
-            method: method.clone(),
-            status,
-            response_headers: resp_headers.clone(),
-            body_size: resp_bytes.len(),
-            timestamp,
-        });
-        const MAX_JS_NETWORK_EVENTS: usize = 4096;
-        if gs.js_network_events.len() > MAX_JS_NETWORK_EVENTS {
-            let overflow = gs.js_network_events.len() - MAX_JS_NETWORK_EVENTS;
-            gs.js_network_events.drain(0..overflow);
-        }
-        request_id
-    };
+    let response_request_id = record_scripted_request(
+        &state,
+        &url,
+        &method,
+        status,
+        &resp_headers,
+        &resp_bytes,
+        &resp_body,
+    );
 
     tracing::debug!(
         "op_fetch_url completed: {} {} ({} bytes)",
@@ -2582,10 +2602,10 @@ fn fetch_response(
 /// and CORS semantics but sends every hop through the wreq stealth client so
 /// the request carries the Chrome TLS fingerprint and client hints. Cookie
 /// handling lives inside StealthHttpClient::send_single, which shares the
-/// context jar. Response bodies are not mirrored into the CDP
-/// Network.getResponseBody buffer here; that is a follow-up for stealth fetches.
+/// context jar.
 #[cfg(feature = "stealth")]
 async fn stealth_fetch_all(
+    state: Rc<RefCell<OpState>>,
     stealth: Arc<StealthHttpClient>,
     url: String,
     method: String,
@@ -2594,6 +2614,7 @@ async fn stealth_fetch_all(
     page_origin: String,
     mode: String,
     credentials: FetchCredentials,
+    document_url: String,
     callbacks: Option<Arc<CallbackRegistry>>,
     allow_private_network: bool,
 ) -> Result<String, deno_error::JsErrorBox> {
@@ -2615,11 +2636,49 @@ async fn stealth_fetch_all(
 
         let mut req_headers: HashMap<String, String> = HashMap::new();
         let current_is_cross_origin = parsed_current.origin().ascii_serialization() != page_origin;
-        if current_is_cross_origin {
+        let fetch_mode = if mode.is_empty() { "cors" } else { mode.as_str() };
+        req_headers.insert(
+            "accept".to_string(),
+            custom_headers
+                .get("accept")
+                .cloned()
+                .unwrap_or_else(|| "*/*".to_string()),
+        );
+        req_headers.insert(
+            "sec-fetch-dest".to_string(),
+            if fetch_mode == "no-cors" { "script" } else { "empty" }.to_string(),
+        );
+        req_headers.insert("sec-fetch-mode".to_string(), fetch_mode.to_string());
+        req_headers.insert(
+            "sec-fetch-site".to_string(),
+            if current_is_cross_origin {
+                "cross-site"
+            } else {
+                "same-origin"
+            }
+            .to_string(),
+        );
+        if (!current_is_cross_origin && current_method != "GET" && current_method != "HEAD")
+            || current_is_cross_origin
+        {
             req_headers.insert("origin".to_string(), page_origin.clone());
         }
         for (k, v) in &custom_headers {
             req_headers.insert(k.to_lowercase(), v.clone());
+        }
+
+        if let Ok(mut referrer_url) = url::Url::parse(&document_url) {
+            referrer_url.set_fragment(None);
+            let referer = if referrer_url.origin().ascii_serialization()
+                == parsed_current.origin().ascii_serialization()
+            {
+                referrer_url.to_string()
+            } else {
+                page_origin.clone()
+            };
+            if !referer.is_empty() {
+                req_headers.insert("referer".to_string(), referer);
+            }
         }
 
         let credentials_allowed = credentials.allows(&page_origin, &current_url);
@@ -2719,10 +2778,21 @@ async fn stealth_fetch_all(
         }
     }
 
+    let request_id = record_scripted_request(
+        &state,
+        &url,
+        &current_method,
+        status,
+        &resp_headers,
+        &resp_bytes,
+        &resp_body,
+    );
+
     Ok(serde_json::json!({
         "status": status,
         "body": resp_body,
         "bodyBase64": resp_body_base64,
+        "requestId": request_id,
         "url": url,
         "headers": resp_headers,
     })
@@ -3356,6 +3426,38 @@ fn op_subtle_digest(#[string] algorithm: &str, #[buffer] data: &[u8]) -> Vec<u8>
         "SHA-512/256" => sha2::Sha512_256::digest(data).to_vec(),
         _ => vec![],
     }
+}
+
+#[op2(fast)]
+fn op_monotonic_time_ms() -> f64 {
+    static ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    ORIGIN
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_secs_f64()
+        * 1_000.0
+}
+
+/// Compress PNG scanlines with a normal zlib stream. Canvas toDataURL is
+/// synchronous, so this small sync op replaces the old stored-block encoder
+/// that made a default 300x150 canvas about 240 KB after base64 encoding.
+#[op2]
+#[buffer]
+fn op_zlib_deflate(#[buffer] data: &[u8]) -> Vec<u8> {
+    use std::io::Write as _;
+
+    const MAX_INPUT_BYTES: usize = 256 * 1024 * 1024;
+    if data.len() > MAX_INPUT_BYTES {
+        return Vec::new();
+    }
+    let mut encoder = flate2::write::ZlibEncoder::new(
+        Vec::new(),
+        flate2::Compression::default(),
+    );
+    if encoder.write_all(data).is_err() {
+        return Vec::new();
+    }
+    encoder.finish().unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -3993,6 +4095,71 @@ fn op_canvas_register_surface(
     true
 }
 
+#[cfg(feature = "render")]
+#[op2]
+#[string]
+fn op_canvas_measure_text(
+    #[string] text: &str,
+    size: f64,
+    bold: bool,
+    italic: bool,
+    #[string] family: &str,
+) -> String {
+    let (width, ascent, descent) = obscura_render::canvas_text_metrics(
+        text,
+        size as f32,
+        bold,
+        italic,
+        Some(family),
+    );
+    serde_json::json!({
+        "width": width,
+        "ascent": ascent,
+        "descent": descent,
+    })
+    .to_string()
+}
+
+#[cfg(feature = "render")]
+#[op2(fast)]
+fn op_canvas_fill_text(
+    state: &OpState,
+    nid: u32,
+    #[string] text: &str,
+    x: f64,
+    y: f64,
+    size: f64,
+    bold: bool,
+    italic: bool,
+    #[string] family: &str,
+    red: u32,
+    green: u32,
+    blue: u32,
+    alpha: u32,
+) -> bool {
+    if red > 255 || green > 255 || blue > 255 || alpha > 255 {
+        return false;
+    }
+    let shared = state.borrow::<SharedState>().clone();
+    let mut state = shared.borrow_mut();
+    let Some(surface) = state.canvas_surfaces.get_mut(&NodeId::new(nid)) else {
+        return false;
+    };
+    obscura_render::draw_canvas_text_rgba(
+        surface.pixels.as_mut(),
+        surface.width,
+        surface.height,
+        text,
+        x as f32,
+        y as f32,
+        [red as u8, green as u8, blue as u8, alpha as u8],
+        size as f32,
+        bold,
+        italic,
+        Some(family),
+    )
+}
+
 /// Report one coalesced Canvas2D paint at the JavaScript task boundary. Pixel
 /// bytes are already live through the retained backing store, so damage wakes
 /// screencast/readiness without throwing away otherwise-valid layout.
@@ -4028,9 +4195,11 @@ pub fn build_extension() -> Extension {
         op_set_cookie(),
         op_navigate(),
         op_async_runtime_available(),
+        op_monotonic_time_ms(),
         op_posted_task(),
         op_binding_called(),
         op_subtle_digest(),
+        op_zlib_deflate(),
         op_subtle_hmac(),
         op_subtle_aes_gcm(),
         op_subtle_aes_cbc(),
@@ -4056,6 +4225,8 @@ pub fn build_extension() -> Extension {
         ops.push(op_begin_render_task());
         ops.push(op_set_dynamic_fonts());
         ops.push(op_canvas_register_surface());
+        ops.push(op_canvas_measure_text());
+        ops.push(op_canvas_fill_text());
         ops.push(op_canvas_paint_damage());
         ops.push(op_image_metadata());
         ops.push(op_load_image_metadata());

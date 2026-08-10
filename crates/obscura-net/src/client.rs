@@ -835,6 +835,7 @@ pub struct ObscuraHttpClient {
     proxy_url: Option<String>,
     pub cookie_jar: Arc<CookieJar>,
     pub user_agent: RwLock<String>,
+    pub accept_language: RwLock<String>,
     pub extra_headers: RwLock<HashMap<String, String>>,
     pub interceptor: RwLock<Option<Box<dyn RequestInterceptor + Send + Sync>>>,
     pub timeout: Duration,
@@ -1057,6 +1058,7 @@ impl ObscuraHttpClient {
             // a profile supplies it rather than inventing a Linux Chrome string
             // that contradicts the Windows profile the page reports.
             user_agent: RwLock::new(String::new()),
+            accept_language: RwLock::new(String::new()),
             extra_headers: RwLock::new(HashMap::new()),
             interceptor: RwLock::new(None),
             in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -1440,6 +1442,7 @@ impl ObscuraHttpClient {
             }
 
             let ua = self.user_agent.read().await.clone();
+            let accept_language = self.accept_language.read().await.clone();
             let (sec_ch_ua, sec_ch_ua_platform) = chrome_client_hints(&ua);
             let mut headers = HeaderMap::new();
             // Chrome's top-level navigation header order. (reqwest appends
@@ -1487,10 +1490,11 @@ impl ObscuraHttpClient {
                 }
             }
             let request_origin = serialized_request_origin(&request, redirect_tainted);
-            headers.insert(
-                reqwest::header::ACCEPT_LANGUAGE,
-                HeaderValue::from_static("en-US,en;q=0.9"),
-            );
+            if let Ok(value) = HeaderValue::from_str(&accept_language) {
+                if !accept_language.is_empty() {
+                    headers.insert(reqwest::header::ACCEPT_LANGUAGE, value);
+                }
+            }
 
             let cookie_header = if request.sends_credentials_to(&current_url) {
                 self.cookie_jar.get_cookie_header(&current_url)

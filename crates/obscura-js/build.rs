@@ -18,30 +18,40 @@ fn splice_fork_modules(bootstrap: &str) -> String {
                 include_str!("js/graphics_shim.js"),
                 include_str!("js/graphics_api_v145.js"),
                 include_str!("js/graphics.js"),
+                include_str!("js/fork_event_target.js"),
                 include_str!("js/fork_interfaces.js"),
                 include_str!("js/fork_media_codecs.js"),
+                include_str!("js/fork_rtc_capabilities.js"),
                 include_str!("js/fork_console.js"),
-                include_str!("js/fork_event_target.js"),
+                include_str!("js/fork_viewport_battery.js"),
             ],
         ),
         (
             "/* __OBSCURA_GRAPHICS_PAGE_INIT__ */",
             &[include_str!("js/graphics_page_init.js")],
         ),
+        (
+            "/* __OBSCURA_FORK_STORAGE__ */",
+            &[include_str!("js/fork_storage.js")],
+        ),
         // Last statement of __obscura_init, after upstream's own hide-list loop.
         (
             "/* __OBSCURA_FORK_PAGE_INIT_END__ */",
             &[
                 include_str!("js/fork_browser_shape.js"),
+                include_str!("js/fork_navigator_chrome151.js"),
                 include_str!("js/fork_audio_memory.js"),
                 include_str!("js/fork_hide_globals.js"),
             ],
         ),
-        // Top level, before upstream's `performance = performance || {...}`,
-        // so that assignment short-circuits onto ours.
+        // Top level, before upstream's `performance = performance || {...}`
+        // and `btoa = btoa || ...` fallbacks, so both short-circuit onto ours.
         (
             "/* __OBSCURA_FORK_EARLY_MODULE__ */",
-            &[include_str!("js/fork_performance.js")],
+            &[
+                include_str!("js/fork_binary_encoding.js"),
+                include_str!("js/fork_performance.js"),
+            ],
         ),
     ];
     let mut spliced = bootstrap.to_string();
@@ -62,6 +72,19 @@ fn main() {
     println!("cargo:rerun-if-changed=js/graphics_api_v145.js");
     println!("cargo:rerun-if-changed=js/graphics.js");
     println!("cargo:rerun-if-changed=js/graphics_page_init.js");
+    println!("cargo:rerun-if-changed=js/fork_binary_encoding.js");
+    println!("cargo:rerun-if-changed=js/fork_storage.js");
+    println!("cargo:rerun-if-changed=js/fork_interfaces.js");
+    println!("cargo:rerun-if-changed=js/fork_media_codecs.js");
+    println!("cargo:rerun-if-changed=js/fork_rtc_capabilities.js");
+    println!("cargo:rerun-if-changed=js/fork_console.js");
+    println!("cargo:rerun-if-changed=js/fork_event_target.js");
+    println!("cargo:rerun-if-changed=js/fork_viewport_battery.js");
+    println!("cargo:rerun-if-changed=js/fork_browser_shape.js");
+    println!("cargo:rerun-if-changed=js/fork_navigator_chrome151.js");
+    println!("cargo:rerun-if-changed=js/fork_audio_memory.js");
+    println!("cargo:rerun-if-changed=js/fork_hide_globals.js");
+    println!("cargo:rerun-if-changed=js/fork_performance.js");
     println!("cargo:rerun-if-changed=build.rs");
 
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());

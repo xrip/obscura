@@ -6650,6 +6650,155 @@ pub fn measure_text(text: &str, size: f32, is_bold: bool, family: Option<&str>) 
     width
 }
 
+fn canvas_font_bytes(
+    family: Option<&str>,
+    is_bold: bool,
+    is_italic: bool,
+) -> (&'static [u8], bool) {
+    let base = fallback_font_bytes(family);
+    if std::ptr::eq(base.as_ptr(), FONT_BYTES.as_ptr()) {
+        let styled = match (is_bold, is_italic) {
+            (true, true) => FONT_BOLD_OBLIQUE_BYTES,
+            (true, false) => FONT_BOLD_BYTES,
+            (false, true) => FONT_OBLIQUE_BYTES,
+            (false, false) => FONT_BYTES,
+        };
+        (styled, false)
+    } else {
+        (base, is_bold)
+    }
+}
+
+/// Measure text for Canvas2D using the same deterministic bundled fonts as
+/// page paint. The returned values are width, ascent, and descent in CSS px.
+pub fn canvas_text_metrics(
+    text: &str,
+    size: f32,
+    is_bold: bool,
+    is_italic: bool,
+    family: Option<&str>,
+) -> (f32, f32, f32) {
+    if !size.is_finite() || size <= 0.0 {
+        return (0.0, 0.0, 0.0);
+    }
+    let (bytes, faux_bold) = canvas_font_bytes(family, is_bold, is_italic);
+    let font = FontRef::try_from_slice(bytes).unwrap();
+    let scale = PxScale::from(size);
+    let scaled_font = font.as_scaled(scale);
+    let mut caret = 0.0;
+    let mut previous = None;
+    let mut ascent = 0.0f32;
+    let mut descent = 0.0f32;
+    for c in text.chars() {
+        if c.is_control() {
+            continue;
+        }
+        let id = font.glyph_id(c);
+        if let Some(previous) = previous {
+            caret += scaled_font.kern(previous, id);
+        }
+        let glyph = id.with_scale_and_position(scale, ab_glyph::point(caret, 0.0));
+        if let Some(outlined) = font.outline_glyph(glyph) {
+            let bounds = outlined.px_bounds();
+            ascent = ascent.max((-bounds.min.y).max(0.0));
+            descent = descent.max(bounds.max.y.max(0.0));
+        }
+        caret += scaled_font.h_advance(id) + if faux_bold { 1.0 } else { 0.0 };
+        previous = Some(id);
+    }
+    (caret, ascent, descent)
+}
+
+/// Rasterize Canvas2D text into a straight-alpha RGBA backing store. This is
+/// deliberately independent from host fonts so one profile is reproducible.
+pub fn draw_canvas_text_rgba(
+    pixels: &mut [u8],
+    width: u32,
+    height: u32,
+    text: &str,
+    x: f32,
+    baseline_y: f32,
+    color: [u8; 4],
+    size: f32,
+    is_bold: bool,
+    is_italic: bool,
+    family: Option<&str>,
+) -> bool {
+    let Some(expected) = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|count| count.checked_mul(4))
+    else {
+        return false;
+    };
+    if pixels.len() != expected
+        || !x.is_finite()
+        || !baseline_y.is_finite()
+        || !size.is_finite()
+        || size <= 0.0
+    {
+        return false;
+    }
+
+    let (bytes, faux_bold) = canvas_font_bytes(family, is_bold, is_italic);
+    let font = FontRef::try_from_slice(bytes).unwrap();
+    let scale = PxScale::from(size);
+    let scaled_font = font.as_scaled(scale);
+    let mut caret = ab_glyph::point(x, baseline_y);
+    let mut previous = None;
+    let width = width as i32;
+    let height = height as i32;
+
+    for c in text.chars() {
+        if c.is_control() {
+            continue;
+        }
+        let id = font.glyph_id(c);
+        if let Some(previous) = previous {
+            caret.x += scaled_font.kern(previous, id);
+        }
+        let glyph = id.with_scale_and_position(scale, caret);
+        if let Some(outlined) = font.outline_glyph(glyph) {
+            let bounds = outlined.px_bounds();
+            outlined.draw(|gx, gy, coverage| {
+                let px = (bounds.min.x + gx as f32) as i32;
+                let py = (bounds.min.y + gy as f32) as i32;
+                if px < 0 || px >= width || py < 0 || py >= height {
+                    return;
+                }
+                let copies = if faux_bold { 2 } else { 1 };
+                for dx in 0..copies {
+                    let px = px + dx;
+                    if px >= width {
+                        continue;
+                    }
+                    let index = (py as usize * width as usize + px as usize) * 4;
+                    let source_alpha = color[3] as f32 / 255.0 * coverage;
+                    let destination_alpha = pixels[index + 3] as f32 / 255.0;
+                    let output_alpha =
+                        source_alpha + destination_alpha * (1.0 - source_alpha);
+                    if output_alpha <= 0.0 {
+                        continue;
+                    }
+                    for channel in 0..3 {
+                        let source = color[channel] as f32 / 255.0;
+                        let destination = pixels[index + channel] as f32 / 255.0;
+                        let output = (source * source_alpha
+                            + destination * destination_alpha * (1.0 - source_alpha))
+                            / output_alpha;
+                        pixels[index + channel] =
+                            (output.clamp(0.0, 1.0) * 255.0).round() as u8;
+                    }
+                    pixels[index + 3] =
+                        (output_alpha.clamp(0.0, 1.0) * 255.0).round() as u8;
+                }
+            });
+        }
+        caret.x += scaled_font.h_advance(id) + if faux_bold { 1.0 } else { 0.0 };
+        previous = Some(id);
+    }
+    true
+}
+
 fn draw_text(
     pixmap: &mut Pixmap,
     text: &str,

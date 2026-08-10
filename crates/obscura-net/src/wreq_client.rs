@@ -120,13 +120,20 @@ async fn read_wreq_body_limited(
 }
 
 #[cfg(feature = "stealth")]
+#[derive(Clone)]
+struct StealthBrowserHeaders {
+    user_agent: String,
+    sec_ch_ua: String,
+    sec_ch_ua_platform: String,
+    accept_language: String,
+}
+
+#[cfg(feature = "stealth")]
 pub struct StealthHttpClient {
     client: wreq::Client,
     // Fork: the wire identity comes from the selected fingerprint profile, so it
     // is stored here rather than left to the one pinned emulation profile.
-    user_agent: String,
-    sec_ch_ua: String,
-    sec_ch_ua_platform: String,
+    browser_headers: RwLock<StealthBrowserHeaders>,
     accept_encoding: String,
     allow_private_network: bool,
     transport_browser_major: u32,
@@ -138,11 +145,11 @@ pub struct StealthHttpClient {
 #[cfg(feature = "stealth")]
 impl StealthHttpClient {
     pub fn new(cookie_jar: Arc<CookieJar>) -> Self {
-        Self::with_browser_identity(cookie_jar, None, "", "", "", 0, false)
+        Self::with_browser_identity(cookie_jar, None, "", "", "", "", 0, false)
     }
 
     pub fn with_proxy(cookie_jar: Arc<CookieJar>, proxy_url: Option<&str>) -> Self {
-        Self::with_browser_identity(cookie_jar, proxy_url, "", "", "", 0, false)
+        Self::with_browser_identity(cookie_jar, proxy_url, "", "", "", "", 0, false)
     }
 
     /// Fork: build the client from a User-Agent, deriving the client hints and
@@ -165,6 +172,7 @@ impl StealthHttpClient {
             user_agent,
             &sec_ch_ua,
             &sec_ch_ua_platform,
+            "",
             browser_major,
             false,
         )
@@ -180,6 +188,7 @@ impl StealthHttpClient {
         user_agent: &str,
         sec_ch_ua: &str,
         sec_ch_ua_platform: &str,
+        accept_language: &str,
         browser_major: u32,
         allow_private_network: bool,
     ) -> Self {
@@ -260,9 +269,12 @@ impl StealthHttpClient {
 
         StealthHttpClient {
             client,
-            user_agent: user_agent.to_owned(),
-            sec_ch_ua: sec_ch_ua.to_owned(),
-            sec_ch_ua_platform: sec_ch_ua_platform.to_owned(),
+            browser_headers: RwLock::new(StealthBrowserHeaders {
+                user_agent: user_agent.to_owned(),
+                sec_ch_ua: sec_ch_ua.to_owned(),
+                sec_ch_ua_platform: sec_ch_ua_platform.to_owned(),
+                accept_language: accept_language.to_owned(),
+            }),
             accept_encoding,
             allow_private_network,
             transport_browser_major,
@@ -337,6 +349,7 @@ impl StealthHttpClient {
         for _ in 0..20 {
             validate_request_mode(&request, &current_url)?;
             let mut req = self.client.get(current_url.as_str());
+            let browser_headers = self.browser_headers.read().await.clone();
 
             req = req
                 .header("accept", request.accept())
@@ -348,16 +361,19 @@ impl StealthHttpClient {
             // profile. Each header is skipped when unset, so a client built
             // without a profile behaves exactly as upstream's does and the
             // emulation profile's own headers stand.
-            if !self.user_agent.is_empty() {
-                req = req.header("user-agent", self.user_agent.as_str());
+            if !browser_headers.user_agent.is_empty() {
+                req = req.header("user-agent", browser_headers.user_agent.as_str());
             }
-            if !self.sec_ch_ua.is_empty() {
+            if !browser_headers.sec_ch_ua.is_empty() {
                 req = req
-                    .header("sec-ch-ua", self.sec_ch_ua.as_str())
+                    .header("sec-ch-ua", browser_headers.sec_ch_ua.as_str())
                     .header("sec-ch-ua-mobile", "?0");
             }
-            if !self.sec_ch_ua_platform.is_empty() {
-                req = req.header("sec-ch-ua-platform", self.sec_ch_ua_platform.as_str());
+            if !browser_headers.sec_ch_ua_platform.is_empty() {
+                req = req.header("sec-ch-ua-platform", browser_headers.sec_ch_ua_platform.as_str());
+            }
+            if !browser_headers.accept_language.is_empty() {
+                req = req.header("accept-language", browser_headers.accept_language.as_str());
             }
             if request.mode == RequestMode::Navigate {
                 req = req
@@ -392,9 +408,10 @@ impl StealthHttpClient {
             // not just the caller-supplied extras.
             let mut callback_headers = self.extra_headers.read().await.clone();
             for (name, value) in [
-                ("user-agent", &self.user_agent),
-                ("sec-ch-ua", &self.sec_ch_ua),
-                ("sec-ch-ua-platform", &self.sec_ch_ua_platform),
+                ("user-agent", &browser_headers.user_agent),
+                ("sec-ch-ua", &browser_headers.sec_ch_ua),
+                ("sec-ch-ua-platform", &browser_headers.sec_ch_ua_platform),
+                ("accept-language", &browser_headers.accept_language),
                 ("accept-encoding", &self.accept_encoding),
             ] {
                 if !value.is_empty() {
@@ -508,6 +525,7 @@ impl StealthHttpClient {
             .parse::<wreq::Method>()
             .map_err(|e| ObscuraNetError::Network(format!("invalid method '{}': {}", method, e)))?;
         let mut req = self.client.request(req_method, url.as_str());
+        let browser_headers = self.browser_headers.read().await.clone();
 
         if send_cookies {
             let cookie_header = self.cookie_jar.get_cookie_header(url);
@@ -516,16 +534,19 @@ impl StealthHttpClient {
             }
         }
         // Fork: same profile identity on the explicit-method path.
-        if !self.user_agent.is_empty() {
-            req = req.header("user-agent", self.user_agent.as_str());
+        if !browser_headers.user_agent.is_empty() {
+            req = req.header("user-agent", browser_headers.user_agent.as_str());
         }
-        if !self.sec_ch_ua.is_empty() {
+        if !browser_headers.sec_ch_ua.is_empty() {
             req = req
-                .header("sec-ch-ua", self.sec_ch_ua.as_str())
+                .header("sec-ch-ua", browser_headers.sec_ch_ua.as_str())
                 .header("sec-ch-ua-mobile", "?0");
         }
-        if !self.sec_ch_ua_platform.is_empty() {
-            req = req.header("sec-ch-ua-platform", self.sec_ch_ua_platform.as_str());
+        if !browser_headers.sec_ch_ua_platform.is_empty() {
+            req = req.header("sec-ch-ua-platform", browser_headers.sec_ch_ua_platform.as_str());
+        }
+        if !browser_headers.accept_language.is_empty() {
+            req = req.header("accept-language", browser_headers.accept_language.as_str());
         }
         for (k, v) in self.extra_headers.read().await.iter() {
             req = req.header(k.as_str(), v.as_str());
@@ -569,6 +590,13 @@ impl StealthHttpClient {
 
     pub async fn set_extra_headers(&self, headers: HashMap<String, String>) {
         *self.extra_headers.write().await = headers;
+    }
+
+    pub async fn set_user_agent(&self, user_agent: &str) {
+        let (sec_ch_ua, _) = crate::client::chrome_client_hints(user_agent);
+        let mut headers = self.browser_headers.write().await;
+        headers.user_agent = user_agent.to_owned();
+        headers.sec_ch_ua = sec_ch_ua;
     }
 
     pub fn active_requests(&self) -> u32 {
@@ -628,6 +656,23 @@ mod tests {
         port
     }
 
+    async fn header_fixture() -> (u16, tokio::sync::oneshot::Receiver<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = vec![0u8; 8192];
+            let count = stream.read(&mut buf).await.unwrap();
+            let _ = sender.send(String::from_utf8_lossy(&buf[..count]).into_owned());
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                .await;
+            let _ = stream.shutdown().await;
+        });
+        (port, receiver)
+    }
+
     // The emulation profile advertises gzip, so origins compress. Without the
     // decoder the raw gzip bytes reach the HTML parser as document text.
     #[tokio::test]
@@ -643,6 +688,7 @@ mod tests {
             "",
             "",
             "",
+            "",
             0,
             true,
         );
@@ -651,5 +697,37 @@ mod tests {
         let resp = client.fetch(&url).await.expect("fixture must be reachable");
         assert_eq!(resp.status, 200);
         assert_eq!(resp.text(), PLAIN_BODY, "gzip body must be decompressed");
+    }
+
+    #[tokio::test]
+    async fn profile_headers_and_overrides_reach_the_wire() {
+        let (port, request) = header_fixture().await;
+        let client = StealthHttpClient::with_browser_identity(
+            Arc::new(CookieJar::new()),
+            None,
+            "Profile-UA Chrome/145.0.0.0",
+            "\"Profile Brand\";v=\"145\"",
+            "\"Windows\"",
+            "ru-RU,en-US;q=0.9,ru;q=0.8,en;q=0.7",
+            145,
+            true,
+        );
+        client
+            .set_extra_headers(std::collections::HashMap::from([(
+                "x-profile-test".to_string(),
+                "present".to_string(),
+            )]))
+            .await;
+        let overridden_ua = "Override-UA Chrome/151.0.0.0";
+        client.set_user_agent(overridden_ua).await;
+
+        let url = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
+        client.fetch(&url).await.expect("fixture must be reachable");
+        let request = request.await.unwrap().to_ascii_lowercase();
+        let (expected_sec_ch_ua, _) = crate::client::chrome_client_hints(overridden_ua);
+        assert!(request.contains(&format!("user-agent: {}", overridden_ua.to_ascii_lowercase())));
+        assert!(request.contains(&format!("sec-ch-ua: {}", expected_sec_ch_ua.to_ascii_lowercase())));
+        assert!(request.contains("accept-language: ru-ru,en-us;q=0.9,ru;q=0.8,en;q=0.7"));
+        assert!(request.contains("x-profile-test: present"));
     }
 }

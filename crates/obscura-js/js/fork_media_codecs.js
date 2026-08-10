@@ -35,7 +35,7 @@
   // Containers that name exactly one codec, so Chrome answers "probably" even
   // with no codecs parameter: audio/mpeg is mp3 and nothing else.
   const SELF_DESCRIBING = new Set([
-    'audio/mpeg', 'audio/wav', 'audio/wave', 'audio/x-wav', 'audio/flac',
+    'audio/aac', 'audio/mpeg', 'audio/wav', 'audio/wave', 'audio/x-wav', 'audio/flac',
   ]);
 
   const canPlayType = function canPlayType(type) {

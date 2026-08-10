@@ -15,9 +15,9 @@
 use std::{collections::HashMap, sync::Arc};
 
 use cosmic_text::{
-    Align, Attrs, Buffer, CacheKey, CacheKeyFlags, Color, CssLineBreak, CssOverflowWrap,
-    CssWordBreak, Cursor, Family, FeatureTag, FontFeatures, FontSystem, FontVariations, Metrics,
-    Shaping, Style, SwashCache, SwashImage, VariationTag, Weight, Wrap,
+    Affinity, Align, Attrs, Buffer, CacheKey, CacheKeyFlags, Color, CssLineBreak,
+    CssOverflowWrap, CssWordBreak, Cursor, Family, FeatureTag, FontFeatures, FontSystem,
+    FontVariations, Metrics, Shaping, Style, SwashCache, SwashImage, VariationTag, Weight, Wrap,
 };
 use swash::scale::{image::Content as SwashContent, Render, ScaleContext, Source, StrikeWith};
 use swash::zeno::{Angle, Format, Transform, Vector};
@@ -1720,47 +1720,67 @@ impl TextEngine {
             let line_starts = source_line_starts(&item.buffer, source);
 
             for (line_index, run) in item.buffer.layout_runs().enumerate() {
-                let Some(&line_start) = line_starts.get(run.line_i) else {
+                let Some(&source_line_start) = line_starts.get(run.line_i) else {
                     continue;
                 };
-                let line_end = line_start.saturating_add(run.text.len());
+                let Some((visual_start, visual_end)) = run_source_range(&run, source_line_start)
+                else {
+                    continue;
+                };
                 let first_line_offset = if line_index == 0 {
                     item.first_line_offset
                 } else {
                     0.0
                 };
-                let alignment_shift = line_edge_alignment_shift(item, line_start, line_end);
+                let alignment_shift = line_edge_alignment_shift(item, visual_start, visual_end);
                 for owner in &item.owner_boxes {
                     let empty = owner.start == owner.end;
                     let intersects = if empty {
-                        (owner.start >= line_start && owner.start < line_end)
-                            || (line_end == source.len() && owner.start == line_end)
+                        (owner.start >= visual_start && owner.start < visual_end)
+                            || (visual_end == source.len() && owner.start == visual_end)
                     } else {
-                        owner.start < line_end && owner.end > line_start
+                        owner.start < visual_end && owner.end > visual_start
                     };
                     if !intersects {
                         continue;
                     }
-                    let first = owner.start >= line_start && owner.start < line_end || empty;
-                    let last = owner.end > line_start && owner.end <= line_end || empty;
+                    let first = owner.start >= visual_start && owner.start < visual_end || empty;
+                    let last = owner.end > visual_start && owner.end <= visual_end || empty;
                     let raw_left = if first {
-                        run_cursor_x(&run, owner.start.saturating_sub(line_start))
+                        run_cursor_x(
+                            &run,
+                            owner.start.saturating_sub(source_line_start),
+                            Affinity::After,
+                        )
                             + line_advance_before_event(
                                 item,
                                 owner.start_event,
-                                line_start,
-                                line_end,
+                                visual_start,
+                                visual_end,
                             )
                             + owner.start_edge.margin
                     } else {
-                        run_cursor_x(&run, 0)
+                        run_cursor_x(
+                            &run,
+                            visual_start.saturating_sub(source_line_start),
+                            Affinity::After,
+                        )
                     };
                     let raw_right = if last {
-                        run_cursor_x(&run, owner.end.saturating_sub(line_start))
-                            + line_advance_before_event(item, owner.end_event, line_start, line_end)
+                        run_cursor_x(
+                            &run,
+                            owner.end.saturating_sub(source_line_start),
+                            Affinity::Before,
+                        )
+                            + line_advance_before_event(
+                                item,
+                                owner.end_event,
+                                visual_start,
+                                visual_end,
+                            )
                             + owner.end_edge.border_padding()
                     } else {
-                        run.line_w + line_edge_advance(item, line_start, line_end)
+                        run.line_w + line_edge_advance(item, visual_start, visual_end)
                     };
                     let x = item.origin.0 + first_line_offset + alignment_shift + raw_left;
                     let width = (raw_right - raw_left).max(0.0);
@@ -2440,8 +2460,24 @@ fn source_line_starts(buffer: &Buffer, source: &str) -> Vec<usize> {
     starts
 }
 
-fn run_cursor_x(run: &cosmic_text::LayoutRun<'_>, byte: usize) -> f32 {
-    let cursor = Cursor::new(run.line_i, byte.min(run.text.len()));
+fn run_source_range(
+    run: &cosmic_text::LayoutRun<'_>,
+    source_line_start: usize,
+) -> Option<(usize, usize)> {
+    let start = run.glyphs.iter().map(|glyph| glyph.start).min()?;
+    let end = run.glyphs.iter().map(|glyph| glyph.end).max()?;
+    Some((
+        source_line_start.saturating_add(start),
+        source_line_start.saturating_add(end),
+    ))
+}
+
+fn run_cursor_x(
+    run: &cosmic_text::LayoutRun<'_>,
+    byte: usize,
+    affinity: Affinity,
+) -> f32 {
+    let cursor = Cursor::new_with_affinity(run.line_i, byte.min(run.text.len()), affinity);
     if let Some((x, _)) = run.highlight(cursor, cursor) {
         return x;
     }

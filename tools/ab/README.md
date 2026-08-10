@@ -11,14 +11,43 @@
 ```
 node tools/ab/ab.mjs <url> [--needle text] [--match regexp]
                            [--only chrome|obscura] [--wait seconds] [--proxy url] [--headed]
+                           [--trace-challenge]
 node tools/ab/journey.mjs [--site wb|ozon|avito] [--cards n]
                            [--only chrome|obscura] [--proxy url] [--goto] [--headed]
+                           [--profile-dir path] [--trace-challenge] [--clean-host]
 node tools/ab/clicklocal.mjs
-node tools/ab/chrome-raw.mjs [--cards n] [--headed] [--proxy url]
+node tools/ab/chrome-raw.mjs [--site wb|ozon] [--cards n] [--headed]
+                             [--only chrome|obscura] [--proxy url] [--clean-host]
+                             [--trace-network] [--dump-dir path]
+                             [--chrome-bin path] [--profile profile-id]
+                             [--trace-challenge]
+                             [--replay captured-challenge.html]
+                             [--trace-replay-helpers]
 ```
+
+`chrome-raw.mjs --dump-dir` writes the loaded home document, document response,
+script inventory, and a small summary to the named disposable directory. Keep
+that directory outside the repository because live documents may contain
+short-lived site data.
+
+`--replay` serves a captured challenge only on loopback and replaces its result
+endpoint with a local recorder. The recorder prints field lengths and SHA-256
+hashes, never challenge or fingerprint values. This is useful for comparing the
+same challenge bytecode in raw Chrome and Obscura without sending a replay to
+the live site.
+
+`--trace-replay-helpers` is valid only with `--replay`. It records the challenge
+helper function names plus argument and result shapes and string lengths. It
+does not record values, cookies, tokens, or the fingerprint body.
 
 Obscura is built from `target/release/obscura.exe` and launched with `--stealth`
 on a free port, then killed. Nothing is written to disk.
+
+On Windows, use `--clean-host` when the terminal or agent process was itself
+started with a proxy. Explorer then launches Chrome or Obscura outside that
+process tree, using the same network path as ordinary interactive Chrome. It
+cannot be combined with `--proxy`. Chrome uses a fresh temporary profile which
+is removed after the run.
 
 ## Why both sides go through Playwright
 
@@ -42,9 +71,10 @@ harness cannot see is worth checking against the debug log before believing.
   local fixture in about four seconds. Every diagnosis that mattered came from
   it, not from a live site — live sites throttle, and a throttled run looks
   exactly like a fingerprinting failure.
-- **Check the exit IP.** `journey.mjs` prints it. `HTTPS_PROXY` in the shell sent
-  runs through an exit they never asked for, and per-site "blocks" measured
-  before that was noticed are not trustworthy.
+- **Check the exit IP.** `journey.mjs` prints it. If the parent process itself
+  was started with `HTTPS_PROXY`, removing the variable from children may still
+  leave them on that process tree's route. Use `--clean-host`; per-site blocks
+  measured on the wrong exit are not trustworthy.
 - **A body length that differs by an order of magnitude** usually means one side
   got a different document, not a different render. Check the navigation status
   before reading anything into the rest.

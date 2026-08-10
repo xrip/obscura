@@ -157,6 +157,9 @@ impl BrowserContext {
         if let Ok(mut guard) = client.user_agent.try_write() {
             *guard = resolved_ua.clone();
         }
+        if let Ok(mut guard) = client.accept_language.try_write() {
+            *guard = profile.navigator.accept_language_header();
+        }
         let http_client = Arc::new(client);
         BrowserContext {
             id,
@@ -278,6 +281,9 @@ impl BrowserContext {
         if let Ok(mut guard) = client.user_agent.try_write() {
             *guard = user_agent.clone();
         }
+        if let Ok(mut guard) = client.accept_language.try_write() {
+            *guard = profile.navigator.accept_language_header();
+        }
 
         BrowserContext {
             id,
@@ -378,6 +384,10 @@ mod tests {
         let client_ua = ctx.http_client.user_agent.read().await.clone();
         assert!(client_ua.contains("Chrome"));
         assert_eq!(ctx.user_agent, client_ua);
+        assert_eq!(
+            ctx.http_client.accept_language.read().await.as_str(),
+            ctx.fingerprint_profile.navigator.accept_language_header()
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

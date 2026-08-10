@@ -19261,6 +19261,30 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "paint")]
+    #[test]
+    fn adjacent_inline_owners_keep_only_their_own_wrapped_line_fragments() {
+        let tree = parse_html(
+            r#"<style>
+                html,body,p { margin:0 }
+                p { width:60px; font:16px/20px monospace }
+            </style>
+            <p><a id="a0">item0</a> <a id="a1">item1</a> <a id="a2">item2</a></p>"#,
+        );
+        let laid = layout_dom(&tree, (200.0, 100.0));
+
+        for id in ["a0", "a1", "a2"] {
+            let node = tree.get_element_by_id(id).unwrap();
+            let fragments = &laid.inline_fragments[&node];
+            assert_eq!(fragments.len(), 1, "{id} claimed another line: {fragments:?}");
+            assert!(
+                fragments[0].width > 0.0,
+                "{id} has no inline width: {fragments:?}"
+            );
+            assert_eq!(laid.rects[&node], fragments[0]);
+        }
+    }
+
     #[test]
     fn wrapped_decorated_inline_exposes_three_ordered_font_box_fragments() {
         let tree = parse_html(

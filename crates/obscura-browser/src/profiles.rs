@@ -233,6 +233,22 @@ impl NavigatorIdentity {
     pub fn sec_ch_ua_platform_header(&self) -> String {
         format!("\"{}\"", escape_client_hint(&self.ua_platform))
     }
+
+    pub fn accept_language_header(&self) -> String {
+        self.languages
+            .iter()
+            .take(10)
+            .enumerate()
+            .map(|(index, language)| {
+                if index == 0 {
+                    language.clone()
+                } else {
+                    format!("{language};q=0.{}", 10 - index)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(",")
+    }
 }
 
 #[derive(Serialize)]
@@ -1325,6 +1341,15 @@ mod tests {
         assert_eq!(
             first.navigator.sec_ch_ua_platform_header(),
             format!("\"{}\"", first.navigator.ua_platform)
+        );
+        let mut navigator = first.navigator.clone();
+        navigator.languages = vec!["ru-RU", "en-US", "ru", "en"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(
+            navigator.accept_language_header(),
+            "ru-RU,en-US;q=0.9,ru;q=0.8,en;q=0.7"
         );
     }
 

@@ -47,7 +47,6 @@
     return out;
   };
 
-  const uniqueSortedStrings = values => Array.from(new Set(Array.from(values || [], String))).sort();
   const uniqueStrings = values => Array.from(new Set(Array.from(values || [], String)));
 
   function numericObjectToArray(value) {
@@ -170,7 +169,7 @@
       parameters,
       initialState,
       extensions,
-      supportedExtensions: uniqueSortedStrings(raw.supportedExtensions),
+      supportedExtensions: uniqueStrings(raw.supportedExtensions),
       shaderPrecisionFormats,
       version: String(raw.version),
       shadingLanguageVersion: String(raw.shadingLanguageVersion),

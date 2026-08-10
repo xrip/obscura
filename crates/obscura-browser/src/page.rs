@@ -887,12 +887,26 @@ impl Page {
                     .fingerprint_profile
                     .navigator
                     .sec_ch_ua_platform_header(),
+                &context
+                    .fingerprint_profile
+                    .navigator
+                    .accept_language_header(),
                 context.fingerprint_profile.browser.major,
                 context.allow_private_network,
             )))
         } else {
             None
         };
+
+        // Fork: the catalog screen row is one captured window identity, not
+        // only a graphics selector. Use its window and scale values until CDP
+        // applies an explicit device-metrics override.
+        let profile_screen = context.screen_profile();
+        let profile_viewport = (
+            profile_screen.inner_width as f32,
+            profile_screen.inner_height as f32,
+        );
+        let profile_device_scale_factor = profile_screen.device_pixel_ratio as f32;
 
         Page {
             id,
@@ -905,11 +919,11 @@ impl Page {
             context,
             title: String::new(),
             referrer: String::new(),
-            viewport: (1280.0, 720.0),
+            viewport: profile_viewport,
             screen_size_override: None,
             screen_metrics_emulated: false,
             device_metrics_baseline: None,
-            device_scale_factor: 1.0,
+            device_scale_factor: profile_device_scale_factor,
             default_background_color_override: None,
             encoding: "UTF-8".to_string(),
             document_timeline_origin: std::time::Instant::now(),
@@ -1058,6 +1072,25 @@ impl Page {
         self.default_background_color_override = color;
     }
 
+    pub async fn set_extra_http_headers(
+        &self,
+        headers: std::collections::HashMap<String, String>,
+    ) {
+        self.http_client.set_extra_headers(headers.clone()).await;
+        #[cfg(feature = "stealth")]
+        if let Some(stealth) = &self.stealth_client {
+            stealth.set_extra_headers(headers).await;
+        }
+    }
+
+    pub async fn set_user_agent_override(&self, user_agent: &str) {
+        self.http_client.set_user_agent(user_agent).await;
+        #[cfg(feature = "stealth")]
+        if let Some(stealth) = &self.stealth_client {
+            stealth.set_user_agent(user_agent).await;
+        }
+    }
+
     #[cfg(feature = "render")]
     fn capture_surface_color(&self) -> [u8; 4] {
         self.default_background_color_override
@@ -1065,13 +1098,26 @@ impl Page {
     }
 
     async fn do_fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {
+        let mut request = ResourceRequest::navigation();
+        request.referrer = Url::parse(&self.referrer).ok();
         #[cfg(feature = "stealth")]
         if let Some(ref stealth) = self.stealth_client {
-            return stealth.fetch(url).await;
+            return stealth
+                .fetch_resource_with_callbacks(url, request, Some(&self.callbacks))
+                .await;
         }
         self.http_client
-            .fetch_with_callbacks(url, Some(&self.callbacks))
+            .fetch_resource_with_callbacks(url, request, Some(&self.callbacks))
             .await
+    }
+
+    fn active_network_requests(&self) -> u32 {
+        let mut active = self.http_client.active_requests();
+        #[cfg(feature = "stealth")]
+        if let Some(ref stealth) = self.stealth_client {
+            active = active.saturating_add(stealth.active_requests());
+        }
+        active
     }
     fn init_js(&mut self) {
         // init_js is also the new-document path.  Only resume_js explicitly
@@ -1132,6 +1178,7 @@ impl Page {
         );
 
         rt.set_cookie_jar(self.context.cookie_jar.clone());
+        rt.set_local_storage(self.context.local_storage.clone());
         rt.set_http_client(self.http_client.clone());
         rt.set_callbacks(self.callbacks.clone());
         rt.set_blocked_urls(self.blocked_url_patterns.clone());
@@ -1649,6 +1696,8 @@ impl Page {
         }
 
         let client = self.http_client.clone();
+        #[cfg(feature = "stealth")]
+        let stealth_client = self.stealth_client.clone();
         let page_callbacks = self.callbacks.clone();
         let script_initiator = self
             .url
@@ -1658,6 +1707,8 @@ impl Page {
             .iter()
             .map(|(idx, url)| {
                 let client = client.clone();
+                #[cfg(feature = "stealth")]
+                let stealth_client = stealth_client.clone();
                 let cbs = page_callbacks.clone();
                 let initiator = script_initiator.clone();
                 let url = url.clone();
@@ -1690,10 +1741,21 @@ impl Page {
                         return Some((idx, url, resp));
                     }
                     let request = ResourceRequest::subresource(ResourceType::Script, &initiator);
-                    match client
+                    #[cfg(feature = "stealth")]
+                    let result = if let Some(stealth_client) = stealth_client {
+                        stealth_client
+                            .fetch_resource_with_callbacks(&parsed, request, Some(&cbs))
+                            .await
+                    } else {
+                        client
+                            .fetch_resource_with_callbacks(&parsed, request, Some(&cbs))
+                            .await
+                    };
+                    #[cfg(not(feature = "stealth"))]
+                    let result = client
                         .fetch_resource_with_callbacks(&parsed, request, Some(&cbs))
-                        .await
-                    {
+                        .await;
+                    match result {
                         Ok(resp) => Some((idx, url, resp)),
                         Err(e) => {
                             tracing::warn!("Failed to fetch script {}: {}", url, e);
@@ -2692,7 +2754,7 @@ impl Page {
             let mut idle_since: Option<tokio::time::Instant> = None;
 
             loop {
-                let active = self.http_client.active_requests();
+                let active = self.active_network_requests();
                 let now = tokio::time::Instant::now();
 
                 if active <= threshold {

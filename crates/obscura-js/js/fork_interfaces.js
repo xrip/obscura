@@ -62,16 +62,129 @@ _forkBrandInstance('Permissions', globalThis.navigator && navigator.permissions)
 _forkBrandInstance('MediaDevices', globalThis.navigator && navigator.mediaDevices);
 _forkBrandInstance('NavigatorUAData', globalThis.navigator && navigator.userAgentData);
 _forkBrandInstance('ScreenOrientation', globalThis.screen && screen.orientation);
+_forkBrandInstance('Clipboard', globalThis.navigator && navigator.clipboard);
+_forkBrandInstance('CredentialsContainer', globalThis.navigator && navigator.credentials);
+_forkBrandInstance('Geolocation', globalThis.navigator && navigator.geolocation);
+_forkBrandInstance('Keyboard', globalThis.navigator && navigator.keyboard);
+_forkBrandInstance('LockManager', globalThis.navigator && navigator.locks);
+_forkBrandInstance('MediaCapabilities', globalThis.navigator && navigator.mediaCapabilities);
+_forkBrandInstance('ServiceWorkerContainer', globalThis.navigator && navigator.serviceWorker);
+_forkBrandInstance('StorageManager', globalThis.navigator && navigator.storage);
+_forkBrandInstance('WakeLock', globalThis.navigator && navigator.wakeLock);
 
-// Chrome exposes these two on window with no instance behind them on an
-// ordinary page: NavigatorManagedData for enterprise policy, ProtectedAudience
-// for the Privacy Sandbox. Their absence is checkable.
-_forkInterface('NavigatorManagedData');
-_forkInterface('ProtectedAudience');
+// Both interfaces inherit EventTarget in Chrome. The upstream instances are
+// plain objects, so branding alone would leave the prototype chain too short.
+if (typeof EventTarget === 'function') {
+  if (typeof MediaDevices === 'function') {
+    Object.setPrototypeOf(MediaDevices.prototype, EventTarget.prototype);
+  }
+  if (typeof ScreenOrientation === 'function') {
+    Object.setPrototypeOf(ScreenOrientation.prototype, EventTarget.prototype);
+  }
+  if (typeof Clipboard === 'function') {
+    Object.setPrototypeOf(Clipboard.prototype, EventTarget.prototype);
+  }
+  if (typeof ServiceWorkerContainer === 'function') {
+    for (const name of ['addEventListener', 'removeEventListener', 'dispatchEvent']) {
+      delete ServiceWorkerContainer.prototype[name];
+    }
+    Object.setPrototypeOf(ServiceWorkerContainer.prototype, EventTarget.prototype);
+  }
+}
+
+// Chromium exposes live navigator instances for these two APIs. Ozon walks
+// both object graphs, so constructor-only shells are observably incomplete.
+const _protectedAudienceConstructionToken = {};
+const _protectedAudienceInstances = new WeakSet();
+class ProtectedAudience {
+  constructor(token) {
+    if (token !== _protectedAudienceConstructionToken) throw new TypeError('Illegal constructor');
+    _protectedAudienceInstances.add(this);
+  }
+  queryFeatureSupport(feature) {
+    if (!_protectedAudienceInstances.has(this)) throw new TypeError('Illegal invocation');
+    if (arguments.length < 1) {
+      throw new TypeError("Failed to execute 'queryFeatureSupport' on 'ProtectedAudience': 1 argument required, but only 0 present.");
+    }
+    return String(feature) === 'adComponentsLimit' ? 40 : undefined;
+  }
+}
+_markNative(ProtectedAudience);
+_markNative(ProtectedAudience.prototype.queryFeatureSupport);
+Object.defineProperty(ProtectedAudience.prototype, 'queryFeatureSupport', {
+  ...Object.getOwnPropertyDescriptor(ProtectedAudience.prototype, 'queryFeatureSupport'),
+  enumerable: true,
+});
+Object.defineProperty(ProtectedAudience.prototype, Symbol.toStringTag, {
+  value: 'ProtectedAudience', configurable: true,
+});
+Object.defineProperty(globalThis, 'ProtectedAudience', {
+  value: ProtectedAudience, writable: true, enumerable: false, configurable: true,
+});
+const _protectedAudience = new ProtectedAudience(_protectedAudienceConstructionToken);
+
+const _navigatorManagedDataConstructionToken = {};
+const _navigatorManagedDataInstances = new WeakSet();
+const _navigatorManagedDataHandlers = new WeakMap();
+class NavigatorManagedData extends EventTarget {
+  constructor(token) {
+    if (token !== _navigatorManagedDataConstructionToken) throw new TypeError('Illegal constructor');
+    super();
+    _navigatorManagedDataInstances.add(this);
+    _navigatorManagedDataHandlers.set(this, null);
+  }
+  getManagedConfiguration(keys) {
+    if (!_navigatorManagedDataInstances.has(this)) throw new TypeError('Illegal invocation');
+    if (arguments.length < 1) {
+      throw new TypeError("Failed to execute 'getManagedConfiguration' on 'NavigatorManagedData': 1 argument required, but only 0 present.");
+    }
+    if (keys === null || typeof keys !== 'object' || typeof keys[Symbol.iterator] !== 'function') {
+      throw new TypeError("Failed to execute 'getManagedConfiguration' on 'NavigatorManagedData': The provided value cannot be converted to a sequence.");
+    }
+    Array.from(keys, String);
+    return Promise.reject(new DOMException(
+      'Managed configuration is empty. This API is available only for managed apps.',
+      'NotAllowedError'
+    ));
+  }
+  get onmanagedconfigurationchange() {
+    if (!_navigatorManagedDataInstances.has(this)) throw new TypeError('Illegal invocation');
+    return _navigatorManagedDataHandlers.get(this);
+  }
+  set onmanagedconfigurationchange(value) {
+    if (!_navigatorManagedDataInstances.has(this)) throw new TypeError('Illegal invocation');
+    _navigatorManagedDataHandlers.set(this, typeof value === 'function' ? value : null);
+  }
+}
+_markNative(NavigatorManagedData);
+for (const name of ['getManagedConfiguration', 'onmanagedconfigurationchange']) {
+  const descriptor = Object.getOwnPropertyDescriptor(NavigatorManagedData.prototype, name);
+  if (descriptor.value) _markNative(descriptor.value);
+  if (descriptor.get) _markNativeAs(descriptor.get, `function get ${name}() { [native code] }`);
+  if (descriptor.set) _markNativeAs(descriptor.set, `function set ${name}() { [native code] }`);
+  Object.defineProperty(NavigatorManagedData.prototype, name, { ...descriptor, enumerable: true });
+}
+Object.defineProperty(NavigatorManagedData.prototype, Symbol.toStringTag, {
+  value: 'NavigatorManagedData', configurable: true,
+});
+Object.defineProperty(globalThis, 'NavigatorManagedData', {
+  value: NavigatorManagedData, writable: true, enumerable: false, configurable: true,
+});
+const _navigatorManagedData = new NavigatorManagedData(_navigatorManagedDataConstructionToken);
+
+if (globalThis.navigator) {
+  navigator.protectedAudience = _protectedAudience;
+  navigator.deprecatedRunAdAuctionEnforcesKAnonymity = false;
+  navigator.managed = _navigatorManagedData;
+}
 
 // Element interfaces Chrome exposes that upstream has no class for. They are
 // real constructors in a browser, so `Element` alone is not enough.
 if (typeof Element === 'function') {
+  Object.defineProperty(globalThis, 'HTMLIFrameElement', {
+    value: class HTMLIFrameElement extends Element {},
+    writable: true, enumerable: false, configurable: true,
+  });
   Object.defineProperty(globalThis, 'HTMLEmbedElement', {
     value: class HTMLEmbedElement extends Element {},
     writable: true, enumerable: false, configurable: true,
@@ -80,6 +193,7 @@ if (typeof Element === 'function') {
     value: class HTMLSourceElement extends Element {},
     writable: true, enumerable: false, configurable: true,
   });
+  _markNative(globalThis.HTMLIFrameElement);
   _markNative(globalThis.HTMLEmbedElement);
   _markNative(globalThis.HTMLSourceElement);
 }

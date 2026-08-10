@@ -64,6 +64,17 @@
   }
 })();
 
+// deno_core exposes its host bridge as an enumerable global by default. Keep
+// it available to the runtime, but hide it from ordinary page enumeration.
+try {
+  Object.defineProperty(globalThis, 'Deno', {
+    value: globalThis.Deno,
+    writable: true,
+    configurable: true,
+    enumerable: false,
+  });
+} catch (_) {}
+
 globalThis.__obscura_errors = [];
 
 globalThis.addEventListener = globalThis.addEventListener || function(){};
@@ -132,17 +143,33 @@ const _nativeFns = new Set();
 // or functions whose `.name` does not match the real builtin.
 const _nativeStr = new Map();
 const _origToString = Function.prototype.toString;
-Function.prototype.toString = function toString() {
-  if (_nativeStr.has(this)) { return _nativeStr.get(this); }
-  if (_nativeFns.has(this)) {
-    return `function ${this.name || ''}() { [native code] }`;
-  }
-  return _origToString.call(this);
-};
+// Method syntax creates a non-constructable function with no own `prototype`,
+// matching the native Function.prototype.toString. A normal `function`
+// wrapper is constructable, which Ozon checks before trusting native sources.
+const _functionToString = {
+  toString() {
+    if (_nativeStr.has(this)) { return _nativeStr.get(this); }
+    if (_nativeFns.has(this)) {
+      return `function ${this.name || ''}() { [native code] }`;
+    }
+    return _origToString.call(this);
+  },
+}.toString;
+Function.prototype.toString = _functionToString;
 function _markNative(fn) { if (typeof fn === 'function') _nativeFns.add(fn); return fn; }
 // Mark a function with an exact native-code toString (used for accessors).
 function _markNativeAs(fn, str) { if (typeof fn === 'function') _nativeStr.set(fn, str); return fn; }
-_nativeFns.add(Function.prototype.toString);
+function _setInternal(target, key, value) {
+  if (Object.prototype.hasOwnProperty.call(target, key)) {
+    target[key] = value;
+  } else {
+    Object.defineProperty(target, key, {
+      value, writable: true, enumerable: false, configurable: true,
+    });
+  }
+  return value;
+}
+_nativeFns.add(_functionToString);
 
 // unusualWindowProperties: obscura's internal globals are made non-enumerable
 // (see _preHideInternals and __obscura_init), which hides them from
@@ -165,10 +192,20 @@ _nativeFns.add(Function.prototype.toString);
     return _cache;
   }
   function _isGlobal(t) { return t === globalThis; }
+  function _isDomWrapper(t) {
+    var C = globalThis.Node;
+    return typeof C === 'function' && t instanceof C;
+  }
+  function _isPrivateDomKey(t, name) {
+    return _isDomWrapper(t) && typeof name === 'string' && name.startsWith('_');
+  }
   function _filter(t, names) {
-    if (!_isGlobal(t)) { return names; }
+    if (_isDomWrapper(t)) {
+      return names.filter(function(name) { return !_isPrivateDomKey(t, name); });
+    }
+    if (!_isGlobal(t)) return names;
     var set = _set();
-    if (!set) { return names; }
+    if (!set) return names;
     var out = [];
     for (var i = 0; i < names.length; i++) { if (!set.has(names[i])) { out.push(names[i]); } }
     return out;
@@ -176,18 +213,31 @@ _nativeFns.add(Function.prototype.toString);
   var _oGOPN = Object.getOwnPropertyNames;
   var _oOwnKeys = Reflect.ownKeys;
   var _oKeys = Object.keys;
+  var _oGOPD = Object.getOwnPropertyDescriptor;
   var _oGOPDs = Object.getOwnPropertyDescriptors;
+  var _rGOPD = Reflect.getOwnPropertyDescriptor;
   function define(obj, prop, impl) {
     try { Object.defineProperty(obj, prop, { value: _markNative(impl), writable: true, enumerable: false, configurable: true }); } catch (e) {}
   }
   define(Object, 'getOwnPropertyNames', function getOwnPropertyNames(t) { return _filter(t, _oGOPN(t)); });
   define(Reflect, 'ownKeys', function ownKeys(t) { return _filter(t, _oOwnKeys(t)); });
   define(Object, 'keys', function keys(t) { return _filter(t, _oKeys(t)); });
+  define(Object, 'getOwnPropertyDescriptor', function getOwnPropertyDescriptor(t, p) {
+    return _isPrivateDomKey(t, p) ? undefined : _oGOPD(t, p);
+  });
+  define(Reflect, 'getOwnPropertyDescriptor', function getOwnPropertyDescriptor(t, p) {
+    return _isPrivateDomKey(t, p) ? undefined : _rGOPD(t, p);
+  });
   define(Object, 'getOwnPropertyDescriptors', function getOwnPropertyDescriptors(t) {
     var all = _oGOPDs(t);
     if (_isGlobal(t)) {
       var set = _set();
       if (set) { var ks = _oGOPN(all); for (var i = 0; i < ks.length; i++) { if (set.has(ks[i])) { delete all[ks[i]]; } } }
+    } else if (_isDomWrapper(t)) {
+      var own = _oGOPN(all);
+      for (var j = 0; j < own.length; j++) {
+        if (_isPrivateDomKey(t, own[j])) delete all[own[j]];
+      }
     }
     return all;
   });
@@ -301,7 +351,7 @@ async function __fetchDynClassicScript(task) {
     body = _decodeDataScriptUrl(task.url);
   } else {
     const raw = await Deno.core.ops.op_fetch_url(
-      task.url, "GET", "{}", "", task.pageOrigin, "no-cors", "same-origin"
+      task.url, "GET", "{}", "", task.pageOrigin, "no-cors", "same-origin", _documentUrl()
     );
     const parsed = JSON.parse(raw);
     // The HTML script-fetch algorithm treats an unsuccessful HTTP response
@@ -527,7 +577,7 @@ async function _fetchLinkedCss(url, pageOrigin, depth = 0, seen = new Set()) {
   if (depth > 4 || seen.has(url)) return "";
   seen.add(url);
   const raw = await Deno.core.ops.op_fetch_url(
-    url, "GET", "{}", "", pageOrigin, "no-cors", "same-origin"
+    url, "GET", "{}", "", pageOrigin, "no-cors", "same-origin", _documentUrl()
   );
   const parsed = JSON.parse(raw);
   if (parsed.blocked || parsed.status >= 400 || parsed.status === 0) {
@@ -678,6 +728,7 @@ const _eventRegistry = globalThis._eventRegistry;
 const _formValues = globalThis._formValues;
 const _formChecked = globalThis._formChecked;
 const _domParse = (cmd, a1, a2) => { try { return JSON.parse(_dom(cmd, a1, a2)); } catch { return null; } };
+const _documentUrl = () => _domParse("document_url") || "about:blank";
 
 // HTML "ASCII whitespace": U+0009 TAB, U+000A LF, U+000C FF, U+000D CR, U+0020 SPACE.
 // Class token splitting (classList, getElementsByClassName) uses exactly this set.
@@ -1810,24 +1861,24 @@ function __prepareInsertedSubtree(root) {
 }
 
 function _seedDetachedTreeState(node) {
-  node._treeDetachedExact = true;
-  node._treeParent = null;
-  node._treeParentEpoch = _treeMutationEpoch;
-  node._treeConnected = false;
-  node._treeConnectedEpoch = _treeMutationEpoch;
+  _setInternal(node, '_treeDetachedExact', true);
+  _setInternal(node, '_treeParent', null);
+  _setInternal(node, '_treeParentEpoch', _treeMutationEpoch);
+  _setInternal(node, '_treeConnected', false);
+  _setInternal(node, '_treeConnectedEpoch', _treeMutationEpoch);
 }
 
 function _seedInsertedTreeState(node, parent, connected) {
-  node._treeDetachedExact = false;
-  node._treeParent = parent;
-  node._treeParentEpoch = _treeMutationEpoch;
-  node._treeConnected = !!connected;
-  node._treeConnectedEpoch = _treeMutationEpoch;
+  _setInternal(node, '_treeDetachedExact', false);
+  _setInternal(node, '_treeParent', parent);
+  _setInternal(node, '_treeParentEpoch', _treeMutationEpoch);
+  _setInternal(node, '_treeConnected', !!connected);
+  _setInternal(node, '_treeConnectedEpoch', _treeMutationEpoch);
 }
 
 function _seedUnchangedConnection(node, connected) {
-  node._treeConnected = !!connected;
-  node._treeConnectedEpoch = _treeMutationEpoch;
+  _setInternal(node, '_treeConnected', !!connected);
+  _setInternal(node, '_treeConnectedEpoch', _treeMutationEpoch);
 }
 
 class Node {
@@ -1850,7 +1901,7 @@ class Node {
   static DOCUMENT_POSITION_CONTAINED_BY = 16;
   static DOCUMENT_POSITION_IMPLEMENTATION_SPECIFIC = 32;
 
-  constructor(nid) { this._nid = nid; }
+  constructor(nid) { _setInternal(this, '_nid', nid); }
   get nodeType() { return +_dom("node_type", this._nid); }
   get nodeName() { return _domParse("node_name", this._nid) || ""; }
   get ownerDocument() { return globalThis.document; }
@@ -1906,8 +1957,8 @@ class Node {
     if (this._treeDetachedExact) return null;
     if (this._treeParentEpoch === _treeMutationEpoch) return this._treeParent;
     const parent = _wrap(+_dom("parent_node", this._nid));
-    this._treeParent = parent;
-    this._treeParentEpoch = _treeMutationEpoch;
+    _setInternal(this, '_treeParent', parent);
+    _setInternal(this, '_treeParentEpoch', _treeMutationEpoch);
     return parent;
   }
   get parentElement() { const p = this.parentNode; return p && p.nodeType === 1 ? p : null; }
@@ -2123,8 +2174,8 @@ class Node {
     if (this._treeDetachedExact) return false;
     if (this._treeConnectedEpoch === _treeMutationEpoch) return this._treeConnected;
     const connected = _dom("is_connected", this._nid) === "true";
-    this._treeConnected = connected;
-    this._treeConnectedEpoch = _treeMutationEpoch;
+    _setInternal(this, '_treeConnected', connected);
+    _setInternal(this, '_treeConnectedEpoch', _treeMutationEpoch);
     return connected;
   }
   normalize() {
@@ -2211,6 +2262,7 @@ class CharacterData extends Node {
 class Text extends CharacterData {
   get nodeName() { return "#text"; }
   get nodeType() { return 3; }
+  get assignedSlot() { return _assignedSlotForNode(this); }
   get wholeText() { return this.data; }
   splitText(offset) {
     const d = this.data;
@@ -2902,7 +2954,7 @@ class Element extends Node {
       Object.setPrototypeOf(upgrading, new.target.prototype);
       return upgrading;
     }
-    this._style = _styleProxy(new CSSStyleDeclaration(this));
+    _setInternal(this, '_style', _styleProxy(new CSSStyleDeclaration(this)));
   }
   // Element wrappers always back a nodeType-1 node (_wrap/_wrapEl only build an
   // Element for element nodes, and node ids are never freed-and-reused), so this
@@ -2913,8 +2965,7 @@ class Element extends Node {
     // nodeName/tagName repeatedly while hydrating; crossing the native bridge
     // for every comparison adds thousands of calls on modern component trees.
     if (this._tagName !== undefined) return this._tagName;
-    this._tagName = _domParse("tag_name", this._nid) || "";
-    return this._tagName;
+    return _setInternal(this, '_tagName', _domParse("tag_name", this._nid) || "");
   }
   get nodeName() { return this.tagName; }
   get localName() {
@@ -2924,11 +2975,14 @@ class Element extends Node {
     if (this._lname !== undefined) return this._lname;
     const ln = _domParse("local_name", this._nid)
       || (this.tagName || "").toLowerCase();
-    if (ln) this._lname = ln;
+    if (ln) _setInternal(this, '_lname', ln);
     return ln;
   }
   get id() { return this.getAttribute("id") || ""; }
   set id(v) { this.setAttribute("id", v); }
+  get slot() { return this.getAttribute("slot") || ""; }
+  set slot(v) { this.setAttribute("slot", String(v)); }
+  get assignedSlot() { return _assignedSlotForNode(this); }
   get className() {
     // SVG elements reflect class as an SVGAnimatedString (.baseVal/.animVal),
     // not a plain string. Anti-fraud sensors read el.className.animVal.
@@ -2954,7 +3008,7 @@ class Element extends Node {
     let ns = _domParse("namespace_uri", this._nid) || "";
     // Nodes with no element name recorded fall back to the previous heuristic.
     if (!ns) ns = this.localName === "svg" ? "http://www.w3.org/2000/svg" : "http://www.w3.org/1999/xhtml";
-    this._nsCache = ns;
+    _setInternal(this, '_nsCache', ns);
     return ns;
   }
   // `inner_html` resolves a <template> to its contents document on the Rust
@@ -3137,7 +3191,7 @@ class Element extends Node {
     // Namespace-aware writes can replace an attribute by namespace/local name
     // while changing its qualified name. Fall back to native reads afterwards
     // instead of maintaining a second, subtly different key space here.
-    this._nullNamespaceAttrs = null;
+    _setInternal(this, '_nullNamespaceAttrs', null);
     if (ns === "" && n === "style") this._style._replaceFromAttribute(value);
   }
   removeAttribute(n) {
@@ -3171,7 +3225,7 @@ class Element extends Node {
     ns = String(ns == null ? "" : ns);
     n = String(n);
     _dom("remove_attribute_ns", this._nid, ns + "\0" + n);
-    this._nullNamespaceAttrs = null;
+    _setInternal(this, '_nullNamespaceAttrs', null);
     if (ns === "" && n === "style") this._style._replaceFromAttribute("");
   }
   hasAttribute(n) { return this.getAttribute(n) !== null; }
@@ -4765,8 +4819,12 @@ class Document extends Node {
     const nid = globalThis.__currentScriptNid;
     return nid ? _wrapEl(+nid) : null;
   }
+  get fullscreenEnabled() { return true; }
+  get webkitFullscreenEnabled() { return this.fullscreenEnabled; }
   get hidden() { return false; }
   get visibilityState() { return "visible"; }
+  get webkitHidden() { return this.hidden; }
+  get webkitVisibilityState() { return this.visibilityState; }
   getElementById(id) { return _wrapEl(+_dom("get_element_by_id", id)); }
   querySelector(s) { return _wrapEl(+_dom("query_selector", s)); }
   querySelectorAll(s) {
@@ -4790,10 +4848,10 @@ class Document extends Node {
     // This node was just created from values already known to JS. Seed its
     // immutable metadata instead of rediscovering it through native calls in
     // hydration's tag/local-name checks.
-    el._tagName = localName.toUpperCase();
-    el._lname = localName;
-    el._ns = "http://www.w3.org/1999/xhtml";
-    el._nullNamespaceAttrs = new Map();
+    _setInternal(el, '_tagName', localName.toUpperCase());
+    _setInternal(el, '_lname', localName);
+    _setInternal(el, '_ns', "http://www.w3.org/1999/xhtml");
+    _setInternal(el, '_nullNamespaceAttrs', new Map());
     _seedDetachedTreeState(el);
     _cache.set(nid, el);
     if (el && localName === 'template') {
@@ -4810,7 +4868,7 @@ class Document extends Node {
     _ns_validateQualifiedName(namespace == null ? "" : namespace, qualified);
     if (namespace === "http://www.w3.org/1999/xhtml") {
       const el = this.createElement(qualified);
-      if (el) el._ns = namespace;
+      if (el) _setInternal(el, '_ns', namespace);
       return el;
     }
     const nid = +_dom(
@@ -4823,10 +4881,10 @@ class Document extends Node {
     const localName = qualified.includes(":")
       ? qualified.slice(qualified.indexOf(":") + 1)
       : qualified;
-    el._tagName = qualified;
-    el._lname = localName;
-    el._ns = effectiveNamespace;
-    el._nullNamespaceAttrs = new Map();
+    _setInternal(el, '_tagName', qualified);
+    _setInternal(el, '_lname', localName);
+    _setInternal(el, '_ns', effectiveNamespace);
+    _setInternal(el, '_nullNamespaceAttrs', new Map());
     _seedDetachedTreeState(el);
     _cache.set(nid, el);
     return el;
@@ -4890,14 +4948,11 @@ class Document extends Node {
   // returned a generic Event for every type, which broke libraries that call
   // createEvent('CustomEvent').initCustomEvent(...) — see issue #41.
   createEvent(type) {
-    const normalized = String(type || '').toLowerCase();
-    if (normalized === 'promiserejectionevent') {
-      throw new DOMException(
-        "The provided event type ('PromiseRejectionEvent') is invalid",
-        'NotSupportedError'
-      );
-    }
+    const eventType = String(type || '');
+    const normalized = eventType.toLowerCase();
     const map = {
+      'event': Event, 'events': Event,
+      'htmlevents': Event, 'svgevents': Event,
       'customevent': CustomEvent, 'customevents': CustomEvent,
       'mouseevent': MouseEvent,   'mouseevents': MouseEvent,
       'keyboardevent': KeyboardEvent, 'keyboardevents': KeyboardEvent,
@@ -4913,7 +4968,13 @@ class Document extends Node {
       'transitionevent': TransitionEvent,
       'storageevent': StorageEvent,
     };
-    const Cls = map[normalized] || Event;
+    const Cls = map[normalized];
+    if (!Cls) {
+      throw new DOMException(
+        `The provided event type ('${eventType}') is invalid`,
+        'NotSupportedError'
+      );
+    }
     return new Cls('');
   }
   createRange() { return new Range(); }
@@ -5850,8 +5911,10 @@ function _elementClassFor(nid) {
     if (globalThis.SVGElement) return globalThis.SVGElement;
   }
   if (tag === "FORM" && globalThis.HTMLFormElement) return globalThis.HTMLFormElement;
+  if (tag === "IFRAME" && globalThis.HTMLIFrameElement) return globalThis.HTMLIFrameElement;
   if (tag === "IMG") return HTMLImageElement;
   if (tag === "CANVAS" && globalThis.HTMLCanvasElement) return globalThis.HTMLCanvasElement;
+  if (tag === "SLOT" && globalThis.HTMLSlotElement) return globalThis.HTMLSlotElement;
   if (tag === "AUDIO") return HTMLAudioElement;
   if (tag === "VIDEO") return HTMLVideoElement;
   if (tag === "TRACK") return HTMLTrackElement;
@@ -5869,8 +5932,10 @@ function _elementClassForKnownName(namespace, qualifiedName) {
   if (namespace === "http://www.w3.org/1999/xhtml") {
     const tag = localName.toUpperCase();
     if (tag === "FORM" && globalThis.HTMLFormElement) return globalThis.HTMLFormElement;
+    if (tag === "IFRAME" && globalThis.HTMLIFrameElement) return globalThis.HTMLIFrameElement;
     if (tag === "IMG") return HTMLImageElement;
     if (tag === "CANVAS" && globalThis.HTMLCanvasElement) return globalThis.HTMLCanvasElement;
+    if (tag === "SLOT" && globalThis.HTMLSlotElement) return globalThis.HTMLSlotElement;
     if (tag === "AUDIO") return HTMLAudioElement;
     if (tag === "VIDEO") return HTMLVideoElement;
     if (tag === "TRACK") return HTMLTrackElement;
@@ -5920,7 +5985,7 @@ function __currentUrl() {
 }
 globalThis.location = {
   get href() { return __currentUrl(); },
-  set href(url) { var r = _resolveUrl(url); globalThis.__virtualUrl = r; Deno.core.ops.op_navigate(r, 'GET', ''); },
+  set href(url) { var r = _resolveUrl(String(url)); globalThis.__virtualUrl = r; Deno.core.ops.op_navigate(r, 'GET', ''); },
   get origin() { try { return new URL(this.href).origin; } catch { return ""; } },
   get protocol() { try { return new URL(this.href).protocol; } catch { return ""; } },
   get host() { try { return new URL(this.href).host; } catch { return ""; } },
@@ -5930,9 +5995,9 @@ globalThis.location = {
   get hash() { try { return new URL(this.href).hash; } catch { return ""; } },
   get port() { try { return new URL(this.href).port; } catch { return ""; } },
   toString() { return this.href; },
-  assign(url) { var r = _resolveUrl(url); globalThis.__virtualUrl = r; Deno.core.ops.op_navigate(r, 'GET', ''); },
+  assign(url) { var r = _resolveUrl(String(url)); globalThis.__virtualUrl = r; Deno.core.ops.op_navigate(r, 'GET', ''); },
   reload() { var r = _resolveUrl(this.href); globalThis.__virtualUrl = r; Deno.core.ops.op_navigate(r, 'GET', ''); },
-  replace(url) { var r = _resolveUrl(url); globalThis.__virtualUrl = r; Deno.core.ops.op_navigate(r, 'GET', ''); },
+  replace(url) { var r = _resolveUrl(String(url)); globalThis.__virtualUrl = r; Deno.core.ops.op_navigate(r, 'GET', ''); },
 };
 const _locationObj = globalThis.location;
 Object.defineProperty(globalThis, 'location', {
@@ -6030,12 +6095,22 @@ function Navigator() {}
 _markNative(Navigator);
 
 // PluginArray must exist before navigator is built so the plugins getter can use it.
+const _pluginArrayItems = new WeakMap();
 function PluginArray(items) {
-  for (var _pi = 0; _pi < items.length; _pi++) this[_pi] = items[_pi];
-  this.length = items.length;
+  items = Array.from(items || []);
+  _pluginArrayItems.set(this, items);
+  for (var _pi = 0; _pi < items.length; _pi++) {
+    Object.defineProperty(this, _pi, {value:items[_pi], enumerable:true, configurable:true});
+    if (items[_pi] && items[_pi].name && !Object.prototype.hasOwnProperty.call(this, items[_pi].name)) {
+      Object.defineProperty(this, items[_pi].name, {value:items[_pi], enumerable:true, configurable:true});
+    }
+  }
 }
-PluginArray.prototype = Object.create(Array.prototype);
-PluginArray.prototype.constructor = PluginArray;
+PluginArray.prototype = Object.create(Object.prototype);
+Object.defineProperty(PluginArray.prototype, 'length', {
+  get: _markNativeAs(function length() { return (_pluginArrayItems.get(this) || []).length; }, 'function get length() { [native code] }'),
+  enumerable: true, configurable: true,
+});
 PluginArray.prototype.item = function(i) { return this[i] || null; };
 PluginArray.prototype.namedItem = function(name) {
   for (var _pi = 0; _pi < this.length; _pi++) {
@@ -6045,6 +6120,9 @@ PluginArray.prototype.namedItem = function(name) {
 };
 PluginArray.prototype.refresh = function() {};
 PluginArray.prototype[Symbol.iterator] = Array.prototype[Symbol.iterator];
+Object.defineProperty(PluginArray.prototype, 'constructor', {
+  value: PluginArray, writable: true, configurable: true,
+});
 Object.defineProperty(PluginArray.prototype, Symbol.toStringTag, {value: 'PluginArray', configurable: true});
 _markNative(PluginArray);
 _markNative(PluginArray.prototype.item);
@@ -6084,20 +6162,45 @@ function MimeType(type, description, suffixes, plugin) {
 Object.defineProperty(MimeType.prototype, Symbol.toStringTag, {value: 'MimeType', configurable: true});
 _markNative(MimeType);
 
+const _mimeTypeArrayItems = new WeakMap();
 function MimeTypeArray(items) {
-  for (var _i = 0; _i < items.length; _i++) this[_i] = items[_i];
-  this.length = items.length;
+  items = Array.from(items || []);
+  _mimeTypeArrayItems.set(this, items);
+  for (var _i = 0; _i < items.length; _i++) {
+    Object.defineProperty(this, _i, {value:items[_i], enumerable:true, configurable:true});
+    if (items[_i] && items[_i].type && !Object.prototype.hasOwnProperty.call(this, items[_i].type)) {
+      Object.defineProperty(this, items[_i].type, {value:items[_i], enumerable:true, configurable:true});
+    }
+  }
 }
+MimeTypeArray.prototype = Object.create(Object.prototype);
+Object.defineProperty(MimeTypeArray.prototype, 'length', {
+  get: _markNativeAs(function length() { return (_mimeTypeArrayItems.get(this) || []).length; }, 'function get length() { [native code] }'),
+  enumerable: true, configurable: true,
+});
 MimeTypeArray.prototype.item = function(i) { return this[i] || null; };
 MimeTypeArray.prototype.namedItem = function(name) {
   for (var _i = 0; _i < this.length; _i++) if (this[_i] && this[_i].type === name) return this[_i];
   return null;
 };
 MimeTypeArray.prototype[Symbol.iterator] = Array.prototype[Symbol.iterator];
+Object.defineProperty(MimeTypeArray.prototype, 'constructor', {
+  value: MimeTypeArray, writable: true, configurable: true,
+});
 Object.defineProperty(MimeTypeArray.prototype, Symbol.toStringTag, {value: 'MimeTypeArray', configurable: true});
 _markNative(MimeTypeArray);
 _markNative(MimeTypeArray.prototype.item);
 _markNative(MimeTypeArray.prototype.namedItem);
+for (const [name, Constructor] of [
+  ['PluginArray', PluginArray],
+  ['Plugin', Plugin],
+  ['MimeTypeArray', MimeTypeArray],
+  ['MimeType', MimeType],
+]) {
+  Object.defineProperty(globalThis, name, {
+    value: Constructor, writable: true, enumerable: false, configurable: true,
+  });
+}
 
 class NetworkInformation {
   constructor() { this._listeners = Object.create(null); }
@@ -6149,6 +6252,12 @@ var _GREASE_CHARS = [' ', '(', ':', '-', '.', '/', ')', ';', '=', '?', '_'];
 var _GREASE_VER = ['8', '99', '24'];
 var _BRAND_PERMS = [[0,1,2],[0,2,1],[1,0,2],[1,2,0],[2,0,1],[2,1,0]];
 function _uaBrands() {
+  var profileNavigator = _fingerprintProfile && _fingerprintProfile.navigator;
+  if (profileNavigator && Array.isArray(profileNavigator.brands)) {
+    return profileNavigator.brands.map(function(b) {
+      return {brand: String(b.brand), version: String(b.version)};
+    });
+  }
   var seed = _chromeMajor();
   var grease = {
     brand: 'Not' + _GREASE_CHARS[seed % 11] + 'A' + _GREASE_CHARS[(seed + 1) % 11] + 'Brand',
@@ -6178,22 +6287,43 @@ globalThis.navigator = {
     get platform() { return globalThis.__obscura_ua_platform || "Windows"; },
     getHighEntropyValues(hints) {
       var brands = _uaBrands();
+      var profile = _fingerprintProfile || {};
+      var profileNavigator = profile.navigator || {};
+      var profileBrowser = profile.browser || {};
+      var fullVersionList = Array.isArray(profileNavigator.fullVersionList)
+        ? profileNavigator.fullVersionList.map(function(b) {
+            return {brand: String(b.brand), version: String(b.version)};
+          })
+        : brands.map(function(b) {
+            return {brand: b.brand, version: b.version + ".0.0.0"};
+          });
       return Promise.resolve({
-        architecture: "x86",
-        bitness: "64",
+        architecture: profileNavigator.architecture || "x86",
+        bitness: profileNavigator.bitness || "64",
         brands: brands,
-        fullVersionList: brands.map(function(b) { return {brand: b.brand, version: b.version + ".0.0.0"}; }),
+        fullVersionList: fullVersionList,
         mobile: false,
         model: "",
         platform: globalThis.__obscura_ua_platform || "Windows",
         platformVersion: globalThis.__obscura_ua_platform_version || "15.0.0",
-        uaFullVersion: _chromeMajor() + ".0.0.0",
+        uaFullVersion: profileBrowser.version || (_chromeMajor() + ".0.0.0"),
         wow64: false,
       });
     },
     toJSON() { return {brands:this.brands,mobile:this.mobile,platform:this.platform}; },
   },
-  serviceWorker: { ready: Promise.resolve(), register(){return Promise.resolve();}, getRegistrations(){return Promise.resolve([]);}, controller: null, oncontrollerchange: null, onmessage: null, addEventListener(){}, removeEventListener(){}, dispatchEvent(){return true;} },
+  serviceWorker: {
+    controller: null,
+    ready: Promise.resolve(),
+    oncontrollerchange: null,
+    onmessage: null,
+    onmessageerror: null,
+    getRegistration(){return Promise.resolve(undefined);},
+    getRegistrations(){return Promise.resolve([]);},
+    register(){return Promise.resolve();},
+    startMessages(){},
+    addEventListener(){}, removeEventListener(){}, dispatchEvent(){return true;},
+  },
   mediaDevices: {
     enumerateDevices() {
       return Promise.resolve([
@@ -6207,7 +6337,13 @@ globalThis.navigator = {
     getDisplayMedia() { return Promise.reject(new DOMException("NotAllowedError")); },
     addEventListener(){}, removeEventListener(){},
   },
-  clipboard: { writeText(){return Promise.resolve();}, readText(){return Promise.resolve("");} },
+  clipboard: {
+    onclipboardchange: null,
+    read(){return Promise.reject(new DOMException('Not allowed', 'NotAllowedError'));},
+    readText(){return Promise.resolve("");},
+    write(){return Promise.reject(new DOMException('Not allowed', 'NotAllowedError'));},
+    writeText(){return Promise.resolve();},
+  },
   permissions: { query(params){
     var n = params && params.name;
     // Chrome defaults privacy-sensitive permissions to "prompt", not "granted";
@@ -6221,6 +6357,7 @@ globalThis.navigator = {
   sendBeacon() { return true; },
   javaEnabled() { return false; },
   geolocation: {
+    clearWatch() {},
     getCurrentPosition(success, error) {
       const coords = {
         latitude: (globalThis.__obscura_geo_lat ?? 50.1109) + (_fpRand(500) - 0.5) * 0.1,
@@ -6249,12 +6386,12 @@ globalThis.navigator = {
       }
       return 0;
     },
-    clearWatch() {},
   },
   storage: {
     estimate() { return Promise.resolve({ quota: 5000000000, usage: Math.floor(_fpRand(640) * 100000000) }); },
-    persist() { return Promise.resolve(false); },
     persisted() { return Promise.resolve(false); },
+    getDirectory() { return Promise.reject(new DOMException('Not supported', 'NotSupportedError')); },
+    persist() { return Promise.resolve(false); },
   },
 };
 
@@ -6316,7 +6453,29 @@ globalThis.navigator = {
 })();
 
 globalThis.chrome = {
-  app: { isInstalled: false, InstallState: { DISABLED: "disabled", INSTALLED: "installed", NOT_INSTALLED: "not_installed" }, RunningState: { CANNOT_RUN: "cannot_run", READY_TO_RUN: "ready_to_run", RUNNING: "running" } },
+  app: {
+    isInstalled: false,
+    getDetails() {
+      if (arguments.length !== 0) throw new TypeError('No arguments expected');
+      return null;
+    },
+    getIsInstalled() {
+      if (arguments.length !== 0) throw new TypeError('No arguments expected');
+      return false;
+    },
+    installState() {
+      if (arguments.length === 0) return undefined;
+      const callback = arguments[0];
+      if (typeof callback !== 'function') throw new TypeError('Callback must be a function');
+      queueMicrotask(() => callback('not_installed'));
+    },
+    runningState() {
+      if (arguments.length !== 0) throw new TypeError('No arguments expected');
+      return 'cannot_run';
+    },
+    InstallState: { DISABLED: "disabled", INSTALLED: "installed", NOT_INSTALLED: "not_installed" },
+    RunningState: { CANNOT_RUN: "cannot_run", READY_TO_RUN: "ready_to_run", RUNNING: "running" },
+  },
   runtime: { OnInstalledReason: {}, OnRestartRequiredReason: {}, PlatformArch: {}, PlatformNaclArch: {}, PlatformOs: {}, RequestUpdateCheckStatus: {}, connect() { throw new Error("Could not establish connection. Receiving end does not exist."); }, sendMessage() { throw new Error("Could not establish connection. Receiving end does not exist."); } },
   csi() {
     const t = Date.now();
@@ -6343,6 +6502,16 @@ globalThis.chrome = {
   },
 };
 
+for (const name of ['csi', 'loadTimes']) {
+  const implementation = globalThis.chrome[name];
+  const shaped = function () {
+    return implementation.apply(globalThis.chrome, arguments);
+  };
+  Object.defineProperty(shaped, 'name', { value: '', configurable: true });
+  _markNativeAs(shaped, 'function () { [native code] }');
+  globalThis.chrome[name] = shaped;
+}
+
 globalThis.Notification = class Notification {
   static permission = "default";
   static requestPermission() { return Promise.resolve(Notification.permission); }
@@ -6352,33 +6521,75 @@ globalThis.Notification = class Notification {
 globalThis.WebGLRenderingContext = class WebGLRenderingContext {};
 globalThis.WebGL2RenderingContext = class WebGL2RenderingContext {};
 
+const _screenState = new WeakMap();
+const _screenToken = {};
 class Screen {
-  constructor(w, h, availW, availH) {
-    this._w = w; this._h = h;
-    this._availW = availW === undefined ? w : availW;
-    this._availH = availH === undefined ? h - 40 : availH;
-    this.colorDepth = 24; this.pixelDepth = 24; this.availTop = 0; this.availLeft = 0;
-    this.orientation = {type:'landscape-primary',angle:0,addEventListener(){},removeEventListener(){},dispatchEvent(){return true;}};
+  constructor(token, w, h, availW, availH) {
+    if (token !== _screenToken) {
+      throw new TypeError("Failed to construct 'Screen': Illegal constructor");
+    }
+    _screenState.set(this, {
+      width: w,
+      height: h,
+      availWidth: availW === undefined ? w : availW,
+      availHeight: availH === undefined ? h - 40 : availH,
+      colorDepth: 24,
+      pixelDepth: 24,
+      availLeft: 0,
+      availTop: 0,
+      orientation: {type:'landscape-primary',angle:0,addEventListener(){},removeEventListener(){},dispatchEvent(){return true;}},
+      onchange: null,
+    });
   }
-  get width() { return this._w; }
-  get height() { return this._h; }
-  get availWidth() { return this._availW; }
-  get availHeight() { return this._availH; }
+  get availWidth() { return _screenState.get(this).availWidth; }
+  get availHeight() { return _screenState.get(this).availHeight; }
+  get width() { return _screenState.get(this).width; }
+  get height() { return _screenState.get(this).height; }
+  get colorDepth() { return _screenState.get(this).colorDepth; }
+  get pixelDepth() { return _screenState.get(this).pixelDepth; }
+  get availLeft() { return _screenState.get(this).availLeft; }
+  get availTop() { return _screenState.get(this).availTop; }
+  get orientation() { return _screenState.get(this).orientation; }
+  get isExtended() {
+    if (!_screenState.has(this)) throw new TypeError('Illegal invocation');
+    return false;
+  }
+  get onchange() { return _screenState.get(this).onchange; }
+  set onchange(value) {
+    _screenState.get(this).onchange = typeof value === 'function' ? value : null;
+  }
 }
-['width','height','availWidth','availHeight'].forEach(function(k) {
+function _setScreenValues(instance, values) {
+  const state = _screenState.get(instance);
+  if (state) Object.assign(state, values);
+}
+['availWidth','availHeight','width','height','colorDepth','pixelDepth','availLeft','availTop','orientation','isExtended','onchange'].forEach(function(k) {
   var d = Object.getOwnPropertyDescriptor(Screen.prototype, k);
-  if (d && d.get) _markNative(d.get);
+  if (d && d.get) {
+    d.enumerable = true;
+    _markNative(d.get);
+    Object.defineProperty(Screen.prototype, k, d);
+  }
 });
+const _screenSecureDescriptors = new Map(['isExtended', 'onchange'].map(function(k) {
+  return [k, Object.getOwnPropertyDescriptor(Screen.prototype, k)];
+}));
+const _screenConstructorDescriptor = Object.getOwnPropertyDescriptor(Screen.prototype, 'constructor');
+delete Screen.prototype.constructor;
+Object.defineProperty(Screen.prototype, 'constructor', _screenConstructorDescriptor);
+_markNative(Screen);
 globalThis.Screen = Screen;
-globalThis.screen = new Screen(1920, 1080);
+globalThis.screen = new Screen(_screenToken, 1920, 1080);
 function _applyScreenSize(w, h, emulated) {
   if (globalThis.screen instanceof Screen) {
-    globalThis.screen._w = w;
-    globalThis.screen._h = h;
-    globalThis.screen._availW = w;
-    globalThis.screen._availH = emulated ? h : h - 40;
+    _setScreenValues(globalThis.screen, {
+      width: w,
+      height: h,
+      availWidth: w,
+      availHeight: emulated ? h : h - 40,
+    });
   } else {
-    globalThis.screen = new Screen(w, h, w, emulated ? h : h - 40);
+    globalThis.screen = new Screen(_screenToken, w, h, w, emulated ? h : h - 40);
   }
 }
 globalThis.__obscura_set_screen_override = function(w, h, emulated) {
@@ -6557,7 +6768,9 @@ globalThis.fetch = async (input, init = {}) => {
     throw new TypeError("Failed to execute 'fetch': '" + fetchCredentials + "' is not a valid RequestCredentials value");
   }
   const pageOrigin = (function() { try { const u = new URL(_domParse("document_url") || "about:blank"); return u.origin; } catch(e) { return ""; } })();
-  const raw = await Deno.core.ops.op_fetch_url(url, method, hdrs, body, pageOrigin, fetchMode, fetchCredentials);
+  const raw = await Deno.core.ops.op_fetch_url(
+    url, method, hdrs, body, pageOrigin, fetchMode, fetchCredentials, _documentUrl()
+  );
   const parsed = JSON.parse(raw);
   if (parsed.blocked) {
     const err = new TypeError('net::ERR_FAILED');
@@ -9946,6 +10159,7 @@ const _mkStore = () => {
 };
 globalThis.localStorage = _mkStore();
 globalThis.sessionStorage = _mkStore();
+/* __OBSCURA_FORK_STORAGE__ */
 
 globalThis.btoa = globalThis.btoa || ((s) => { const b = new TextEncoder().encode(s); const c="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"; let r=""; for(let i=0;i<b.length;i+=3){const a=b[i],bb=b[i+1]??0,cc=b[i+2]??0; r+=c[a>>2]+c[((a&3)<<4)|(bb>>4)]+(i+1<b.length?c[((bb&15)<<2)|(cc>>6)]:"=")+(i+2<b.length?c[cc&63]:"=");} return r; });
 globalThis.atob = globalThis.atob || ((s) => {
@@ -10766,7 +10980,101 @@ globalThis.HTMLLIElement = Element;
 globalThis.HTMLPreElement = Element;
 globalThis.HTMLHeadingElement = Element;
 globalThis.HTMLTemplateElement = Element;
-globalThis.HTMLSlotElement = Element;
+const _manualSlotNodes = new WeakMap();
+const _manualSlotForNode = new WeakMap();
+function _isSlottable(node) {
+  return !!node && (node.nodeType === Node.ELEMENT_NODE || node.nodeType === Node.TEXT_NODE);
+}
+function _slotName(slot) {
+  return slot.getAttribute("name") || "";
+}
+function _slottableName(node) {
+  return node.nodeType === Node.ELEMENT_NODE ? (node.getAttribute("slot") || "") : "";
+}
+function _slotForNode(root, node) {
+  if (!(root instanceof globalThis.ShadowRoot)) return null;
+  if (root.slotAssignment === "manual") {
+    const slot = _manualSlotForNode.get(node) || null;
+    return slot && slot.getRootNode() === root ? slot : null;
+  }
+  const name = _slottableName(node);
+  for (const slot of root.querySelectorAll("slot")) {
+    if (_slotName(slot) === name) return slot;
+  }
+  return null;
+}
+function _assignedSlotForNode(node) {
+  const host = node.parentNode;
+  if (!(host instanceof Element)) return null;
+  const root = _shadowRootForHost(host, false);
+  return root ? _slotForNode(root, node) : null;
+}
+function _directSlotNodes(slot) {
+  const root = slot.getRootNode();
+  if (!(root instanceof globalThis.ShadowRoot)) return [];
+  const host = root.host;
+  if (root.slotAssignment === "manual") {
+    return (_manualSlotNodes.get(slot) || []).filter(node =>
+      _isSlottable(node) && node.parentNode === host);
+  }
+  return Array.from(host.childNodes).filter(node =>
+    _isSlottable(node) && _slotForNode(root, node) === slot);
+}
+function _flattenedSlotNodes(slot, seen) {
+  if (seen.has(slot)) return [];
+  seen.add(slot);
+  let nodes = _directSlotNodes(slot);
+  if (nodes.length === 0) {
+    nodes = Array.from(slot.childNodes).filter(_isSlottable);
+  }
+  const result = [];
+  for (const node of nodes) {
+    if (node instanceof globalThis.HTMLSlotElement
+        && node.getRootNode() instanceof globalThis.ShadowRoot) {
+      result.push(..._flattenedSlotNodes(node, seen));
+    } else {
+      result.push(node);
+    }
+  }
+  seen.delete(slot);
+  return result;
+}
+class HTMLSlotElement extends Element {
+  get name() { return this.getAttribute("name") || ""; }
+  set name(value) { this.setAttribute("name", String(value)); }
+  assignedNodes(options = {}) {
+    return options && options.flatten
+      ? _flattenedSlotNodes(this, new Set())
+      : _directSlotNodes(this);
+  }
+  assignedElements(options = {}) {
+    return this.assignedNodes(options).filter(node => node.nodeType === Node.ELEMENT_NODE);
+  }
+  assign(...nodes) {
+    if (!nodes.every(_isSlottable)) {
+      throw new TypeError("Failed to execute 'assign' on 'HTMLSlotElement': each argument must be an Element or Text.");
+    }
+    for (const node of _manualSlotNodes.get(this) || []) {
+      if (_manualSlotForNode.get(node) === this) _manualSlotForNode.delete(node);
+    }
+    const unique = [];
+    for (const node of nodes) {
+      const previous = _manualSlotForNode.get(node);
+      if (previous && previous !== this) {
+        _manualSlotNodes.set(previous,
+          (_manualSlotNodes.get(previous) || []).filter(item => item !== node));
+      }
+      if (!unique.includes(node)) unique.push(node);
+      _manualSlotForNode.set(node, this);
+    }
+    _manualSlotNodes.set(this, unique);
+  }
+}
+globalThis.HTMLSlotElement = HTMLSlotElement;
+_markNative(HTMLSlotElement);
+_markNative(HTMLSlotElement.prototype.assignedNodes);
+_markNative(HTMLSlotElement.prototype.assignedElements);
+_markNative(HTMLSlotElement.prototype.assign);
 globalThis.HTMLOptionElement = Element;
 globalThis.HTMLDataListElement = Element;
 globalThis.HTMLFieldSetElement = Element;
@@ -11352,6 +11660,8 @@ _markNative(globalThis.Selection);
   Storage, Storage.prototype.getItem, Storage.prototype.setItem,
   Storage.prototype.removeItem, Storage.prototype.clear, Storage.prototype.key,
   Notification, Notification.requestPermission,
+  window.chrome?.app?.getDetails, window.chrome?.app?.getIsInstalled,
+  window.chrome?.app?.installState, window.chrome?.app?.runningState,
   window.chrome?.csi, window.chrome?.loadTimes,
   MutationObserver, ResizeObserver, IntersectionObserver, PerformanceObserver,
   XMLSerializer, XMLSerializer.prototype.serializeToString,
@@ -11658,10 +11968,8 @@ class _IframeWindow {
 }
 
 // Encode an RGBA pixel buffer into a valid PNG data URL.
-// Uses stored-block DEFLATE (no compression) wrapped in zlib.
-// This produces a larger file than a real browser but the hash is unique
-// per session (from _fpNoise) and valid, so it does not match the known
-// headless stub.
+// Uses the runtime's bounded zlib encoder. The stored-block implementation is
+// retained as a fallback for an embedding that did not register the op.
 function _encodePNG(w, h, rgba) {
   // RGBA scanlines: filter byte (0) + 4 bytes per pixel.
   var rowLen = 1 + w * 4;
@@ -11678,19 +11986,27 @@ function _encodePNG(w, h, rgba) {
   var s1 = 1, s2 = 0, M = 65521;
   for (var i = 0; i < raw.length; i++) { s1 = (s1 + raw[i]) % M; s2 = (s2 + s1) % M; }
   var adler = ((s2 << 16) | s1) >>> 0;
-  // Stored DEFLATE blocks (zlib level 0)
-  var MAXB = 65535, nb = Math.ceil(raw.length / MAXB) || 1;
-  var dlen = 2 + nb * 5 + raw.length + 4;
-  var def = new Uint8Array(dlen), dp = 0;
-  def[dp++] = 0x78; def[dp++] = 0x01;
-  for (var bi = 0; bi < nb; bi++) {
-    var bs = bi * MAXB, be = Math.min(raw.length, bs + MAXB), bl = be - bs;
-    def[dp++] = bi === nb-1 ? 1 : 0;
-    def[dp++] = bl&0xff; def[dp++] = (bl>>8)&0xff;
-    def[dp++] = (~bl)&0xff; def[dp++] = (~bl>>8)&0xff;
-    def.set(raw.subarray(bs, be), dp); dp += bl;
+  var def = null;
+  try {
+    var compressed = Deno.core.ops.op_zlib_deflate(raw);
+    if (compressed && compressed.length) def = new Uint8Array(compressed);
+  } catch (_) { /* old embedding: use the valid stored-block fallback below */ }
+  if (!def) {
+    var MAXB = 65535, nb = Math.ceil(raw.length / MAXB) || 1;
+    var dlen = 2 + nb * 5 + raw.length + 4;
+    def = new Uint8Array(dlen);
+    var dp = 0;
+    def[dp++] = 0x78; def[dp++] = 0x01;
+    for (var bi = 0; bi < nb; bi++) {
+      var bs = bi * MAXB, be = Math.min(raw.length, bs + MAXB), bl = be - bs;
+      def[dp++] = bi === nb-1 ? 1 : 0;
+      def[dp++] = bl&0xff; def[dp++] = (bl>>8)&0xff;
+      def[dp++] = (~bl)&0xff; def[dp++] = (~bl>>8)&0xff;
+      def.set(raw.subarray(bs, be), dp); dp += bl;
+    }
+    def[dp++]=(adler>>24)&0xff; def[dp++]=(adler>>16)&0xff; def[dp++]=(adler>>8)&0xff; def[dp]=adler&0xff;
   }
-  def[dp++]=(adler>>24)&0xff; def[dp++]=(adler>>16)&0xff; def[dp++]=(adler>>8)&0xff; def[dp]=adler&0xff;
+  var dlen = def.length;
   // CRC32 (lazy table)
   if (!_encodePNG._t) {
     var t = new Uint32Array(256);
@@ -11732,6 +12048,27 @@ globalThis.__ariaQuerySelector = function(root, selector) { return null; };
 globalThis.__ariaQuerySelectorAll = async function*(root, selector) { /* yields nothing */ };
 const _MAX_CANVAS_DIMENSION = 32767;
 const _MAX_CANVAS_PIXELS = 67108864;
+function _parseCanvasFont(value) {
+  const text = String(value).trim();
+  const match = text.match(/^(.*?)(\d+(?:\.\d+)?)(px|pt)(?:\/[^\s]+)?\s+(.+)$/i);
+  if (!match) return null;
+  const size = Number(match[2]) * (match[3].toLowerCase() === 'pt' ? 4 / 3 : 1);
+  const family = match[4].trim();
+  if (!Number.isFinite(size) || size <= 0 || !family) return null;
+  const prefix = match[1].trim().replace(/\s+/g, ' ');
+  const weight = prefix.match(/(?:^|\s)([1-9]00)(?:\s|$)/);
+  const bold = /(?:^|\s)(?:bold|bolder)(?:\s|$)/i.test(prefix)
+    || (weight && Number(weight[1]) >= 600);
+  const italic = /(?:^|\s)(?:italic|oblique)(?:\s|$)/i.test(prefix);
+  const rounded = Math.round(size * 10000) / 10000;
+  return {
+    css: `${prefix ? `${prefix} ` : ''}${rounded}px ${family}`,
+    size,
+    family,
+    bold: !!bold,
+    italic,
+  };
+}
 class _Canvas2D {
   constructor(canvas) {
     this.canvas = canvas;
@@ -11754,6 +12091,12 @@ class _Canvas2D {
     this.globalAlpha = 1;
     this.globalCompositeOperation = 'source-over';
     this._stateStack = [];
+    this._path = [];
+  }
+  get font() { return this._fontInfo ? this._fontInfo.css : '10px sans-serif'; }
+  set font(value) {
+    const parsed = _parseCanvasFont(value);
+    if (parsed) this._fontInfo = parsed;
   }
   _resizeFromCanvas() {
     const requestedWidth = this._canvasDimension('width', 300);
@@ -11851,10 +12194,45 @@ class _Canvas2D {
   }
   fillText(text, x, y) {
     const [r,g,b,a] = this._parseColor(this.fillStyle);
-    const fontSize = parseInt(this.font) || 10;
-    const scale = Math.max(1, Math.round(fontSize / 10));
+    const fontInfo = this._fontInfo || _parseCanvasFont('10px sans-serif');
+    const fontSize = fontInfo.size;
     const str = String(text);
-    let cx = Math.round(x);
+    const drawText = Deno.core.ops.op_canvas_fill_text;
+    const metrics = this._measureText(str);
+    let drawX = Number(x);
+    let baselineY = Number(y);
+    if (!Number.isFinite(drawX) || !Number.isFinite(baselineY)) return;
+    if (this.textAlign === 'center') drawX -= metrics.width / 2;
+    else if (this.textAlign === 'right' || this.textAlign === 'end') drawX -= metrics.width;
+    if (this.textBaseline === 'top') baselineY += metrics.actualBoundingBoxAscent;
+    else if (this.textBaseline === 'hanging') baselineY += metrics.actualBoundingBoxAscent * 0.8;
+    else if (this.textBaseline === 'middle') {
+      baselineY += (metrics.actualBoundingBoxAscent - metrics.actualBoundingBoxDescent) / 2;
+    } else if (this.textBaseline === 'bottom' || this.textBaseline === 'ideographic') {
+      baselineY -= metrics.actualBoundingBoxDescent;
+    }
+    if (typeof drawText === 'function' && this.globalCompositeOperation === 'source-over') {
+      const globalAlpha = Math.min(1, Math.max(0, Number(this.globalAlpha) || 0));
+      if (drawText(
+        this.canvas._nid,
+        str,
+        drawX,
+        baselineY,
+        fontSize,
+        fontInfo.bold,
+        fontInfo.italic,
+        fontInfo.family,
+        r,
+        g,
+        b,
+        Math.round(a * globalAlpha),
+      )) {
+        this._markPaintDamage();
+        return;
+      }
+    }
+    const scale = Math.max(1, Math.round(fontSize / 10));
+    let cx = Math.round(drawX);
     for (let i = 0; i < str.length; i++) {
       const code = str.charCodeAt(i);
       for (let row = 0; row < 7; row++) {
@@ -11865,7 +12243,7 @@ class _Canvas2D {
           if (on) {
             for (let sy = 0; sy < scale; sy++) {
               for (let sx = 0; sx < scale; sx++) {
-                this._setPixel(cx + col*scale + sx, Math.round(y) - 7*scale + row*scale + sy, r, g, b, a);
+                this._setPixel(cx + col*scale + sx, Math.round(baselineY) - 7*scale + row*scale + sy, r, g, b, a);
               }
             }
           }
@@ -11876,11 +12254,30 @@ class _Canvas2D {
     this._markPaintDamage();
   }
   strokeText(text, x, y) { this.fillText(text, x, y); }
-  measureText(t) {
-    const fontSize = parseInt(this.font) || 10;
+  _measureText(t) {
+    const fontInfo = this._fontInfo || _parseCanvasFont('10px sans-serif');
+    const measure = Deno.core.ops.op_canvas_measure_text;
+    if (typeof measure === 'function') {
+      try {
+        const result = JSON.parse(measure(
+          String(t),
+          fontInfo.size,
+          fontInfo.bold,
+          fontInfo.italic,
+          fontInfo.family,
+        ));
+        return {
+          width: result.width,
+          actualBoundingBoxAscent: result.ascent,
+          actualBoundingBoxDescent: result.descent,
+        };
+      } catch (_error) {}
+    }
+    const fontSize = fontInfo.size;
     const scale = Math.max(1, Math.round(fontSize / 10));
     return { width: String(t).length * 6 * scale, actualBoundingBoxAscent: 7*scale, actualBoundingBoxDescent: 2*scale };
   }
+  measureText(t) { return this._measureText(String(t)); }
   getImageData(x, y, w, h) {
     x=Math.round(x); y=Math.round(y); w=Math.round(w); h=Math.round(h);
     const data = new Uint8ClampedArray(w * h * 4);
@@ -11942,12 +12339,22 @@ class _Canvas2D {
   bezierCurveTo() {} quadraticCurveTo() {}
   arc(x, y, r, s, e) { if (this._path) this._path.push({t:'A',x,y,r}); }
   arcTo() {}
-  rect(x, y, w, h) { this.fillRect(x, y, w, h); }
+  rect(x, y, w, h) { this._path.push({t:'R',x,y,w,h}); }
   fill() {
     if (!this._path) return;
     const [r,g,b,a] = this._parseColor(this.fillStyle);
     for (const seg of this._path) {
-      if (seg.t === 'A') {
+      if (seg.t === 'R') {
+        const left = Math.round(Math.min(seg.x, seg.x + seg.w));
+        const right = Math.round(Math.max(seg.x, seg.x + seg.w));
+        const top = Math.round(Math.min(seg.y, seg.y + seg.h));
+        const bottom = Math.round(Math.max(seg.y, seg.y + seg.h));
+        for (let py = Math.max(0, top); py < Math.min(this._h, bottom); py++) {
+          for (let px = Math.max(0, left); px < Math.min(this._w, right); px++) {
+            this._setPixel(px, py, r, g, b, a);
+          }
+        }
+      } else if (seg.t === 'A') {
         const cx = Math.round(seg.x), cy = Math.round(seg.y), rad = seg.r;
         const r2 = rad * rad;
         for (let py = Math.max(0, cy - rad); py <= Math.min(this._h - 1, cy + rad); py++) {
@@ -11957,12 +12364,11 @@ class _Canvas2D {
         }
       }
     }
-    this._path = [];
     this._markPaintDamage();
   }
   stroke() {}
   clip() {}
-  save() { this._stateStack.push({fillStyle: this.fillStyle, strokeStyle: this.strokeStyle, globalAlpha: this.globalAlpha, font: this.font, lineWidth: this.lineWidth}); }
+  save() { this._stateStack.push({fillStyle: this.fillStyle, strokeStyle: this.strokeStyle, globalAlpha: this.globalAlpha, globalCompositeOperation: this.globalCompositeOperation, font: this.font, lineWidth: this.lineWidth, textAlign: this.textAlign, textBaseline: this.textBaseline}); }
   restore() { const s = this._stateStack.pop(); if (s) Object.assign(this, s); }
   translate() {} rotate() {} scale() {}
   setTransform() {} resetTransform() {} transform() {}
@@ -12015,7 +12421,7 @@ globalThis.HTMLCanvasElement = HTMLCanvasElement;
 HTMLCanvasElement.prototype.getContext = function getContext(type) {
   if (type === '2d') {
     if (!this._ctx) {
-      try { this._ctx = new _Canvas2D(this); }
+      try { _setInternal(this, '_ctx', new _Canvas2D(this)); }
       catch (_error) { return null; }
     }
     return this._ctx;
@@ -12074,11 +12480,11 @@ Element.prototype.attachShadow = function attachShadow(opts) {
   }
   const shadow = new ShadowRoot(rootNid, this, opts);
   _treeMutationEpoch++;
-  shadow._treeDetachedExact = false;
-  shadow._treeParent = null;
-  shadow._treeParentEpoch = _treeMutationEpoch;
-  shadow._treeConnected = this.isConnected;
-  shadow._treeConnectedEpoch = _treeMutationEpoch;
+  _setInternal(shadow, '_treeDetachedExact', false);
+  _setInternal(shadow, '_treeParent', null);
+  _setInternal(shadow, '_treeParentEpoch', _treeMutationEpoch);
+  _setInternal(shadow, '_treeConnected', this.isConnected);
+  _setInternal(shadow, '_treeConnectedEpoch', _treeMutationEpoch);
   _cache.set(rootNid, shadow);
   return shadow;
 };
@@ -14026,7 +14432,7 @@ globalThis.__obscura_init = function() {
   const vh = Number.isFinite(globalThis.__obscura_viewport_h) && globalThis.__obscura_viewport_h > 0
     ? globalThis.__obscura_viewport_h : sh - 80;
   _applyScreenSize(sw, sh, !!globalThis.__obscura_screen_emulated);
-  globalThis.visualViewport = { width:vw, height:vh, offsetLeft:0, offsetTop:0, scale:1, addEventListener(){}, removeEventListener(){} };
+  _forkSetVisualViewportSize(vw, vh);
   // Screen dimensions do not determine the output device scale. The embedding
   // browser applies an explicit device metric after page initialization; the
   // standalone runtime has the same 1x default as Obscura's render surface.
@@ -14039,7 +14445,8 @@ globalThis.__obscura_init = function() {
   var memValues = globalThis.__obscura_stealth ? [4, 8] : [0.25, 0.5, 1, 2, 4, 8];
   globalThis.__obscura_mem = memValues[Math.floor(_fpRand(401) * memValues.length)];
 
-  const t0 = Date.now() + Math.floor(_fpRand(641) * 100) - 50;
+  // A future origin makes performance.now() negative, which Chrome never does.
+  const t0 = Date.now() - Math.floor(_fpRand(641) * 100);
   globalThis.performance.timeOrigin = t0;
   globalThis.performance.timing = { navigationStart: t0, domContentLoadedEventEnd: t0, loadEventEnd: t0 };
   var _totalHeap = 15000000 + Math.floor(_fpRand(620) * 85000000);

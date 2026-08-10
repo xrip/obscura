@@ -1701,9 +1701,9 @@ mod tests {
         let session_id = format!("{page_id}-session");
         ctx.sessions.insert(session_id.clone(), page_id);
         let session = Some(session_id);
-        ctx.get_session_page_mut(&session)
-            .expect("page")
-            .set_viewport((100.0, 80.0));
+        let page = ctx.get_session_page_mut(&session).expect("page");
+        page.set_viewport((100.0, 80.0));
+        page.set_device_scale_factor(1.0);
 
         handle(
             "navigate",
@@ -1769,9 +1769,9 @@ mod tests {
         let session_id = format!("{page_id}-session");
         ctx.sessions.insert(session_id.clone(), page_id);
         let session = Some(session_id);
-        ctx.get_session_page_mut(&session)
-            .expect("page")
-            .set_viewport((100.0, 80.0));
+        let page = ctx.get_session_page_mut(&session).expect("page");
+        page.set_viewport((100.0, 80.0));
+        page.set_device_scale_factor(1.0);
         handle(
             "navigate",
             &json!({
@@ -1795,9 +1795,9 @@ mod tests {
         let session_id = format!("{page_id}-session");
         ctx.sessions.insert(session_id.clone(), page_id);
         let session = Some(session_id);
-        ctx.get_session_page_mut(&session)
-            .expect("page")
-            .set_viewport((100.0, 80.0));
+        let page = ctx.get_session_page_mut(&session).expect("page");
+        page.set_viewport((100.0, 80.0));
+        page.set_device_scale_factor(1.0);
         handle(
             "navigate",
             &json!({
@@ -2508,9 +2508,9 @@ mod tests {
         let session_id = format!("{page_id}-session");
         ctx.sessions.insert(session_id.clone(), page_id);
         let session = Some(session_id);
-        ctx.get_session_page_mut(&session)
-            .expect("page")
-            .set_viewport((1000.0, 700.0));
+        let page = ctx.get_session_page_mut(&session).expect("page");
+        page.set_viewport((1000.0, 700.0));
+        page.set_device_scale_factor(1.0);
         handle(
             "navigate",
             &json!({

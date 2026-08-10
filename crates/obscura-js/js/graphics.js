@@ -8,6 +8,7 @@ const _graphicsObjectToken = {};
 const _canvasSlots = new WeakMap();
 const _webglSlots = new WeakMap();
 const _resourceSlots = new WeakMap();
+const _graphicsJsonStringify = JSON.stringify;
 
 function _graphicsIllegalConstructor() { throw new TypeError('Illegal constructor'); }
 function _graphicsBrand(slots, self, name) {
@@ -33,8 +34,20 @@ function _graphicsDefineMethod(proto, name, length, fn) {
 function _graphicsDefineProperties(proto, descriptors) {
   for (const name of Object.keys(descriptors)) {
     const d = descriptors[name];
-    if (typeof d.get === 'function') d.get = _makeNativeFunction(d.get, 'get ' + name, 0, 'function get ' + name + '() { [native code] }');
-    if (typeof d.set === 'function') d.set = _makeNativeFunction(d.set, 'set ' + name, 1, 'function set ' + name + '() { [native code] }');
+    if (typeof d.get === 'function') {
+      const implementation = d.get;
+      d.get = Object.getOwnPropertyDescriptor({
+        get value() { return implementation.call(this); },
+      }, 'value').get;
+      d.get = _makeNativeFunction(d.get, 'get ' + name, 0, 'function get ' + name + '() { [native code] }');
+    }
+    if (typeof d.set === 'function') {
+      const implementation = d.set;
+      d.set = Object.getOwnPropertyDescriptor({
+        set value(value) { implementation.call(this, value); },
+      }, 'value').set;
+      d.set = _makeNativeFunction(d.set, 'set ' + name, 1, 'function set ' + name + '() { [native code] }');
+    }
   }
   Object.defineProperties(proto, descriptors);
 }
@@ -82,7 +95,7 @@ function _graphicsHashBytes(bytes, seed) {
 }
 function _graphicsDigest(value) {
   let text;
-  try { text = JSON.stringify(value, function(k, v) {
+  try { text = _graphicsJsonStringify(value, function(k, v) {
     if (ArrayBuffer.isView(v)) return Array.from(v);
     if (v instanceof ArrayBuffer) return Array.from(new Uint8Array(v));
     if (_resourceSlots.has(v)) { const s = _resourceSlots.get(v); return [s.kind, s.serial, s.digest]; }
@@ -480,7 +493,78 @@ function _renderbufferStorage(target,format,width,height){const s=_webglState(th
 function _framebufferRenderbuffer(target,attachment,renderTarget,rb){const s=_webglState(this),fb=Number(target)===0x8ca8?s.readFramebuffer:s.drawFramebuffer;if(!fb){_webglPushError(s,0x0502);return;}const fr=_resourceSlots.get(fb);if(rb!==null&&_webglResource(s,rb,'renderbuffer',false)===undefined)return;if(rb===null)fr.attachments.delete(Number(attachment));else fr.attachments.set(Number(attachment),{object:rb,target:Number(renderTarget),level:0});}
 
 function _webglClear(mask){const s=_webglState(this);if(s.lost)return;mask=Number(mask);if(mask&~(0x4000|0x0100|0x0400)){_webglPushError(s,0x0501);return;}if(mask&0x4000){const surface=_webglSurface(s,false),sc=s.enabled.has(0x0c11)?s.dynamic.get(0x0c10):[0,0,surface.width,surface.height],f=s.dynamic.get(0x0c22)||[0,0,0,0],m=s.dynamic.get(0x0c23)||[true,true,true,true],color=[Math.round(Math.max(0,Math.min(1,f[0]))*255),Math.round(Math.max(0,Math.min(1,f[1]))*255),Math.round(Math.max(0,Math.min(1,f[2]))*255),Math.round(Math.max(0,Math.min(1,f[3]))*255)];_surfaceRegion(surface,{kind:'clear',x:Math.max(0,sc[0]),y:Math.max(0,sc[1]),w:Math.max(0,Math.min(surface.width,sc[0]+sc[2])-Math.max(0,sc[0])),h:Math.max(0,Math.min(surface.height,sc[1]+sc[3])-Math.max(0,sc[1])),color,mask:Array.from(m)});}}
-function _webglDraw(method,args){const s=_webglState(this);if(s.lost)return;if(!s.currentProgram||!(_resourceSlots.get(s.currentProgram)||{}).linked){_webglPushError(s,0x0502);return;}const surface=_webglSurface(s,false),viewport=s.dynamic.get(0x0ba2)||[0,0,surface.width,surface.height],sc=s.enabled.has(0x0c11)?s.dynamic.get(0x0c10):viewport,p=_resourceSlots.get(s.currentProgram),bindings=[];for(const [k,v] of s.bindings){const r=v&&_resourceSlots.get(v);bindings.push([k,r&&r.digest]);}bindings.sort((a,b)=>a[0]-b[0]);const transcript=[_fingerprintProfile&&_fingerprintProfile.id,_fingerprintProfile&&_fingerprintProfile.renderSeed,s.generation,p.digest,Array.from(p.uniformValues.entries()).sort(),bindings,Array.from(s.enabled).sort(),Array.from(viewport),Array.from(sc),method,args,s.drawNumber++];const hash=_graphicsHashText(JSON.stringify(transcript));_surfaceRegion(surface,{kind:'draw',x:Math.max(0,sc[0]),y:Math.max(0,sc[1]),w:Math.max(0,Math.min(surface.width,sc[0]+sc[2])-Math.max(0,sc[0])),h:Math.max(0,Math.min(surface.height,sc[1]+sc[3])-Math.max(0,sc[1])),hash,mask:Array.from(s.dynamic.get(0x0c23)||[true,true,true,true])});s.commands.push(hash);if(s.commands.length>_GRAPHICS_COMMAND_LIMIT)s.commands.splice(0,s.commands.length-_GRAPHICS_COMMAND_LIMIT);}
+function _webglSimpleGradientProgram(program) {
+  const shaders=program.shaders.map(shader=>_resourceSlots.get(shader));
+  const vertex=shaders.find(shader=>shader.type===0x8b31),fragment=shaders.find(shader=>shader.type===0x8b30);
+  if(!vertex||!fragment||program.attributes.length!==1)return null;
+  const attribute=program.attributes[0],uniform=program.uniforms.find(value=>value.type==='vec2');
+  const varying=vertex.scan.varyings.find(value=>value.type==='vec2'&&fragment.scan.varyings.some(other=>other.type==='vec2'&&other.name===value.name));
+  if(attribute.type!=='vec2'||!uniform||!varying)return null;
+  const compact=source=>source.replace(/\/\*[\s\S]*?\*\//g,'').replace(/\/\/.*$/gm,'').replace(/\s+/g,'');
+  const vertexSource=compact(vertex.source),fragmentSource=compact(fragment.source);
+  if(!vertexSource.includes(varying.name+'='+attribute.name+'+'+uniform.name+';')||
+     !vertexSource.includes('gl_Position=vec4('+attribute.name+',0,1);')||
+     !fragmentSource.includes('gl_FragColor=vec4('+varying.name+',0,1);'))return null;
+  return {attribute,uniform};
+}
+function _webglFloatVertex(resource,attribute,index) {
+  if(!resource||!resource.bytes||attribute.type!==0x1406||attribute.integer||attribute.normalized||attribute.size<2)return null;
+  const stride=attribute.stride||attribute.size*4,offset=attribute.offset+index*stride;
+  if(offset<0||offset+8>resource.bytes.byteLength)return null;
+  const view=new DataView(resource.bytes.buffer,resource.bytes.byteOffset,resource.bytes.byteLength);
+  return [view.getFloat32(offset,true),view.getFloat32(offset+4,true)];
+}
+function _webglTrySimpleGradientDraw(s,program,surface,viewport,scissor,method,args) {
+  if(method!=='drawArrays')return false;
+  for(const capability of s.enabled)if(capability!==0x0c11)return false;
+  const shape=_webglSimpleGradientProgram(program),mode=Number(args[0]),first=Number(args[1])|0,count=Number(args[2])|0;
+  if(!shape||(mode!==0x0004&&mode!==0x0005)||first<0||count<0||count>4096)return false;
+  const location=program.attribBindings.has(shape.attribute.name)?program.attribBindings.get(shape.attribute.name):program.attributes.findIndex(value=>value.name===shape.attribute.name);
+  const attribute=s.vertexAttribs.get(location),buffer=attribute&&_resourceSlots.get(attribute.buffer);
+  if(!attribute||!attribute.enabled||attribute.divisor||!buffer)return false;
+  let offset=program.uniformValues.get(shape.uniform.name);
+  if(Array.isArray(offset)&&offset.length===1&&Array.isArray(offset[0]))offset=offset[0];
+  if(!Array.isArray(offset)||offset.length<2||!Number.isFinite(Number(offset[0]))||!Number.isFinite(Number(offset[1])))return false;
+  const vertices=[];
+  for(let index=0;index<count;index++){
+    const value=_webglFloatVertex(buffer,attribute,first+index);
+    if(!value)return false;
+    vertices.push({x:viewport[0]+(value[0]+1)*viewport[2]/2,y:viewport[1]+(value[1]+1)*viewport[3]/2,r:value[0]+Number(offset[0]),g:value[1]+Number(offset[1])});
+  }
+  const triangles=[];
+  if(mode===0x0004)for(let index=0;index+2<vertices.length;index+=3)triangles.push([vertices[index],vertices[index+1],vertices[index+2]]);
+  else for(let index=0;index+2<vertices.length;index++)triangles.push([vertices[index],vertices[index+1],vertices[index+2]]);
+  if(!triangles.length)return true;
+  const clipX=Math.max(0,Number(scissor[0])|0),clipY=Math.max(0,Number(scissor[1])|0);
+  const clipRight=Math.min(surface.width,(Number(scissor[0])+Number(scissor[2]))|0),clipTop=Math.min(surface.height,(Number(scissor[1])+Number(scissor[3]))|0);
+  const minX=Math.max(clipX,Math.floor(Math.min(...vertices.map(value=>value.x))));
+  const minY=Math.max(clipY,Math.floor(Math.min(...vertices.map(value=>value.y))));
+  const maxX=Math.min(clipRight,Math.ceil(Math.max(...vertices.map(value=>value.x))));
+  const maxY=Math.min(clipTop,Math.ceil(Math.max(...vertices.map(value=>value.y))));
+  const width=Math.max(0,maxX-minX),height=Math.max(0,maxY-minY);
+  if(!width||!height||width*height*4>_GRAPHICS_PIXEL_WORK_LIMIT)return true;
+  const bytes=new Uint8ClampedArray(width*height*4);
+  for(let y=0;y<height;y++)for(let x=0;x<width;x++)bytes.set(_surfacePixel(surface,minX+x,minY+y),(y*width+x)*4);
+  const edge=(a,b,x,y)=>(x-a.x)*(b.y-a.y)-(y-a.y)*(b.x-a.x);
+  let touched=false;
+  for(const triangle of triangles){
+    const [a,b,c]=triangle,area=edge(a,b,c.x,c.y);
+    if(Math.abs(area)<1e-12)continue;
+    const left=Math.max(minX,Math.floor(Math.min(a.x,b.x,c.x))),right=Math.min(maxX,Math.ceil(Math.max(a.x,b.x,c.x)));
+    const bottom=Math.max(minY,Math.floor(Math.min(a.y,b.y,c.y))),top=Math.min(maxY,Math.ceil(Math.max(a.y,b.y,c.y)));
+    for(let y=bottom;y<top;y++)for(let x=left;x<right;x++){
+      const px=x+0.5,py=y+0.5,wa=edge(b,c,px,py)/area,wb=edge(c,a,px,py)/area,wc=edge(a,b,px,py)/area;
+      if(wa<0||wb<0||wc<0)continue;
+      const at=((y-minY)*width+x-minX)*4;
+      bytes[at]=Math.round(Math.max(0,Math.min(1,wa*a.r+wb*b.r+wc*c.r))*255);
+      bytes[at+1]=Math.round(Math.max(0,Math.min(1,wa*a.g+wb*b.g+wc*c.g))*255);
+      bytes[at+2]=0;bytes[at+3]=255;touched=true;
+    }
+  }
+  if(touched)_surfaceRegion(surface,{kind:'pixels',x:minX,y:minY,w:width,h:height,bytesPerRow:width*4,bytes,mask:Array.from(s.dynamic.get(0x0c23)||[true,true,true,true])});
+  return true;
+}
+function _webglDraw(method,args){const s=_webglState(this);if(s.lost)return;if(!s.currentProgram||!(_resourceSlots.get(s.currentProgram)||{}).linked){_webglPushError(s,0x0502);return;}const surface=_webglSurface(s,false),viewport=s.dynamic.get(0x0ba2)||[0,0,surface.width,surface.height],sc=s.enabled.has(0x0c11)?s.dynamic.get(0x0c10):viewport,p=_resourceSlots.get(s.currentProgram),bindings=[];for(const [k,v] of s.bindings){const r=v&&_resourceSlots.get(v);bindings.push([k,r&&r.digest]);}bindings.sort((a,b)=>a[0]-b[0]);const transcript=[_fingerprintProfile&&_fingerprintProfile.id,_fingerprintProfile&&_fingerprintProfile.renderSeed,s.generation,p.digest,Array.from(p.uniformValues.entries()).sort(),bindings,Array.from(s.enabled).sort(),Array.from(viewport),Array.from(sc),method,args,s.drawNumber++];const hash=_graphicsHashText(_graphicsJsonStringify(transcript));if(!_webglTrySimpleGradientDraw(s,p,surface,viewport,sc,method,args))_surfaceRegion(surface,{kind:'draw',x:Math.max(0,sc[0]),y:Math.max(0,sc[1]),w:Math.max(0,Math.min(surface.width,sc[0]+sc[2])-Math.max(0,sc[0])),h:Math.max(0,Math.min(surface.height,sc[1]+sc[3])-Math.max(0,sc[1])),hash,mask:Array.from(s.dynamic.get(0x0c23)||[true,true,true,true])});s.commands.push(hash);if(s.commands.length>_GRAPHICS_COMMAND_LIMIT)s.commands.splice(0,s.commands.length-_GRAPHICS_COMMAND_LIMIT);}
 function _readPixels(x,y,width,height,format,type,dst,dstOffset){
   const s=_webglState(this);x=Number(x);y=Number(y);width=Number(width);height=Number(height);format=Number(format);type=Number(type);
   if(!Number.isSafeInteger(x)||!Number.isSafeInteger(y)||!Number.isSafeInteger(width)||!Number.isSafeInteger(height)||width<0||height<0){_webglPushError(s,0x0501);return;}
@@ -535,10 +619,10 @@ function _readPixels(x,y,width,height,format,type,dst,dstOffset){
   }
 }
 
-function _vertexAttrib(s,index){index=Number(index);const max=_webglValue(s.component.parameters&&s.component.parameters['34921'])||16;if(!Number.isInteger(index)||index<0||index>=max){_webglPushError(s,0x0501);return null;}if(!s.vertexAttribs.has(index))s.vertexAttribs.set(index,{enabled:false,size:4,type:0x1406,normalized:false,stride:0,offset:0,integer:false,divisor:0,buffer:null,current:new Float32Array([0,0,0,1])});return s.vertexAttribs.get(index);}
+function _vertexAttrib(s,index){index=Number(index)>>>0;const max=_webglValue(s.component.parameters&&s.component.parameters['34921'])||16;if(index>=max){_webglPushError(s,0x0501);return null;}if(!s.vertexAttribs.has(index))s.vertexAttribs.set(index,{enabled:false,size:4,type:0x1406,normalized:false,stride:0,offset:0,integer:false,divisor:0,buffer:null,current:new Float32Array([0,0,0,1])});return s.vertexAttribs.get(index);}
 function _vertexAttribPointer(index,size,type,normalized,stride,offset,integer){const s=_webglState(this),a=_vertexAttrib(s,index);if(!a)return;if(!s.bindings.get(0x8892)){_webglPushError(s,0x0502);return;}size=Number(size);stride=Number(stride);offset=Number(offset);if(size<1||size>4||stride<0||offset<0){_webglPushError(s,0x0501);return;}Object.assign(a,{size,type:Number(type),normalized:!!normalized,stride,offset,integer:!!integer,buffer:s.bindings.get(0x8892)});}
 function _getVertexAttrib(index,pname){const s=_webglState(this),a=_vertexAttrib(s,index);if(!a)return null;const map={0x8622:'enabled',0x8623:'size',0x8624:'stride',0x8625:'type',0x886a:'normalized',0x889f:'buffer',0x88fd:'integer',0x88fe:'divisor'};if(Number(pname)===0x8626)return new Float32Array(a.current);const key=map[Number(pname)];if(key)return a[key];_webglPushError(s,0x0500);return null;}
-function _setDynamicCall(name,enums){return function(){const s=_webglState(this),args=Array.from(arguments,Number);for(let i=0;i<enums.length;i++)s.dynamic.set(enums[i],args[Math.min(i,args.length-1)]);s.commands.push(_graphicsHashText(name+JSON.stringify(args)));};}
+function _setDynamicCall(name,enums){return function(){const s=_webglState(this),args=Array.from(arguments,Number);for(let i=0;i<enums.length;i++)s.dynamic.set(enums[i],args[Math.min(i,args.length-1)]);s.commands.push(_graphicsHashText(name+_graphicsJsonStringify(args)));};}
 
 function _canvasGetContext(canvas, type, options) {
   const s=_canvasSlots.get(canvas);type=String(type).toLowerCase();let mode=type==='experimental-webgl'?'webgl':type;

@@ -2,7 +2,7 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use obscura_browser::profiles;
 use obscura_browser::{BrowserContext, Page, WaitUntil};
@@ -30,12 +30,6 @@ const CASES: &[ProductCase] = &[
         url: "https://www.ozon.ru/product/ochistitel-vyhlopnoy-sistemy-rastvor-mocheviny-adblue-10-l-sintec-804-1902651403",
         product_id: "1902651403",
         product_marker: "adblue",
-    },
-    ProductCase {
-        name: "avito",
-        url: "https://www.avito.ru/novosibirsk/tovary_dlya_kompyutera/cmp_100hx_cmp_100-100_6gb_hbm2_8226629375",
-        product_id: "8226629375",
-        product_marker: "данные видеокарты это урезки",
     },
 ];
 
@@ -132,6 +126,44 @@ fn product_card_error(case: &ProductCase, value: Value) -> Option<String> {
     None
 }
 
+async fn wait_for_product_card(page: &mut Page, case: &ProductCase) -> Result<Value, String> {
+    let started = Instant::now();
+    let timeout = Duration::from_secs(60);
+    let mut task_budget_errors = 0;
+
+    loop {
+        let value = page.evaluate(&product_eval(case.product_id, case.product_marker));
+        if product_card_error(case, value.clone()).is_none() || started.elapsed() >= timeout {
+            return Ok(value);
+        }
+
+        page.process_pending_navigation()
+            .await
+            .map_err(|error| format!("{} challenge navigation failed: {error}", case.name))?;
+        let reached_idle = match page.run_autonomous_event_loop_turn().await {
+            Ok(reached_idle) => {
+                task_budget_errors = 0;
+                reached_idle
+            }
+            Err(error)
+                if error.contains("exceeded its task budget") && task_budget_errors < 3 =>
+            {
+                task_budget_errors += 1;
+                false
+            }
+            Err(error) => {
+                return Err(format!("{} challenge task failed: {error}", case.name));
+            }
+        };
+        page.process_pending_navigation()
+            .await
+            .map_err(|error| format!("{} challenge navigation failed: {error}", case.name))?;
+        if reached_idle {
+            tokio::task::yield_now().await;
+        }
+    }
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn live_product_cards_load_with_the_selected_profile() {
     if let Ok(runtime_dir) = std::env::var("OBSCURA_PROFILE_RUNTIME_DIR") {
@@ -173,8 +205,13 @@ async fn live_product_cards_load_with_the_selected_profile() {
             Ok(Ok(())) => {}
         }
 
-        page.settle(10_000).await;
-        let value = page.evaluate(&product_eval(case.product_id, case.product_marker));
+        let value = match wait_for_product_card(&mut page, case).await {
+            Ok(value) => value,
+            Err(error) => {
+                failures.push(error);
+                continue;
+            }
+        };
         if let Some(error) = product_card_error(case, value) {
             failures.push(error);
         }

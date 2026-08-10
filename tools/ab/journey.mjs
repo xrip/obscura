@@ -6,9 +6,12 @@
 //     --cards <n>        product cards to visit (default 3)
 //     --only <engine>    "chrome" or "obscura"
 //     --proxy <url>      send both engines through the same proxy
+//     --profile-dir <p>  reuse one Chrome profile directory across runs
+//     --trace-challenge  log safe WB VM and create-token shapes
 //     --wait <seconds>   how long to wait for a card to render (default 20)
 //     --goto             navigate by URL instead of clicking the card
 //     --headed           show the Chrome window
+//     --clean-host       launch outside the current Windows process tree
 //
 // Open the home page, pick N product links at random, and visit each one.
 //
@@ -28,6 +31,7 @@
 // cannot be satisfied by the site chrome alone.
 
 import { runIn, tryEvaluate, evaluated } from './engines.mjs';
+import { installChallengeTrace, readChallengeTrace } from './challenge-trace.mjs';
 // What differs between storefronts: where the home page is, what a card link
 // looks like, and where the product id hides in its URL.
 const SITES = {
@@ -63,9 +67,12 @@ function parseArgs(argv) {
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === '--headed') opts.headed = true;
+    else if (arg === '--clean-host') opts.cleanHost = true;
     else if (arg === '--cards') opts.cards = Number(argv[++i]);
     else if (arg === '--only') opts.only = argv[++i];
     else if (arg === '--proxy') opts.proxy = argv[++i];
+    else if (arg === '--profile-dir') opts.profileDir = argv[++i];
+    else if (arg === '--trace-challenge') opts.traceChallenge = true;
     else if (arg === '--wait') opts.wait = Number(argv[++i]);
     else if (arg === '--goto') opts.goto = true;
     else if (arg === '--site') opts.site = argv[++i];
@@ -87,11 +94,18 @@ async function journey(page, log) {
   let requests = 0;
   page.on('request', () => { requests += 1; });
 
+  if (opts.traceChallenge) {
+    await installChallengeTrace(page);
+  }
+
   // Which IP the site actually sees. A blocked run and a proxied run look the
   // same from here otherwise, and guessing which one happened wastes far more
   // time than asking.
   try {
-    await page.goto('https://api.ipify.org/?format=json', { waitUntil: 'load', timeout: 30000 });
+    // The expected route is an IPv4 address. The dual-stack endpoint can take
+    // a different IPv6 path and report an unrelated exit, so pin this gate to
+    // IPv4 before using it to accept or reject a live-site result.
+    await page.goto('https://api4.ipify.org/', { waitUntil: 'load', timeout: 30000 });
     const seen = evaluated(await tryEvaluate(page, () => document.body.innerText.trim().slice(0, 80)));
     log(`exit ip: ${seen}`);
   } catch (error) {
@@ -99,7 +113,11 @@ async function journey(page, log) {
   }
   requests = 0;
 
-  await page.goto(HOME, { waitUntil: 'load', timeout: 90000 });
+  const homeResponse = await page.goto(HOME, { waitUntil: 'load', timeout: 90000 });
+  if (homeResponse) {
+    const headers = homeResponse.headers();
+    log(`home response: ${homeResponse.status()} content-type=${headers['content-type'] || ''}`);
+  }
   // The home page fills its rails after hydration, so wait for links rather
   // than assuming the first paint has them.
   let links = [];
@@ -112,7 +130,23 @@ async function journey(page, log) {
   const unique = [...new Set(links.filter(productId))];
   steps.push({ step: 'home', links: unique.length, requests, ok: unique.length >= opts.cards });
   log(`home: ${unique.length} product links, ${requests} requests`);
-  if (!unique.length) return steps;
+  if (!unique.length) {
+    const state = evaluated(await tryEvaluate(page, () => ({
+      url: location.href,
+      title: document.title,
+      h1: document.querySelector('h1')?.innerText || '',
+      text: (document.body?.innerText || '').replace(/\s+/g, ' ').slice(0, 180),
+    })));
+    if (state) {
+      steps[0].state = state;
+      log(`empty state: ${JSON.stringify(state)}`);
+    }
+    if (opts.traceChallenge) {
+      const trace = await readChallengeTrace(page, tryEvaluate, evaluated);
+      log(`challenge trace: ${JSON.stringify(trace)}`);
+    }
+    return steps;
+  }
 
   // One card at a time, returning home in between. The home feed reshuffles on
   // every visit, so ids picked up front are gone by the second card — which

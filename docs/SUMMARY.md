@@ -32,3 +32,4 @@
 * [Architecture overview](Architecture-overview.md)
 * [Adding a CDP method or Web API](Adding-a-CDP-method-or-Web-API.md)
 * [Testing and debugging](Testing-and-debugging.md)
+* [Wildberries and Ozon protection analysis](Stealth-protection-analysis.md)
