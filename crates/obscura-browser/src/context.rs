@@ -335,28 +335,41 @@ impl BrowserContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
 
     fn alternate_profile_id() -> String {
-        let index: serde_json::Value = serde_json::from_str(
-            &crate::profiles::catalog().unwrap().index_json().unwrap(),
+        const BASE_ID: &str = "11111111111111111111111111111111";
+        const GRAPHICS_ID: &str = "22222222222222222222222222222222";
+        const SCREEN_ID: &str = "33333333333333333333333333333333";
+        const WEBGL1_ID: &str = "44444444444444444444444444444444";
+        const WEBGL2_ID: &str = "55555555555555555555555555555555";
+        const WEBGPU_ID: &str = "66666666666666666666666666666666";
+
+        let profile = crate::profiles::resolve_profile().unwrap();
+        let id = format!("c{}w1:{BASE_ID}:{GRAPHICS_ID}:{SCREEN_ID}", profile.browser.major);
+        let mut hasher = Sha256::new();
+        hasher.update(b"graphics-render-v1");
+        hasher.update(id.as_bytes());
+        let mut render_seed = String::with_capacity(64);
+        for byte in hasher.finalize() {
+            write!(&mut render_seed, "{byte:02x}").unwrap();
+        }
+
+        let mut runtime: serde_json::Value = serde_json::from_str(profile.runtime_json()).unwrap();
+        runtime["id"] = serde_json::json!(id);
+        runtime["renderSeed"] = serde_json::json!(render_seed);
+        runtime["screen"]["id"] = serde_json::json!(SCREEN_ID);
+        runtime["graphics"]["id"] = serde_json::json!(GRAPHICS_ID);
+        runtime["graphics"]["webgl1Id"] = serde_json::json!(WEBGL1_ID);
+        runtime["graphics"]["webgl2Id"] = serde_json::json!(WEBGL2_ID);
+        runtime["graphics"]["webgpuId"] = serde_json::json!(WEBGPU_ID);
+        runtime["graphics"]["observationsByBrowserVersion"] = serde_json::to_value(
+            std::collections::BTreeMap::from([(profile.browser.version.clone(), 1u64)]),
         )
         .unwrap();
-        let default_id = index["defaultProfileId"].as_str().unwrap();
-        let parts: Vec<&str> = default_id.split(':').collect();
-        let graphics_id = index["graphicsProfiles"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find_map(|row| {
-                let supports_145 = row["observationsByBrowserVersion"]
-                    .as_object()
-                    .unwrap()
-                    .keys()
-                    .any(|version| version.starts_with("145."));
-                supports_145.then(|| row["id"].as_str()).flatten().filter(|id| *id != parts[2])
-            })
-            .unwrap();
-        format!("{}:{}:{}:{}", parts[0], parts[1], graphics_id, parts[3])
+        runtime["graphics"]["weight"] = serde_json::json!(1);
+        crate::profiles::register_runtime_profile(&runtime).unwrap()
     }
 
     #[tokio::test(flavor = "current_thread")]

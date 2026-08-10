@@ -26,8 +26,8 @@ sha2 = "0.10"
 getrandom = "0.2"
 flate2 = "1"
 
-# build.rs bakes data/chrome-windows-v1.json into a gzipped blob so the 1.4 MB
-# catalog is not parsed at startup.
+# build.rs bakes data/chrome-windows-v1.json into a gzipped blob so a full
+# locally generated catalog is not parsed at startup.
 [build-dependencies]
 serde_json = { workspace = true }
 flate2 = "1"

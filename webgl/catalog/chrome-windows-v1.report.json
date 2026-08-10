@@ -7,9 +7,9 @@
   },
   "assumptions": [
     "Chrome 145 remains the fixed default browser major",
-    "every valid Windows Chrome profile is selectable",
-    "a browser major without an exact wreq transport uses the nearest available transport and emits a runtime warning",
-    "the graphics API shape remains pinned to Chromium 145 and non-145 profiles emit a runtime warning"
+    "the tracked catalog contains only the fixed Chrome 145 composition",
+    "local generated catalogs and the runtime registry support additional profiles",
+    "the graphics API shape remains pinned to Chromium 145"
   ],
   "bannedFieldScan": {
     "fields": [
@@ -93,7 +93,7 @@
     "150.0.7871.24": 6,
     "150.0.7871.47": 13
   },
-  "catalogBytes": 1446621,
+  "catalogBytes": 33161,
   "catalogId": "chrome-windows-v1",
   "catalogLimitBytes": 2097152,
   "exactOverlap": {
@@ -159,13 +159,13 @@
   },
   "status": "valid",
   "unique": {
-    "baseProfiles": 367,
-    "graphicsProfiles": 427,
-    "screenProfiles": 226,
-    "webgl1Components": 10,
-    "webgl2Components": 19,
-    "webgpuAdapterComponents": 561,
-    "webgpuComponents": 360,
-    "webgpuLimitsComponents": 16
+    "baseProfiles": 1,
+    "graphicsProfiles": 1,
+    "screenProfiles": 1,
+    "webgl1Components": 1,
+    "webgl2Components": 1,
+    "webgpuAdapterComponents": 1,
+    "webgpuComponents": 1,
+    "webgpuLimitsComponents": 2
   }
 }

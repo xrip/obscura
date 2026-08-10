@@ -1301,9 +1301,9 @@ mod tests {
         let catalog = catalog().unwrap();
         assert_eq!(catalog.catalog_id, CATALOG_ID);
         assert!(CATALOG_GZIP.len() < 2 * 1024 * 1024);
-        assert_eq!(catalog.base_profile_count(), 367);
-        assert_eq!(catalog.screen_profile_count(), 226);
-        assert_eq!(catalog.graphics_profile_count(), 427);
+        assert_eq!(catalog.base_profile_count(), 1);
+        assert_eq!(catalog.screen_profile_count(), 1);
+        assert_eq!(catalog.graphics_profile_count(), 1);
         let index: Value = serde_json::from_str(&catalog.index_json().unwrap()).unwrap();
         assert_eq!(index["defaultBrowserMajor"], 145);
         assert_eq!(index["graphicsApiBrowserMajor"], 145);
@@ -1312,7 +1312,7 @@ mod tests {
             .iter()
             .map(|row| browser_major(&row.browser_version).unwrap())
             .collect();
-        assert_eq!(majors, [143, 144, 145, 147, 148, 150].into_iter().collect());
+        assert_eq!(majors, [145].into_iter().collect());
     }
 
     #[test]
@@ -1367,9 +1367,9 @@ mod tests {
     fn catalog_index_lists_selectable_rows() {
         let index: Value = serde_json::from_str(&catalog().unwrap().index_json().unwrap()).unwrap();
         assert_eq!(index["catalogId"], CATALOG_ID);
-        assert_eq!(index["baseProfiles"].as_array().unwrap().len(), 367);
-        assert_eq!(index["graphicsProfiles"].as_array().unwrap().len(), 427);
-        assert_eq!(index["screenProfiles"].as_array().unwrap().len(), 226);
+        assert_eq!(index["baseProfiles"].as_array().unwrap().len(), 1);
+        assert_eq!(index["graphicsProfiles"].as_array().unwrap().len(), 1);
+        assert_eq!(index["screenProfiles"].as_array().unwrap().len(), 1);
         assert!(index["defaultProfileId"].as_str().unwrap().starts_with("c145w1:"));
         assert!(index.get("components").is_none());
     }
@@ -1389,25 +1389,13 @@ mod tests {
     }
 
     #[test]
-    fn every_captured_browser_major_is_selectable() {
+    fn built_in_catalog_contains_only_the_default_composition() {
         let catalog = catalog().unwrap();
-        let screen_id = catalog.default_composition.screen_id.as_str();
-        for major in [143, 144, 145, 147, 148, 150] {
-            let base = catalog
-                .base_profiles
-                .iter()
-                .find(|row| browser_major(&row.browser_version).unwrap() == major)
-                .unwrap();
-            let graphics = catalog
-                .graphics_profiles
-                .iter()
-                .find(|row| graphics_major_weight(row, major) > 0)
-                .unwrap();
-            let id = composed_id(major, &base.id, &graphics.id, screen_id);
-            let selected = resolve_profile_id(&id).unwrap();
-            assert_eq!(selected.browser.major, major);
-            assert_eq!(selected.id, id);
-        }
+        let ids = &catalog.default_composition;
+        assert_eq!(catalog.base_profiles[0].id, ids.base_id);
+        assert_eq!(catalog.graphics_profiles[0].id, ids.graphics_id);
+        assert_eq!(catalog.screen_profiles[0].id, ids.screen_id);
+        assert_eq!(browser_major(&catalog.base_profiles[0].browser_version).unwrap(), 145);
     }
 
     #[test]
@@ -1421,11 +1409,11 @@ mod tests {
     }
 
     #[test]
-    fn rotation_draws_each_table_independently() {
+    fn rotation_keeps_the_single_built_in_profile() {
         let catalog = catalog().unwrap();
         let low = resolve_with_options(catalog, None, true, Some([0; 24])).unwrap().0;
         let high = resolve_with_options(catalog, None, true, Some([255; 24])).unwrap().0;
-        assert_ne!(low.id, high.id);
+        assert_eq!(low.id, high.id);
     }
 
     #[test]

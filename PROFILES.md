@@ -3,7 +3,7 @@
 Obscura has one profile system for browser, screen, WebGL, and WebGPU data.
 The current catalog target is:
 
-- Captured Chrome browser identities from every valid source profile.
+- One built-in Chrome 145 browser identity selected from local observations.
 - Windows.
 - ANGLE with D3D11.
 - A Chrome 145 JavaScript graphics API shape, revision `145.0.7632.75`.
@@ -18,9 +18,9 @@ Obscura uses the nearest available Chrome transport and gives a warning. A
 profile with a browser major other than 145 also gives a warning because some
 JavaScript API shapes still follow Chrome 145. The profile remains usable.
 
-The current catalog has selectable Chrome 143, 144, 145, 147, 148, and 150
-rows. Chrome 143 through 148 have exact pinned `wreq` transports. Chrome 150
-uses the nearest available transport, Chrome 148, when stealth mode is on.
+The tracked catalog has only one Chrome 145 composition. Other captured
+versions stay in ignored workbench storage and can be loaded at runtime by
+exact ID. Chrome 145 has an exact pinned `wreq` transport.
 
 ## What a profile contains
 
@@ -84,7 +84,7 @@ Obscura uses `OBSCURA_PROFILE` and `OBSCURA_ROTATE_PROFILE`.
 | No setting | Fixed catalog default |
 | `OBSCURA_PROFILE=0` | Fixed catalog default |
 | `OBSCURA_PROFILE=<positive decimal>` | Stable weighted selection for catalog version 1 |
-| `OBSCURA_PROFILE=c<major>w1:...` | Exact compatible base, graphics, and screen IDs |
+| `OBSCURA_PROFILE=c<major>w1:...` | Exact built-in or loaded runtime profile ID |
 | `OBSCURA_ROTATE_PROFILE=1` | New weighted random selection for each new context |
 
 ### Fixed default
@@ -112,7 +112,8 @@ OBSCURA_PROFILE=42
 
 Seed `42` gives the same profile after each restart while catalog version 1 and
 its rows stay the same. Two different seeds may still select the same row.
-Rows with more observation weight have a greater chance of selection.
+Rows with more observation weight have a greater chance of selection. The
+tracked catalog has one row, but a locally generated catalog may have many.
 
 Use a decimal seed when you need repeatable profile variety but do not need to
 store a long composed ID.
@@ -125,15 +126,19 @@ An exact ID pins all three parts:
 OBSCURA_PROFILE=c<chrome-major>w1:<base-id>:<graphics-id>:<screen-id>
 ```
 
-All three IDs must exist in the embedded catalog. The prefix and graphics row
-must match the base Chrome major. Use this form for a test case, a saved
-scraping job, or a known graphics setup.
+All three IDs must exist in the embedded catalog or in the runtime profile
+registry. The prefix and graphics row must match the base Chrome major. Use
+this form for a test case, a saved scraping job, or a workbench capture.
 
 ### Weighted rotation
 
 `OBSCURA_ROTATE_PROFILE` accepts `1`, `true`, `yes`, or `on`, without regard
 to letter case. Obscura uses OS random bytes and picks the three parts by their
 weights. The result is then fixed for that context.
+
+The tracked catalog has one Chrome 145 composition, so its rotation currently
+selects that same profile. A locally generated multi-profile catalog keeps full
+weighted rotation. Local workbench profiles are selected by exact ID.
 
 `OBSCURA_ROTATE_PROFILE` is used only when `OBSCURA_PROFILE` is absent. If
 `OBSCURA_PROFILE` exists, even as an empty value, it has priority. Remove it
@@ -851,13 +856,17 @@ browser context is created.
 The sidecar is local to the workbench source directory and is ignored by Git.
 It does not change the fixed catalog default or weighted rotation.
 
-### Promote the capture into the embedded catalog
+### Promote the capture into a local embedded catalog
 
 To make the profile available to a binary that is not started with the
 workbench directory, stop `serve`, run the normal generator command from the
 next section, and rebuild Obscura. Start the new binary with the workbench flag
 again. Then refresh the workbench. The `[new capture]` mark must be gone and
 the same three IDs must now be normal embedded catalog options.
+
+The generated multi-profile catalog is for local use. Keep the full source pack
+in the ignored `webgl/profiles/` directory and do not commit either that pack or
+the generated full catalog. Git keeps only the base Chrome 145 catalog.
 
 Build Obscura and check the exact ID printed by the capture page:
 
@@ -916,10 +925,10 @@ webgl/profiles/
 These local files are ignored by Git. They are not needed to run Obscura.
 They are needed only to make a new catalog. Do not add them to Git.
 
-The build puts a small fixed-default fragment and a compressed full catalog in
-the binary. The fixed default does not require the full catalog to be parsed.
-A seed, exact ID, or rotation loads and checks the full embedded catalog once
-per process.
+The build puts a small fixed-default fragment and a compressed catalog in the
+binary. The fixed default does not require the full catalog to be parsed. A
+seed, exact ID, or rotation loads and checks the embedded catalog once per
+process. Local capture files and runtime sidecars are never embedded directly.
 
 ## Generate a new catalog
 
@@ -980,8 +989,9 @@ stealth build and tests.
 
 ### Rotation always gives the same profile
 
-Check whether `OBSCURA_PROFILE` exists. It has priority over rotation. Remove
-it, then make a new context or restart the process.
+This is expected with the tracked one-profile catalog. With a locally generated
+multi-profile catalog, check whether `OBSCURA_PROFILE` exists. It has priority
+over rotation. Remove it, then make a new context or restart the process.
 
 ### A seed does not change an open page
 

@@ -34,6 +34,8 @@ mod tests {
     use super::*;
     use crate::dispatch::dispatch;
     use crate::types::CdpRequest;
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
 
     fn profile_ids() -> (String, String) {
         let index: Value = serde_json::from_str(
@@ -44,21 +46,33 @@ mod tests {
         )
         .unwrap();
         let default_id = index["defaultProfileId"].as_str().unwrap().to_string();
-        let parts: Vec<&str> = default_id.split(':').collect();
-        let graphics_id = index["graphicsProfiles"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find_map(|row| {
-                let supports_145 = row["observationsByBrowserVersion"]
-                    .as_object()
-                    .unwrap()
-                    .keys()
-                    .any(|version| version.starts_with("145."));
-                supports_145.then(|| row["id"].as_str()).flatten().filter(|id| *id != parts[2])
-            })
-            .unwrap();
-        let alternate = format!("{}:{}:{}:{}", parts[0], parts[1], graphics_id, parts[3]);
+        let profile = obscura_browser::profiles::resolve_profile_id(&default_id).unwrap();
+        let alternate = format!(
+            "c{}w1:11111111111111111111111111111111:22222222222222222222222222222222:33333333333333333333333333333333",
+            profile.browser.major
+        );
+        let mut hasher = Sha256::new();
+        hasher.update(b"graphics-render-v1");
+        hasher.update(alternate.as_bytes());
+        let mut render_seed = String::with_capacity(64);
+        for byte in hasher.finalize() {
+            write!(&mut render_seed, "{byte:02x}").unwrap();
+        }
+
+        let mut runtime: Value = serde_json::from_str(profile.runtime_json()).unwrap();
+        runtime["id"] = json!(alternate);
+        runtime["renderSeed"] = json!(render_seed);
+        runtime["screen"]["id"] = json!("33333333333333333333333333333333");
+        runtime["graphics"]["id"] = json!("22222222222222222222222222222222");
+        runtime["graphics"]["webgl1Id"] = json!("44444444444444444444444444444444");
+        runtime["graphics"]["webgl2Id"] = json!("55555555555555555555555555555555");
+        runtime["graphics"]["webgpuId"] = json!("66666666666666666666666666666666");
+        runtime["graphics"]["observationsByBrowserVersion"] = serde_json::to_value(
+            std::collections::BTreeMap::from([(profile.browser.version.clone(), 1u64)]),
+        )
+        .unwrap();
+        runtime["graphics"]["weight"] = json!(1);
+        let alternate = obscura_browser::profiles::register_runtime_profile(&runtime).unwrap();
         (default_id, alternate)
     }
 
