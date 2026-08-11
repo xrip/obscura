@@ -94,6 +94,10 @@ pub async fn handle(
             cookie_jar_for(ctx, session_id).clear();
             Ok(json!({}))
         }
+        // Playwright clears the browser cache while applying storageState.
+        // Obscura has no disk HTTP cache here, so the protocol-compatible
+        // result is a successful no-op.
+        "clearBrowserCache" => Ok(json!({})),
         "setCacheDisabled" => Ok(json!({})),
         "setRequestInterception" => Ok(json!({})),
         "setBlockedURLs" => {
@@ -243,6 +247,15 @@ mod tests {
             .await
             .expect("clearBrowserCookies must succeed");
         assert!(ctx.default_context.cookie_jar.get_all_cookies().is_empty());
+    }
+
+    #[tokio::test]
+    async fn clear_browser_cache_is_supported_for_playwright() {
+        let mut ctx = CdpContext::new();
+        let result = handle("clearBrowserCache", &json!({}), &mut ctx, &None)
+            .await
+            .expect("clearBrowserCache must succeed");
+        assert_eq!(result, json!({}));
     }
 
     #[tokio::test]
