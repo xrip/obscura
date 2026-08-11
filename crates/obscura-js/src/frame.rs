@@ -184,7 +184,9 @@ impl FrameRealm {
             parent,
             &format!(
                 "globalThis.innerWidth={width};globalThis.innerHeight={height};\
-                 if(globalThis.visualViewport){{\
+                 if(typeof globalThis.__obscura_set_visual_viewport_size==='function'){{\
+                   globalThis.__obscura_set_visual_viewport_size({width},{height});\
+                 }}else if(globalThis.visualViewport){{\
                    globalThis.visualViewport.width={width};\
                    globalThis.visualViewport.height={height};\
                  }}"
