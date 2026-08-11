@@ -1204,8 +1204,8 @@ impl Page {
     /// object, so a page that replaces an iframe repeatedly would otherwise
     /// accumulate contexts and DOM trees for the life of the document.
     ///
-    /// A frame nested inside a discarded frame is reached on a later pass,
-    /// once its own parent is gone.
+    /// A frame nested inside a discarded frame is released in the same pass
+    /// once its parent is no longer retained.
     fn release_detached_frames(&mut self) {
         if self.frames.is_empty() {
             return;
@@ -1215,7 +1215,7 @@ impl Page {
              .filter(frame => frame && frame.isConnected && frame._frameId)\
              .map(frame => frame._frameId >>> 0)";
 
-        let mut live: Vec<u32> = Vec::new();
+        let mut live = std::collections::HashSet::new();
         if let Some(js) = self.js.as_mut() {
             if let Ok(value) = js.evaluate(LIVE_FRAME_IDS) {
                 live.extend(serde_json::from_value::<Vec<u32>>(value).unwrap_or_default());
@@ -1229,11 +1229,24 @@ impl Page {
             }
         }
 
+        // A child can still look connected inside a parent realm that is
+        // already detached from the page. Keep only frames whose full parent
+        // chain is retained, so descendants leave in the same pass.
+        let mut retained = std::collections::HashSet::new();
+        for frame in &self.frames {
+            if live.contains(&frame.frame_id())
+                && (frame.parent_frame_id() == 0
+                    || retained.contains(&frame.parent_frame_id()))
+            {
+                retained.insert(frame.frame_id());
+            }
+        }
+
         let discarded: Vec<(u32, u32)> = self
             .frames
             .iter()
             .map(|frame| (frame.frame_id(), frame.parent_frame_id()))
-            .filter(|(id, _)| !live.contains(id))
+            .filter(|(id, _)| !retained.contains(id))
             .collect();
         if discarded.is_empty() {
             return;
@@ -1243,9 +1256,20 @@ impl Page {
         // nested child whose iframe registry lives in a parent that is also
         // being removed during this pass.
         for &(frame_id, parent_frame_id) in &discarded {
+            if let Some(index) = self
+                .frames
+                .iter()
+                .position(|frame| frame.frame_id() == frame_id)
+            {
+                if let Some(js) = self.js.as_mut() {
+                    if let Err(error) = self.frames[index].dispose_pending_tasks(js) {
+                        tracing::debug!("disposing frame {frame_id} tasks failed: {error}");
+                    }
+                }
+            }
             self.forget_frame_references(frame_id, parent_frame_id);
         }
-        self.frames.retain(|frame| live.contains(&frame.frame_id()));
+        self.frames.retain(|frame| retained.contains(&frame.frame_id()));
         tracing::debug!("discarded {} detached frame realm(s)", discarded.len());
     }
 
@@ -3175,6 +3199,13 @@ impl Page {
     }
 
     pub fn navigate_blank(&mut self) {
+        if let Some(js) = self.js.as_mut() {
+            for frame in &self.frames {
+                if let Err(error) = frame.dispose_pending_tasks(js) {
+                    tracing::debug!("disposing frame tasks during navigation failed: {error}");
+                }
+            }
+        }
         self.frames.clear();
         self.js = None;
         self.url = Some(Url::parse("about:blank").unwrap());

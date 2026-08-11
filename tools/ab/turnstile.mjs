@@ -2,7 +2,8 @@
 //
 //   node tools/ab/turnstile.mjs [url|local] [--only chrome|obscura]
 //                              [--wait seconds] [--proxy url] [--headed]
-//                              [--outbound] [--click] [--verbose <RUST_LOG>]
+//                              [--outbound] [--child-trace] [--click]
+//                              [--verbose <RUST_LOG>]
 //
 // "local" serves a fixture using Turnstile's dummy sitekey, which always issues
 // a token without interaction. That separates the two questions a live site
@@ -65,6 +66,7 @@ function parseArgs(argv) {
       opts.onStderr = chunk => process.stderr.write(chunk);
     }
     else if (arg === '--outbound') opts.outbound = true;
+    else if (arg === '--child-trace') opts.childTrace = true;
     else if (arg === '--only') opts.only = argv[++i];
     else if (arg === '--wait') opts.wait = Number(argv[++i]);
     else if (arg === '--proxy') opts.proxy = argv[++i];
@@ -95,6 +97,9 @@ function probe() {
   const roots = globalThis.__abShadowRoots || [];
   out.shadowRoots = roots.length;
   out.messages = (globalThis.__abMessages || []).slice(0, 60);
+  out.childDiagnostics = (globalThis.__abChildDiagnostics || []).slice(0, 10);
+  out.contentWindowDescriptor = globalThis.__abContentWindowDescriptor || 'unknown';
+  out.outboundInstalled = globalThis.__abOutboundInstalled === true;
   const frames = [...document.querySelectorAll('iframe')];
   for (const root of roots) {
     try { frames.push(...root.querySelectorAll('iframe')); } catch { /* gone */ }
@@ -138,6 +143,7 @@ async function scenario(page) {
     // message an engine fails to send or answer is the actual difference
     // between passing and not; the DOM afterwards only shows that it did not.
     globalThis.__abMessages = [];
+    globalThis.__abChildDiagnostics = [];
     globalThis.__abInputEvents = [];
     for (const type of ['pointerdown', 'mousedown', 'pointerup', 'mouseup', 'click']) {
       document.addEventListener(type, event => globalThis.__abInputEvents.push({
@@ -159,6 +165,11 @@ async function scenario(page) {
     };
     addEventListener('message', e => {
       globalThis.__abMessages.push(`in  ${label(e.data)}  src=${e.source ? 'yes' : 'NONE'}`);
+      if (e.data && e.data.source === 'ab-child-diag') {
+        if (globalThis.__abChildDiagnostics.length < 10) {
+          globalThis.__abChildDiagnostics.push(e.data);
+        }
+      }
     });
 
     // Outbound needs the iframe's window intercepted. A cross-origin
@@ -167,14 +178,22 @@ async function scenario(page) {
     // Off by default, and deliberately: wrapping contentWindow in a Proxy stops
     // real Chrome from ever issuing a token, so a run with this on cannot be
     // read as a pass or a fail — only as a record of the sequence.
-    const descriptor = captureOutbound && Object.getOwnPropertyDescriptor(
-      HTMLIFrameElement.prototype, 'contentWindow');
-    if (descriptor && descriptor.get) {
-      Object.defineProperty(HTMLIFrameElement.prototype, 'contentWindow', {
+    let descriptor;
+    let descriptorOwner;
+    for (let proto = HTMLIFrameElement.prototype; proto && !descriptor; proto = Object.getPrototypeOf(proto)) {
+      descriptor = Object.getOwnPropertyDescriptor(proto, 'contentWindow');
+      if (descriptor) descriptorOwner = proto;
+    }
+    globalThis.__abContentWindowDescriptor = descriptor
+      ? `${typeof descriptor.get}/${typeof descriptor.set}` : 'absent';
+    if (captureOutbound && descriptor && descriptor.get) {
+      globalThis.__abOutboundInstalled = true;
+      Object.defineProperty(descriptorOwner, 'contentWindow', {
         configurable: true,
         get() {
           const win = descriptor.get.call(this);
           if (!win) return win;
+          if (this.localName !== 'iframe') return win;
           return new Proxy(win, {
             get(target, prop) {
               if (prop === 'postMessage') {
@@ -191,6 +210,140 @@ async function scenario(page) {
       });
     }
   }, opts.outbound || false);
+
+  if (opts.childTrace) {
+    await page.addInitScript(() => {
+      if (globalThis.parent === globalThis) return;
+      const report = data => {
+        try { globalThis.parent.postMessage({ source: 'ab-child-diag', ...data }, '*'); } catch (_) {}
+      };
+      if (typeof globalThis.Worker === 'function') {
+        const WorkerClass = globalThis.Worker;
+        globalThis.Worker = new Proxy(WorkerClass, {
+          construct(target, args, newTarget) {
+            const worker = Reflect.construct(target, args, newTarget);
+            report({ event: 'worker-construct', url: String(args[0] || '').slice(0, 180) });
+            const post = worker.postMessage;
+            worker.postMessage = function (...postArgs) {
+              report({ event: 'worker-post', kind: typeof postArgs[0] });
+              return post.apply(this, postArgs);
+            };
+            return worker;
+          },
+        });
+      }
+      addEventListener('error', event => report({
+        event: 'error', message: String(event.message || '').slice(0, 300),
+      }));
+      addEventListener('unhandledrejection', event => report({
+        event: 'unhandledrejection', reason: String(event.reason || '').slice(0, 300),
+      }));
+      for (const name of ['error', 'warn']) {
+        const original = console[name];
+        console[name] = function (...args) {
+          report({ event: `console-${name}`, text: args.map(value => String(value)).join(' ').slice(0, 400) });
+          return original.apply(this, args);
+        };
+      }
+      const originalAttachShadow = Element.prototype.attachShadow;
+      Element.prototype.attachShadow = function (init) {
+        const isBody = this?.tagName === 'BODY';
+        const beforeOpen = isBody && (() => {
+          try { return !!this.shadowRoot; } catch { return 'error'; }
+        })();
+        const stack = isBody ? (() => {
+          try { return String(new Error().stack || '').slice(0, 900); } catch { return ''; }
+        })() : '';
+        try {
+          const root = originalAttachShadow.call(this, init);
+          if (isBody) {
+            report({
+              event: 'attachShadow-body', mode: init?.mode,
+              beforeOpen, afterOpen: (() => {
+                try { return !!this.shadowRoot; } catch { return 'error'; }
+              })(), children: root?.childNodes?.length ?? null, stack,
+            });
+          }
+          return root;
+        }
+        catch (error) {
+          report({
+            event: 'attachShadow-error',
+            tag: this?.tagName, id: this?.id, className: this?.className,
+            beforeOpen, stack, reason: String(error).slice(0, 300),
+          });
+          throw error;
+        }
+      };
+      const typeOf = name => {
+        try { return typeof globalThis[name]; } catch { return 'error'; }
+      };
+      const has = name => {
+        try { return name in globalThis; } catch { return false; }
+      };
+      const diag = {
+        source: 'ab-child-diag', event: 'diag',
+        obscuraFrameId: globalThis.__obscura_frameId ?? null,
+        parentIsSelf: globalThis.parent === globalThis,
+        topIsSelf: globalThis.top === globalThis,
+        selfIsWindow: globalThis.self === globalThis,
+        origin: (() => { try { return location.origin; } catch { return 'error'; } })(),
+        readyState: (() => { try { return document.readyState; } catch { return 'error'; } })(),
+        bodyShadow: (() => { try { return !!document.body?.shadowRoot; } catch { return 'error'; } })(),
+        bodyShadowInfo: (() => {
+          try { return Deno.core.ops.op_shadow_root_info(document.body._nid); }
+          catch (error) { return String(error).slice(0, 180); }
+        })(),
+        bodyChildren: (() => { try { return document.body?.childNodes?.length ?? null; } catch { return 'error'; } })(),
+        bodyHtml: (() => { try { return String(document.body?.innerHTML || '').slice(0, 240); } catch { return 'error'; } })(),
+        capturedShadowHosts: (() => {
+          try { return (globalThis.__abShadowRoots || []).map(root => root.host?.tagName || '?'); }
+          catch { return 'error'; }
+        })(),
+        hasCrypto: has('crypto'), cryptoSubtle: (() => { try { return typeof crypto.subtle; } catch { return 'error'; } })(),
+        hasTextEncoder: has('TextEncoder'), hasURL: has('URL'), hasURLSearchParams: has('URLSearchParams'),
+        hasPerformance: has('performance'), hasVisualViewport: has('visualViewport'),
+        hasFonts: (() => { try { return !!document.fonts; } catch { return false; } })(),
+        hasOffscreenCanvas: has('OffscreenCanvas'), hasWebGL: typeOf('WebGLRenderingContext'),
+        hasWebGPU: (() => { try { return typeof navigator.gpu; } catch { return 'error'; } })(),
+        isSecureContext: (() => { try { return [typeof isSecureContext, isSecureContext]; } catch { return 'error'; } })(),
+        crossOriginIsolated: (() => { try { return [typeof crossOriginIsolated, crossOriginIsolated]; } catch { return 'error'; } })(),
+        visibility: (() => { try { return [document.visibilityState, document.hidden]; } catch { return 'error'; } })(),
+        webdriver: (() => { try { return [typeof navigator.webdriver, navigator.webdriver]; } catch { return 'error'; } })(),
+        uaData: (() => { try { return [Object.prototype.toString.call(navigator.userAgentData), navigator.userAgentData.brands?.map(b => `${b.brand}:${b.version}`)]; } catch { return 'error'; } })(),
+        permissions: typeOf('Permissions'), permissionQuery: (() => { try { return typeof navigator.permissions?.query; } catch { return 'error'; } })(),
+        workers: [typeOf('Worker'), typeOf('Blob'), typeOf('URL'), typeOf('WebAssembly')],
+        observers: [typeOf('MutationObserver'), typeOf('ResizeObserver'), typeOf('IntersectionObserver')],
+        userAgent: (() => { try { return navigator.userAgent; } catch { return 'error'; } })(),
+        platform: (() => { try { return navigator.platform; } catch { return 'error'; } })(),
+        languages: (() => { try { return [...navigator.languages]; } catch { return []; } })(),
+      };
+      report(diag);
+      if (typeof navigator.gpu === 'object' && navigator.gpu) {
+        Promise.resolve().then(() => navigator.gpu.requestAdapter())
+          .then(adapter => report({
+            event: 'gpu', adapter: !!adapter,
+            features: adapter ? [...adapter.features].slice(0, 8) : [],
+            limits: adapter ? typeof adapter.limits.maxTextureDimension2D : 'none',
+          }))
+          .catch(error => report({ event: 'gpu-error', reason: String(error).slice(0, 300) }));
+      }
+      try {
+        const source = `self.postMessage({kind:'boot',document:typeof document,navigator:typeof navigator,crypto:typeof crypto,wasm:typeof WebAssembly});self.onmessage=e=>self.postMessage({kind:'echo',data:e.data});`;
+        const workerUrl = URL.createObjectURL(new Blob([source], { type: 'application/javascript' }));
+        const worker = new Worker(workerUrl);
+        URL.revokeObjectURL(workerUrl);
+        worker.onmessage = event => {
+          report({ event: 'worker', data: event.data });
+          if (event.data?.kind === 'boot') worker.postMessage('ping');
+          else worker.terminate();
+        };
+        worker.onerror = event => report({ event: 'worker-error', reason: String(event.message || event).slice(0, 300) });
+      } catch (error) {
+        report({ event: 'worker-create-error', reason: String(error).slice(0, 300) });
+      }
+    });
+  }
 
   const errors = [];
   const challengeRequests = [];
@@ -264,6 +417,10 @@ for (const engine of opts.only ? [opts.only] : ['chrome', 'obscura']) {
     console.log(`   token input       : ${r.tokenInput}`);
     console.log(`   TOKEN             : ${r.token
       ? `${r.token.slice(0, 24)}... (after ${out.tokenAfter}s)  PASS` : 'empty  FAIL'}`);
+    console.log(`   contentWindow API : ${r.contentWindowDescriptor} outbound=${r.outboundInstalled}`);
+    if (r.childDiagnostics?.length) {
+      console.log(`   child diagnostics  : ${JSON.stringify(r.childDiagnostics)}`);
+    }
     console.log(`   shadow roots      : ${r.shadowRoots}`);
     console.log(`   iframes           : ${(r.iframes || []).length}`);
     for (const f of r.iframes || []) {

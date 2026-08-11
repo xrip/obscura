@@ -153,6 +153,9 @@ pub struct ObscuraJsRuntime {
     /// their shims can call ops; nothing else can reach it, including page
     /// script.
     ops_handoff: Option<deno_core::v8::Global<deno_core::v8::Value>>,
+    /// Fork graphics identity, retained by the host so a child realm can
+    /// consume the same profile before its own page init.
+    pub(crate) fingerprint_profile_json: Option<String>,
 }
 
 /// Renders a caught V8 exception as a message for realm evaluation errors.
@@ -373,6 +376,7 @@ impl ObscuraJsRuntime {
             loaded_module_specifiers,
             evaluated_module_specifiers: HashMap::new(),
             ops_handoff: None,
+            fingerprint_profile_json: None,
         };
         // Take the op table before any page script can run, and drop the global
         // that exposed it in the same step.
@@ -3214,6 +3218,62 @@ mod tests {
                 "constructible": vec![true; 6],
                 "utilities": vec![true; 6],
             })
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_keeps_one_scope_between_messages() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "worker-test",
+            r#"
+                globalThis.__workerEvents = [];
+                const source = "self.postMessage('boot'); self.onmessage = e => self.postMessage(e.data);";
+                const workerUrl = URL.createObjectURL(new Blob([source], {type: 'application/javascript'}));
+                const worker = new Worker(workerUrl);
+                URL.revokeObjectURL(workerUrl);
+                worker.onmessage = event => {
+                    __workerEvents.push(event.data);
+                    if (event.data === 'boot') worker.postMessage('ping');
+                    else worker.terminate();
+                };
+            "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__workerEvents").unwrap(),
+            serde_json::json!(["boot", "ping"]),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn terminating_a_worker_clears_its_timers() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "worker-timer-cleanup",
+            r#"
+                globalThis.__workerEvents = [];
+                const source = "self.setInterval(() => self.postMessage('tick'), 0);";
+                const workerUrl = URL.createObjectURL(new Blob([source], {type: 'application/javascript'}));
+                const worker = new Worker(workerUrl);
+                URL.revokeObjectURL(workerUrl);
+                globalThis.__workerForTest = worker;
+                worker.onmessage = event => {
+                    __workerEvents.push(event.data);
+                    worker.terminate();
+                };
+            "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__workerEvents").unwrap(),
+            serde_json::json!(["tick"]),
+        );
+        assert_eq!(
+            rt.evaluate("__workerForTest._timers.size").unwrap().as_f64(),
+            Some(0.0),
         );
     }
 

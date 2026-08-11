@@ -65,6 +65,7 @@ impl FrameRealm {
             return None;
         }
         parent.copy_identity_to_realm(&context);
+        parent.copy_fingerprint_profile_to_realm(&context);
 
         // Only a same-origin frame is reachable from the page. Cross-origin
         // keeps its own security token, so V8 answers `undefined` for any
@@ -106,7 +107,8 @@ impl FrameRealm {
                 &format!(
                     "globalThis.__obscura_frameId = {frame_id};\
                      globalThis.__obscura_parentFrameId = {parent_frame_id};\
-                     globalThis.__obscura_init();"
+                     globalThis.__obscura_init();\
+                     globalThis.__documentReadyState__ = 'loading';"
                 ),
             )
             .ok()?;
@@ -138,6 +140,14 @@ impl FrameRealm {
              if (typeof window.onload === 'function') { try { window.onload(); } catch (_) {} }\
              try { window.dispatchEvent(new Event('load', \
                  { bubbles: false, cancelable: false })); } catch (_) {}",
+        )
+    }
+
+    /// Cancels host work owned by this realm before its context is released.
+    pub fn dispose_pending_tasks(&self, parent: &mut ObscuraJsRuntime) -> Result<(), String> {
+        self.execute_script(
+            parent,
+            "globalThis.__obscura_dispose_realm_tasks?.();",
         )
     }
 
@@ -442,6 +452,95 @@ mod tests {
     }
 
     #[test]
+    fn a_new_frame_starts_loading_until_load_events() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let frame = FrameRealm::new(
+            &mut parent,
+            1,
+            0,
+            "https://child.example/frame",
+            "<html><body></body></html>",
+        )
+        .expect("frame realm");
+
+        assert_eq!(
+            frame.evaluate(&mut parent, "document.readyState").unwrap(),
+            serde_json::json!("loading"),
+        );
+
+        frame.dispatch_load_events(&mut parent).unwrap();
+        assert_eq!(
+            frame.evaluate(&mut parent, "document.readyState").unwrap(),
+            serde_json::json!("complete"),
+        );
+    }
+
+    #[test]
+    fn a_frame_inherits_the_selected_graphics_profile() {
+        let mut parent = ObscuraJsRuntime::new();
+        parent.set_fingerprint_profile(
+            r#"{"renderSeed":"deadbeef","graphics":{"webgpu":{"adapters":{"default":{"features":[],"limits":{},"info":{}}}}}}"#,
+        );
+        parent.set_dom(parse_html("<html><body></body></html>"));
+        parent.set_url("https://parent.example/");
+        parent.run_page_init();
+
+        let frame = FrameRealm::new(
+            &mut parent,
+            1,
+            0,
+            "https://child.example/frame",
+            "<html><body></body></html>",
+        )
+        .expect("frame realm");
+
+        assert_eq!(
+            parent.evaluate("typeof navigator.gpu").unwrap(),
+            serde_json::json!("object"),
+        );
+        assert_eq!(
+            frame.evaluate(&mut parent, "typeof navigator.gpu").unwrap(),
+            serde_json::json!("object"),
+        );
+        assert_eq!(
+            frame
+                .evaluate(&mut parent, "[typeof crossOriginIsolated, crossOriginIsolated]")
+                .unwrap(),
+            serde_json::json!(["boolean", false]),
+        );
+    }
+
+    #[test]
+    fn frame_shadow_roots_use_the_frame_dom_not_the_parent_dom() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let frame = FrameRealm::new(
+            &mut parent,
+            1,
+            0,
+            "https://child.example/frame",
+            "<html><body></body></html>",
+        )
+        .expect("frame realm");
+
+        frame
+            .execute_script(
+                &mut parent,
+                "document.body.attachShadow({ mode: 'open' });",
+            )
+            .unwrap();
+
+        assert_eq!(
+            frame.evaluate(&mut parent, "document.body.shadowRoot !== null")
+                .unwrap(),
+            serde_json::json!(true),
+        );
+        assert_eq!(
+            parent.evaluate("document.body.shadowRoot === null").unwrap(),
+            serde_json::json!(true),
+        );
+    }
+
+    #[test]
     fn frame_uses_its_embedding_viewport() {
         let mut parent = page(
             "https://parent.example/page",
@@ -697,6 +796,33 @@ mod tests {
             serde_json::json!(1),
             "the frame's timer callback never ran"
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn disposing_a_frame_stops_its_interval() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let frame = FrameRealm::new(
+            &mut parent,
+            1,
+            0,
+            "https://child.example/frame",
+            "<html><body></body></html>",
+        )
+        .expect("frame realm");
+
+        frame
+            .execute_script(
+                &mut parent,
+                "globalThis.__ticks=0;setInterval(()=>__ticks++,1);",
+            )
+            .unwrap();
+        parent.run_event_loop_bounded(20).await.unwrap();
+        let before = frame.evaluate(&mut parent, "__ticks").unwrap();
+
+        frame.dispose_pending_tasks(&mut parent).unwrap();
+        parent.run_event_loop_bounded(30).await.unwrap();
+
+        assert_eq!(frame.evaluate(&mut parent, "__ticks").unwrap(), before);
     }
 
     /// Frame timers run on a separate queue from the page's, so cancelling one

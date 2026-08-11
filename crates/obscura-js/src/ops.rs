@@ -1033,13 +1033,18 @@ fn op_script_try_start(state: &OpState, nid: u32) -> bool {
 /// tree. Layout intentionally remains unaware of the detached root until
 /// scoped style, slot assignment, and composed-tree paint are implemented.
 #[op2(fast)]
-fn op_shadow_attach(state: &OpState, host_nid: u32, #[string] mode: String) -> i32 {
+fn op_shadow_attach(
+    scope: &mut v8::HandleScope,
+    state: &OpState,
+    host_nid: u32,
+    #[string] mode: String,
+) -> i32 {
     let mode = match mode.as_str() {
         "open" => ShadowRootMode::Open,
         "closed" => ShadowRootMode::Closed,
         _ => return -1,
     };
-    let shared = state.borrow::<SharedState>().clone();
+    let shared = realm_state(scope, state);
     let state = shared.borrow();
     let Some(dom) = state.dom.as_ref() else {
         return -1;
@@ -1056,8 +1061,8 @@ fn op_shadow_attach(state: &OpState, host_nid: u32, #[string] mode: String) -> i
 /// visibility in bootstrap.js.
 #[op2]
 #[string]
-fn op_shadow_root_info(state: &OpState, host_nid: u32) -> String {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_shadow_root_info(scope: &mut v8::HandleScope, state: &OpState, host_nid: u32) -> String {
+    let shared = realm_state(scope, state);
     let state = shared.borrow();
     let Some(dom) = state.dom.as_ref() else {
         return String::new();

@@ -387,6 +387,12 @@ try {
 Object.defineProperty(globalThis, 'isSecureContext', {
   value: _forkSecureContext, writable: false, enumerable: true, configurable: true,
 });
+// Ordinary pages are not cross-origin isolated unless the response opts into
+// COOP/COEP. Obscura does not implement those response policies yet, so expose
+// the browser's honest default instead of leaving a direct read undefined.
+Object.defineProperty(globalThis, 'crossOriginIsolated', {
+  value: false, writable: false, enumerable: true, configurable: true,
+});
 
 // Chrome exposes the multi-screen fields only in secure contexts. Their
 // functions are created with the Screen interface in the startup snapshot;
