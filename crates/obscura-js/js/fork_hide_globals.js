@@ -39,4 +39,55 @@
       });
     } catch (_) { /* a frozen global is not worth failing init over */ }
   }
+
+  // The sweep above, __obscura_hide_list and _preHideInternals share one blind
+  // spot: all three can only hide a name that already exists. These globals are
+  // created later -- by a host evaluate (set_screen_size_override, the
+  // geolocation override, evaluate-with-await, the injected stylesheet) or by a
+  // DOM method call (click, focus) -- so the assignment creates a fresh
+  // enumerable:true property that no pass ever looked at. Measured reaching a
+  // page script this way: __obscura_screen_w, __obscura_screen_h,
+  // __obscura_geo_lat.
+  //
+  // Both steps below are needed, for two different enumeration paths:
+  //
+  // 1. Declaring the name keeps it out of `for (k in window)`, which reads the
+  //    enumerable flag directly and cannot be intercepted. Assigning to an
+  //    existing writable+configurable property only updates the value, so the
+  //    descriptor survives however late the assignment lands.
+  // 2. The hide list keeps it out of Object.keys, getOwnPropertyNames,
+  //    Reflect.ownKeys and getOwnPropertyDescriptors, which
+  //    _hideInternalsFromReflection wraps and filters by list membership, not by
+  //    the enumerable flag. Step 1 alone would make this surface worse: it turns
+  //    names that only appeared once a feature was used into names present on
+  //    every page.
+  //
+  // Only absent names are declared, so this never wipes a value the host has
+  // already set (__obscura_viewport_w is live by the time we get here).
+  const lateAssigned = [
+    '__obscura_screen_w', '__obscura_screen_h', '__obscura_screen_emulated',
+    '__obscura_viewport_w', '__obscura_viewport_h',
+    '__obscura_click_target', '__obscura_mouse_down', '__obscura_focused',
+    '__obscura_geo_lat', '__obscura_geo_lon',
+    '__obscura_await_meta', '__obscura_await_rejected',
+    '__obscura_css', '__obscura_clone_hooks', '__obscura_fingerprint_profile',
+  ];
+  const hideList = Array.isArray(globalThis.__obscura_hide_list)
+    ? globalThis.__obscura_hide_list
+    : null;
+  for (const name of lateAssigned) {
+    if (!Object.getOwnPropertyDescriptor(globalThis, name)) {
+      try {
+        Object.defineProperty(globalThis, name, {
+          value: undefined,
+          writable: true,
+          enumerable: false,
+          configurable: true,
+        });
+      } catch (_) { /* as above */ }
+    }
+    // Runs on every navigation against one snapshot-lived array, so this has to
+    // stay idempotent or the list grows without bound.
+    if (hideList && !hideList.includes(name)) hideList.push(name);
+  }
 })();
