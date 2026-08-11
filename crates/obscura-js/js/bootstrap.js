@@ -881,7 +881,7 @@ globalThis.setTimeout = (fn, delay = 0, ...args) => {
   return id;
 };
 
-globalThis.clearTimeout = (id) => {
+const _clearTimerId = (id) => {
   const state = _timerStates.get(id);
   if (state) state.cancelled = true;
   _timerStates.delete(id);
@@ -892,6 +892,7 @@ globalThis.clearTimeout = (id) => {
     _nativeTimerIds.delete(id);
   }
 };
+globalThis.clearTimeout = _clearTimerId;
 
 globalThis.setInterval = (fn, delay = 0, ...args) => {
   const f = _coerceTimerFn(fn);
@@ -912,7 +913,7 @@ globalThis.setInterval = (fn, delay = 0, ...args) => {
 
 globalThis.clearInterval = (id) => {
   _intervals.delete(id);
-  globalThis.clearTimeout(id);
+  _clearTimerId(id);
 };
 
 // Animation callbacks are a rendering-phase batch, not zero-delay
@@ -1013,6 +1014,34 @@ globalThis.cancelAnimationFrame = (id) => {
   _rafPending.delete(id);
   if (_rafCurrentBatch) _rafCurrentBatch.delete(id);
 };
+
+// A discarded frame has no Page object left to call clearTimeout or
+// clearInterval. Cancel its host work before its V8 context is released, or a
+// frame-local interval can keep scheduling forever and retain the context.
+Object.defineProperty(globalThis, '__obscura_dispose_realm_tasks', {
+  value: function() {
+    for (const id of [..._intervals]) {
+      _intervals.delete(id);
+      _clearTimerId(id);
+    }
+    for (const id of [..._timerStates.keys()]) _clearTimerId(id);
+    for (const state of _frameTimerStates.values()) state.cancelled = true;
+    _frameTimerStates.clear();
+    __obscuraPendingTimeoutDeadlines.clear();
+    _rafPending.clear();
+    if (_rafCurrentBatch) _rafCurrentBatch.clear();
+    _rafFrameScheduled = false;
+    _renderOpportunityScheduled = false;
+    for (const queue of _browserPostedTaskQueues) queue.length = 0;
+    _browserPostedTaskWakePending = false;
+    _resizeRenderCheckpointPending = false;
+    _intersectionRenderCheckpointPending = false;
+    _intersectionDeliveryTaskPending = false;
+  },
+  writable: false,
+  enumerable: false,
+  configurable: false,
+});
 globalThis.queueMicrotask = globalThis.queueMicrotask || ((fn) => Promise.resolve().then(fn));
 
 // Browser posted tasks need an event-loop boundary but no clock delay. Tokio's
@@ -12696,6 +12725,8 @@ globalThis.Worker = class Worker {
     this.onmessage = null;
     this.onerror = null;
     this._terminated = false;
+    this._scope = null;
+    this._timers = new Map();
     this._listeners = {};
     const worker = this;
 
@@ -12715,14 +12746,37 @@ globalThis.Worker = class Worker {
       (async () => {
         try {
           const resp = await fetch(resolvedUrl);
-          worker._code = await resp.text();
-          if (!worker._terminated) worker._autoRun();
+          const code = await resp.text();
+          if (worker._terminated) return;
+          worker._code = code;
+          worker._autoRun();
         } catch(e) { if (worker.onerror) worker.onerror(e); }
       })();
     }
   }
   _makeScope() {
     const worker = this;
+    const trackTimer = (schedule, cancel, oneShot, fn, delay, args) => {
+      let id;
+      const callback = (...callbackArgs) => {
+        if (oneShot) worker._timers.delete(id);
+        if (worker._terminated) return;
+        fn(...callbackArgs);
+      };
+      id = schedule(callback, delay, ...args);
+      worker._timers.set(id, { cancel });
+      return id;
+    };
+    const clearTimer = id => {
+      const timer = worker._timers.get(id);
+      if (!timer) return;
+      worker._timers.delete(id);
+      timer.cancel(id);
+    };
+    const setTimeout = (fn, delay = 0, ...args) =>
+      trackTimer(globalThis.setTimeout, globalThis.clearTimeout, true, fn, delay, args);
+    const setInterval = (fn, delay = 0, ...args) =>
+      trackTimer(globalThis.setInterval, globalThis.clearInterval, false, fn, delay, args);
     // WorkerGlobalScope defined + no document property → IS_WORKER_SCOPE = true in creepjs
     const scope = {
       WorkerGlobalScope: function WorkerGlobalScope() {},
@@ -12739,17 +12793,17 @@ globalThis.Worker = class Worker {
         if (!scope._ev[type]) scope._ev[type] = [];
         scope._ev[type].push(fn);
       },
-      close: () => { worker._terminated = true; },
+      close: () => { worker.terminate(); },
       crypto: globalThis.crypto,
       Crypto: globalThis.Crypto,
       TextEncoder: globalThis.TextEncoder,
       TextDecoder: globalThis.TextDecoder,
       atob: globalThis.atob,
       btoa: globalThis.btoa,
-      setTimeout: globalThis.setTimeout,
-      setInterval: globalThis.setInterval,
-      clearTimeout: globalThis.clearTimeout,
-      clearInterval: globalThis.clearInterval,
+      setTimeout,
+      setInterval,
+      clearTimeout: clearTimer,
+      clearInterval: clearTimer,
       scheduler: globalThis.scheduler,
       Scheduler: globalThis.Scheduler,
       fetch: globalThis.fetch,
@@ -12764,9 +12818,17 @@ globalThis.Worker = class Worker {
     if (this._terminated || !this._code) return;
     const worker = this;
     const scope = worker._makeScope();
+    worker._scope = scope;
     try {
-      const fn = new Function('self', 'postMessage', 'addEventListener', 'close', worker._code);
-      fn(scope, scope.postMessage, scope.addEventListener, scope.close);
+      const fn = new Function(
+        'self', 'postMessage', 'addEventListener', 'close',
+        'setTimeout', 'setInterval', 'clearTimeout', 'clearInterval',
+        worker._code,
+      );
+      fn(
+        scope, scope.postMessage, scope.addEventListener, scope.close,
+        scope.setTimeout, scope.setInterval, scope.clearTimeout, scope.clearInterval,
+      );
     } catch(e) {
       console.error('Worker error:', e.message);
       if (worker.onerror) worker.onerror(e);
@@ -12776,21 +12838,26 @@ globalThis.Worker = class Worker {
     if (this._terminated) return;
     const worker = this;
     setTimeout(() => {
-      if (worker._terminated || !worker._code) return;
-      const scope = worker._makeScope();
+      if (worker._terminated || !worker._scope) return;
+      const scope = worker._scope;
       try {
-        const fn = new Function('self', 'postMessage', 'addEventListener', 'close', worker._code);
-        fn(scope, scope.postMessage, scope.addEventListener, scope.close);
         const evs = (scope._ev && scope._ev['message']) || [];
-        if (evs.length) { for (const h of evs) h({ data }); }
-        else if (scope.onmessage) scope.onmessage({ data });
+        const event = { data };
+        for (const h of evs) h(event);
+        if (scope.onmessage) scope.onmessage(event);
       } catch(e) {
         console.error('Worker error:', e.message);
         if (worker.onerror) worker.onerror(e);
       }
     }, 0);
   }
-  terminate() { this._terminated = true; }
+  terminate() {
+    this._terminated = true;
+    for (const [id, timer] of this._timers) timer.cancel(id);
+    this._timers.clear();
+    this._scope = null;
+    this._code = '';
+  }
   addEventListener(type, fn) {
     if (!this._listeners[type]) this._listeners[type] = [];
     this._listeners[type].push(fn);

@@ -3175,6 +3175,62 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_keeps_one_scope_between_messages() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "worker-test",
+            r#"
+                globalThis.__workerEvents = [];
+                const source = "self.postMessage('boot'); self.onmessage = e => self.postMessage(e.data);";
+                const workerUrl = URL.createObjectURL(new Blob([source], {type: 'application/javascript'}));
+                const worker = new Worker(workerUrl);
+                URL.revokeObjectURL(workerUrl);
+                worker.onmessage = event => {
+                    __workerEvents.push(event.data);
+                    if (event.data === 'boot') worker.postMessage('ping');
+                    else worker.terminate();
+                };
+            "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__workerEvents").unwrap(),
+            serde_json::json!(["boot", "ping"]),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn terminating_a_worker_clears_its_timers() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "worker-timer-cleanup",
+            r#"
+                globalThis.__workerEvents = [];
+                const source = "self.setInterval(() => self.postMessage('tick'), 0);";
+                const workerUrl = URL.createObjectURL(new Blob([source], {type: 'application/javascript'}));
+                const worker = new Worker(workerUrl);
+                URL.revokeObjectURL(workerUrl);
+                globalThis.__workerForTest = worker;
+                worker.onmessage = event => {
+                    __workerEvents.push(event.data);
+                    worker.terminate();
+                };
+            "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__workerEvents").unwrap(),
+            serde_json::json!(["tick"]),
+        );
+        assert_eq!(
+            rt.evaluate("__workerForTest._timers.size").unwrap().as_f64(),
+            Some(0.0),
+        );
+    }
+
     #[test]
     fn document_domain_getter_and_valid_relaxation_match_effective_host() {
         let dom = parse_html("<html><body></body></html>");
