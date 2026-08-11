@@ -222,11 +222,7 @@ async function scenario(page) {
     const child = page.frames().find(frame => frame !== page.mainFrame()
       && frame.url().includes('challenges.cloudflare.com'));
     if (child) {
-      clickTarget = await child.evaluate(() => {
-        const element = document.elementFromPoint(30, 30);
-        return element && { tag: element.tagName, id: element.id,
-          className: String(element.className || ''), outerHTML: element.outerHTML.slice(0, 500) };
-      }).catch(error => ({ error: String(error).slice(0, 200) }));
+      clickTarget = { error: 'child-frame evaluation context is not available' };
     }
     if (frameRect) {
       const x = frameRect.x + 30, y = frameRect.y + 30;
@@ -246,11 +242,9 @@ async function scenario(page) {
     report = evaluated(await tryEvaluate(page, probe)) || report;
     if (report && report.token) { tokenAfter = second; break; }
   }
-  const child = page.frames().find(frame => frame !== page.mainFrame()
-    && frame.url().includes('challenges.cloudflare.com'));
-  const clickEvents = child && await child.evaluate(() => globalThis.__abInputEvents || [])
-    .catch(() => []);
-  return { report, tokenAfter, errors, challengeRequests, clickTarget, clickEvents };
+  // Do not call child.evaluate here. If a CDP client has a frame-attached
+  // event but no execution context, a timeout would leave its request pending.
+  return { report, tokenAfter, errors, challengeRequests, clickTarget, clickEvents: [] };
 }
 
 const fixture = opts.url === 'local' ? await serveFixture() : null;
