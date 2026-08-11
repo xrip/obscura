@@ -11,7 +11,7 @@
 ```
 node tools/ab/ab.mjs <url> [--needle text] [--match regexp]
                            [--only chrome|obscura] [--wait seconds] [--proxy url] [--headed]
-                           [--trace-challenge]
+                           [--trace-challenge] [--screenshot-dir path]
 node tools/ab/journey.mjs [--site wb|ozon|avito] [--cards n]
                            [--only chrome|obscura] [--proxy url] [--goto] [--headed]
                            [--profile-dir path] [--trace-challenge] [--clean-host]
@@ -41,7 +41,26 @@ helper function names plus argument and result shapes and string lengths. It
 does not record values, cookies, tokens, or the fingerprint body.
 
 Obscura is built from `target/release/obscura.exe` and launched with `--stealth`
-on a free port, then killed. Nothing is written to disk.
+on a free port, then killed. Nothing is written to disk unless
+`--screenshot-dir` is passed. With that option, `ab.mjs` saves the visible
+viewport after the scenario completes, while the page is still open, as
+`<path>/chrome.png` and `<path>/obscura.png`.
+
+For WB and Ozon URLs, screenshot mode waits up to `--wait` seconds for the
+real storefront: at least three visible product links on the home page, or a
+non-challenge product document. If the page still says it is checking the
+browser, no screenshot is written.
+
+For a manual WB/Ozon render check, use a separate disposable directory for
+each site:
+
+```
+node tools/ab/ab.mjs https://www.wildberries.ru/ --screenshot-dir C:\Temp\obscura-ab-wb
+node tools/ab/ab.mjs https://www.ozon.ru/ --screenshot-dir C:\Temp\obscura-ab-ozon
+```
+
+Use `--only chrome` or `--only obscura` when only one image is needed. The
+directory is created on demand and may contain sensitive live page data.
 
 On Windows, use `--clean-host` when the terminal or agent process was itself
 started with a proxy. Explorer then launches Chrome or Obscura outside that

@@ -141,8 +141,8 @@ export async function tryEvaluate(page, fn, arg) {
 
 export const evaluated = result => (result && 'value' in result ? result.value : undefined);
 
-/// Runs `scenario(page)` in the real system Chrome.
-export async function withChrome(opts, scenario) {
+/// Runs `scenario(page)` in the real system Chrome, then `afterScenario`.
+export async function withChrome(opts, scenario, afterScenario) {
   if (opts.cleanHost) {
     if (opts.proxy) throw new Error('--clean-host cannot be combined with --proxy');
     if (opts.profileDir) throw new Error('--clean-host always uses a fresh Chrome profile');
@@ -165,7 +165,8 @@ export async function withChrome(opts, scenario) {
       browser = await chromium.connectOverCDP(`http://127.0.0.1:${port}`);
       const context = browser.contexts()[0] || await browser.newContext();
       const page = context.pages()[0] || await context.newPage();
-      return await scenario(page);
+      const result = await scenario(page);
+      return afterScenario ? await afterScenario(page, result) : result;
     } finally {
       try { await browser?.close(); } catch { /* already closed */ }
       await sleep(500);
@@ -182,7 +183,9 @@ export async function withChrome(opts, scenario) {
       env: childEnv(),
     });
     try {
-      return await scenario(await context.newPage());
+      const page = await context.newPage();
+      const result = await scenario(page);
+      return afterScenario ? await afterScenario(page, result) : result;
     } finally {
       await context.close();
     }
@@ -196,15 +199,16 @@ export async function withChrome(opts, scenario) {
   });
   try {
     const context = await browser.newContext();
-    return await scenario(await context.newPage());
+    const page = await context.newPage();
+    const result = await scenario(page);
+    return afterScenario ? await afterScenario(page, result) : result;
   } finally {
     await browser.close();
   }
 }
 
-/// Runs `scenario(page)` in Obscura, started with --stealth on a free port and
-/// killed afterwards.
-export async function withObscura(opts, scenario) {
+/// Runs `scenario(page)` in Obscura, then `afterScenario`, before teardown.
+export async function withObscura(opts, scenario, afterScenario) {
   const port = await freePort();
   if (opts.cleanHost && opts.proxy) {
     throw new Error('--clean-host cannot be combined with --proxy');
@@ -247,10 +251,14 @@ export async function withObscura(opts, scenario) {
     await waitForCdp(port, 'Obscura');
     const browser = await chromium.connectOverCDP(`http://127.0.0.1:${port}`);
     const context = await browser.newContext();
-    const result = await scenario(await context.newPage());
-    await context.close();
-    await browser.close();
-    return result;
+    try {
+      const page = await context.newPage();
+      const result = await scenario(page);
+      return afterScenario ? await afterScenario(page, result) : result;
+    } finally {
+      await context.close();
+      await browser.close();
+    }
   } finally {
     if (child) child.kill();
     else stopExplorerProcess(obscuraBin, `--port ${port}`);
@@ -260,5 +268,5 @@ export async function withObscura(opts, scenario) {
   }
 }
 
-export const runIn = (engine, opts, scenario) =>
-  (engine === 'chrome' ? withChrome : withObscura)(opts, scenario);
+export const runIn = (engine, opts, scenario, afterScenario) =>
+  (engine === 'chrome' ? withChrome : withObscura)(opts, scenario, afterScenario);
