@@ -210,6 +210,7 @@ export async function withChrome(opts, scenario, afterScenario) {
 /// Runs `scenario(page)` in Obscura, then `afterScenario`, before teardown.
 export async function withObscura(opts, scenario, afterScenario) {
   const port = await freePort();
+  const stealthArgs = process.env.OBSCURA_AB_NO_STEALTH === '1' ? [] : ['--stealth'];
   if (opts.cleanHost && opts.proxy) {
     throw new Error('--clean-host cannot be combined with --proxy');
   }
@@ -233,24 +234,41 @@ export async function withObscura(opts, scenario, afterScenario) {
       'set OBSCURA_NAV_TIMEOUT_MS=90000',
       ...Object.entries(extra).map(([name, value]) =>
         `set "${name}=${String(value).replaceAll('%', '%%').replaceAll('"', '""')}"`),
-      `"${obscuraBin}" --stealth serve --port ${port}`,
+      `"${obscuraBin}" ${stealthArgs.join(' ')} serve --port ${port}`,
     ];
     writeFileSync(launcher, lines.join('\r\n'), 'utf8');
     launchViaExplorer(launcher, [], false);
   } else {
-    child = spawn(obscuraBin, ['--stealth', 'serve', '--port', String(port)], {
+    child = spawn(obscuraBin, [
+      ...stealthArgs, 'serve', '--port', String(port),
+      ...(opts.profileWorkbenchDir
+        ? ['--profile-workbench-dir', resolve(opts.profileWorkbenchDir)]
+        : []),
+    ], {
       cwd: root,
       env: childEnv(opts.proxy, { OBSCURA_NAV_TIMEOUT_MS: '90000', ...(opts.env || {}) }),
       stdio: ['ignore', 'pipe', 'pipe'],
       windowsHide: true,
     });
     child.stdout.on('data', () => {});
-    child.stderr.on('data', opts.onStderr || (() => {}));
+    child.stderr.on('data', opts.onStderr || (data => {
+      if (process.env.OBSCURA_AB_STDERR === '1') process.stderr.write(data);
+    }));
+    if (opts.onStderr) {
+      child.on('exit', (code, signal) => {
+        opts.onStderr(`obscura child exited: code=${code} signal=${signal}\n`);
+      });
+    }
   }
   try {
     await waitForCdp(port, 'Obscura');
     const browser = await chromium.connectOverCDP(`http://127.0.0.1:${port}`);
-    const context = await browser.newContext();
+    if (opts.profile) {
+      const browserCdp = await browser.newBrowserCDPSession();
+      await browserCdp.send('Obscura.setProfile', { profileId: opts.profile });
+      await browserCdp.detach();
+    }
+    const context = await browser.newContext({ viewport: null });
     try {
       const page = await context.newPage();
       const result = await scenario(page);
