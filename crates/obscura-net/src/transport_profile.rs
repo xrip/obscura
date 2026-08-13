@@ -52,6 +52,7 @@ pub(crate) const CHROME_TRANSPORT_PROFILES: &[(u32, wreq_util::Profile)] = &[
     (146, wreq_util::Profile::Chrome146),
     (147, wreq_util::Profile::Chrome147),
     (148, wreq_util::Profile::Chrome148),
+    (149, wreq_util::Profile::Chrome149),
 ];
 
 
