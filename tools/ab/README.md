@@ -48,15 +48,17 @@ viewport after the scenario completes, while the page is still open, as
 
 For WB and Ozon URLs, screenshot mode waits up to `--wait` seconds for the
 real storefront: at least three visible product links on the home page, or a
-non-challenge product document. If the page still says it is checking the
-browser, no screenshot is written.
+non-challenge product document. For Dzen, it waits for at least three visible
+article nodes. If the page still says it is checking the browser, no screenshot
+is written.
 
-For a manual WB/Ozon render check, use a separate disposable directory for
-each site:
+For a manual site render check, use a separate disposable directory for each
+site:
 
 ```
 node tools/ab/ab.mjs https://www.wildberries.ru/ --screenshot-dir C:\Temp\obscura-ab-wb
 node tools/ab/ab.mjs https://www.ozon.ru/ --screenshot-dir C:\Temp\obscura-ab-ozon
+node tools/ab/ab.mjs https://dzen.ru/ --screenshot-dir C:\Temp\obscura-ab-dzen
 ```
 
 Use `--only chrome` or `--only obscura` when only one image is needed. The

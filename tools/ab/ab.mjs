@@ -35,6 +35,10 @@ const STOREFRONTS = {
     host: 'ozon.ru',
     homeSelector: 'a[href*="/product/"]',
   },
+  dzen: {
+    host: 'dzen.ru',
+    homeSelector: 'article',
+  },
 };
 
 function storefrontFor(url) {
@@ -219,14 +223,14 @@ for (const engine of engines) {
       console.log(`   challenge state: ${JSON.stringify(out.challengeState)}`);
     }
     if (out.screenshotReadiness) {
-      console.log(`   storefront: ${out.screenshotReadiness.ready ? 'ready' : 'NOT READY'}` +
+      console.log(`   site: ${out.screenshotReadiness.ready ? 'ready' : 'NOT READY'}` +
                   ` (${out.screenshotReadiness.mode}, waited ${out.screenshotReadiness.waited}s)`);
       if (!out.screenshotReadiness.ready) {
         console.log(`   final state: ${JSON.stringify(out.screenshotReadiness.state)}`);
       }
     }
     if (out.screenshotPath) console.log(`   screenshot: ${out.screenshotPath}`);
-    if (out.screenshotSkipped) console.log('   screenshot skipped: storefront was not ready');
+    if (out.screenshotSkipped) console.log('   screenshot skipped: site was not ready');
     const unique = [...new Set(out.errors)];
     for (const line of unique.slice(0, 12)) console.log('   ' + line);
     if (unique.length > 12) console.log(`   ... and ${unique.length - 12} more errors`);
