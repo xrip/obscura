@@ -44,6 +44,46 @@ async fn serve_fixture() -> String {
     format!("http://{addr}/")
 }
 
+async fn serve_iframe_click_fixture() -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let mut buf = [0u8; 2048];
+            let read = socket.read(&mut buf).await.unwrap_or(0);
+            let request = String::from_utf8_lossy(&buf[..read]);
+            let body = if request.starts_with("GET /frame.html ") {
+                r#"<!doctype html><html><body style="margin:0">
+                    <script>
+                        globalThis.clicks = 0;
+                        const root = document.body.attachShadow({ mode: 'closed' });
+                        root.innerHTML = '<input id="inside" type="checkbox" style="position:absolute;left:10px;top:10px;width:40px;height:40px">';
+                        const inside = root.querySelector('#inside');
+                        inside.addEventListener('click', () => {
+                            globalThis.clicks++;
+                            globalThis.checked = inside.checked;
+                        });
+                    </script>
+                </body></html>"#
+            } else if request.starts_with("GET /outer.html ") {
+                r#"<!doctype html><html><body style="margin:0">
+                    <iframe id="nested" src="/frame.html" style="position:absolute;left:20px;top:20px;width:180px;height:120px;border:0"></iframe>
+                </body></html>"#
+            } else {
+                r#"<!doctype html><html><body style="margin:0">
+                    <iframe id="child" src="/outer.html" style="position:absolute;left:20px;top:20px;width:180px;height:120px;border:0"></iframe>
+                </body></html>"#
+            };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = socket.write_all(response.as_bytes()).await;
+        }
+    });
+    format!("http://{addr}/")
+}
+
 async fn cdp(
     ctx: &mut CdpContext,
     id: u64,
@@ -494,6 +534,53 @@ async fn press_release_orders_events_and_defers_click_activation() {
     assert_eq!(released["log"][2]["ctrl"], true);
     assert_eq!(released["log"][2]["shift"], true);
     assert_eq!(released["log"][2]["trusted"], true);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn page_mouse_click_enters_a_child_frame() {
+    std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+    let url = serve_iframe_click_fixture().await;
+    let mut ctx = CdpContext::new();
+    let page_id = ctx.create_page();
+    let sid = "iframe-mouse-session";
+    ctx.sessions.insert(sid.to_string(), page_id);
+    cdp(
+        &mut ctx,
+        1,
+        "Page.navigate",
+        json!({"url": url, "waitUntil": "load"}),
+        sid,
+    )
+    .await;
+    // Frame attachment is progressed by the next page commands.
+    evaluate(&mut ctx, 2, "1", sid).await;
+    evaluate(&mut ctx, 3, "1", sid).await;
+
+    click(&mut ctx, 4, sid, 70.0, 70.0).await;
+
+    let result = evaluate(
+        &mut ctx,
+        6,
+        r#"(() => {
+            const iframe = document.getElementById('child');
+            const outer = globalThis.__obscura_frameObjects[iframe._frameId];
+            const nested = outer.document.getElementById('nested');
+            const realm = outer.window.__obscura_frameObjects[nested._frameId];
+            return JSON.stringify({
+                frameId: iframe._frameId,
+                nestedFrameId: nested._frameId,
+                clicks: realm.window.clicks,
+                closedShadowChecked: realm.window.checked
+            });
+        })()"#,
+        sid,
+    )
+    .await;
+    let result: Value = serde_json::from_str(result["result"]["value"].as_str().unwrap()).unwrap();
+    assert!(result["frameId"].as_u64().unwrap_or(0) > 0, "child frame was not attached");
+    assert!(result["nestedFrameId"].as_u64().unwrap_or(0) > 0, "nested frame was not attached");
+    assert_eq!(result["clicks"], 1, "nested child click listener did not run exactly once");
+    assert_eq!(result["closedShadowChecked"], true, "page click did not activate closed-shadow control");
 }
 
 #[tokio::test(flavor = "current_thread")]
