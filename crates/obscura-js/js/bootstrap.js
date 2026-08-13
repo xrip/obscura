@@ -15394,8 +15394,9 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
   // don't form a proper containment hierarchy (a child's rect can lie far
   // outside its parent's), so a tree walk that only descends into ancestors
   // containing (x,y) would never reach a deep <input> inside <label><p>.
-  // Returns the deepest matching element (highest nid wins as a proxy for
-  // tree depth) so descendants beat ancestors.
+  // Returns the deepest matching element so descendants beat ancestors.
+  // Prefer form controls over decorative descendants, then use z-index and
+  // tree depth because node ids are creation order, not paint order.
   Document.prototype[_obscuraInternalHitTest] = function(x, y, exposeClosed = true) {
     if (typeof x !== 'number' || typeof y !== 'number' || !isFinite(x) || !isFinite(y)) {
       return null;
@@ -15418,6 +15419,8 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
      }
      var best = null;
      var bestPriority = -1;
+     var bestZIndex = -Infinity;
+     var bestDepth = -1;
      var bestNid = -1;
      var bestRoot = null;
      for (var rootIndex = 0; rootIndex < roots.length; rootIndex++) {
@@ -15429,9 +15432,19 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
        // documentElement / body span the viewport; skip them so we pick a
        // real descendant instead of falling back to <html>/<body>.
        if (root === this && (el === this.documentElement || el === this.body)) continue;
+       // These HTML elements never produce a hit-testable CSS box.
+       var tag = String(el.tagName || '').toUpperCase();
+       if (tag === 'BASE' || tag === 'HEAD' || tag === 'LINK' || tag === 'META' ||
+           tag === 'NOSCRIPT' || tag === 'SCRIPT' || tag === 'STYLE' ||
+           tag === 'TEMPLATE' || tag === 'TITLE') continue;
        var r = el.getBoundingClientRect();
        if (r.width === 0 || r.height === 0) continue;
       if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) {
+        var ownStyle = null;
+        try { ownStyle = getComputedStyle(el); } catch (_e) {}
+        if (ownStyle && (ownStyle.display === 'none' || ownStyle.display === 'contents' ||
+            ownStyle.visibility === 'hidden' || ownStyle.visibility === 'collapse' ||
+            ownStyle.pointerEvents === 'none')) continue;
         // A descendant's layout rect can extend beyond an overflow clip. It
         // must not win hit testing where its scrolling ancestor hides it —
         // otherwise a wheel well outside a small pane scrolls that pane
@@ -15441,6 +15454,10 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
         while (ancestor && ancestor !== this.documentElement && ancestor !== this.body) {
           var style = null;
           try { style = getComputedStyle(ancestor); } catch (_e) {}
+          if (style && style.display === 'none') {
+            visible = false;
+            break;
+          }
           var ox = style ? (style.overflowX || style.overflow || '') : '';
           var oy = style ? (style.overflowY || style.overflow || '') : '';
           var clipsX = ox === 'auto' || ox === 'scroll' || ox === 'hidden' || ox === 'clip';
@@ -15470,11 +15487,18 @@ if (typeof Document !== 'undefined' && !Document.prototype.elementFromPoint) {
         // form control over decorative descendants when their boxes overlap;
         // native hit testing does the same for controls such as a checkbox
         // covered by its label artwork.
-        var tag = String(el.tagName || '').toUpperCase();
         var priority = tag === 'INPUT' ? 3
           : (tag === 'BUTTON' || tag === 'SELECT' || tag === 'TEXTAREA') ? 2
           : (tag === 'LABEL' || tag === 'A') ? 1 : 0;
-        if (priority > bestPriority || (priority === bestPriority && nid > bestNid)) {
+        var zIndex = parseInt(ownStyle && ownStyle.zIndex, 10);
+        if (!isFinite(zIndex)) zIndex = 0;
+        var depth = 0;
+        var parent = el.parentElement;
+        while (parent) { depth++; parent = parent.parentElement; }
+        if (priority > bestPriority ||
+            (priority === bestPriority && (zIndex > bestZIndex ||
+             (zIndex === bestZIndex && (depth > bestDepth ||
+              (depth === bestDepth && nid > bestNid)))))) {
           best = el;
           bestPriority = priority;
           bestNid = nid;

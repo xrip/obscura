@@ -13,7 +13,9 @@
 //     --headed           show the Chrome window
 //     --clean-host       launch outside the current Windows process tree
 //
-// Open the home page, pick N product links at random, and visit each one.
+// Open the home page, pick product links at random, and verify N product pages.
+// A live card can lead to WB's generic loading shell, so failed cards are
+// reported and retried up to a small fixed attempt budget.
 //
 // Why a journey and not a deep link: arriving cold on a product URL is not what
 // a person does, and repeating one deep link is the fastest way to get an IP
@@ -37,11 +39,11 @@ import { installChallengeTrace, readChallengeTrace } from './challenge-trace.mjs
 const SITES = {
   wb: {
     home: 'https://www.wildberries.ru/',
-    cardLink: 'a[href*="/catalog/"][href*="/detail.aspx"]',
+    cardLink: 'a[data-testid="product-card-link"][href*="/catalog/"][href*="/detail.aspx"]',
     idFrom: url => (url.match(/\/catalog\/(\d+)\/detail/) || [])[1],
     // The href fragment that says the browser is on this card.
     onCard: id => `/catalog/${id}/`,
-    cardLinkFor: id => `a[href*="/catalog/${id}/"]`,
+    cardLinkFor: id => `a[data-testid="product-card-link"][href*="/catalog/${id}/"]`,
   },
   ozon: {
     home: 'https://www.ozon.ru/',
@@ -152,21 +154,27 @@ async function journey(page, log) {
   // every visit, so ids picked up front are gone by the second card — which
   // reads as a click failure and is really a stale locator.
   const visited = new Set();
-  for (let round = 0; round < opts.cards; round++) {
-    if (round > 0) {
+  let openedCards = 0;
+  const maxAttempts = opts.site === 'wb' ? opts.cards * 3 : opts.cards;
+  for (let attempt = 0; attempt < maxAttempts && openedCards < opts.cards; attempt++) {
+    if (attempt > 0) {
       await page.goto(HOME, { waitUntil: 'load', timeout: 90000 });
-      await new Promise(done => setTimeout(done, 2000));
     }
 
     // Only cards the page currently shows, and only ones we have not used.
-    const candidates = (evaluated(await tryEvaluate(page, selector =>
-      [...document.querySelectorAll(selector)]
-        .filter(a => {
-          const r = a.getBoundingClientRect();
-          return r.width > 0 && r.height > 0;
-        })
-        .map(a => a.href), site.cardLink)) || [])
-      .filter(u => productId(u));
+    let candidates = [];
+    for (let second = 1; second <= opts.wait; second++) {
+      await new Promise(done => setTimeout(done, 1000));
+      candidates = (evaluated(await tryEvaluate(page, selector =>
+        [...document.querySelectorAll(selector)]
+          .filter(a => {
+            const r = a.getBoundingClientRect();
+            return r.width > 0 && r.height > 0;
+          })
+          .map(a => a.href), site.cardLink)) || [])
+        .filter(u => productId(u));
+      if (candidates.length) break;
+    }
     const fresh = candidates.filter(u => !visited.has(productId(u)));
     if (!fresh.length) {
       // Distinguish "the page came back empty" from "we have already used
@@ -196,9 +204,17 @@ async function journey(page, log) {
         await page.goto(url, { waitUntil: 'load', timeout: 90000 });
       } else {
         const card = page.locator(site.cardLinkFor(id)).first();
-        await card.scrollIntoViewIfNeeded({ timeout: 15000 });
-        await new Promise(done => setTimeout(done, 400 + Math.random() * 600));
-        await card.click({ timeout: 15000 });
+        if (opts.site === 'wb') {
+          // WB keeps moving card boxes while its home feed loads. Exercise the
+          // DOM scroll and mouse-input paths without Playwright's stability wait.
+          await card.evaluate(element => element.scrollIntoView({ block: 'center', inline: 'nearest' }));
+          await new Promise(done => setTimeout(done, 400 + Math.random() * 600));
+          await card.click({ force: true, timeout: 15000 });
+        } else {
+          await card.scrollIntoViewIfNeeded({ timeout: 15000 });
+          await new Promise(done => setTimeout(done, 400 + Math.random() * 600));
+          await card.click({ timeout: 15000 });
+        }
         for (let tick = 0; tick < 40; tick++) {
           if (page.url().includes(site.onCard(id))) break;
           await new Promise(done => setTimeout(done, 500));
@@ -234,10 +250,15 @@ async function journey(page, log) {
     } catch (error) {
       failure = String(error).split('\n')[0].slice(0, 140);
     }
-    steps.push({ step: 'card', id, how, opened, bodyLength, failure, requests, ok: opened !== null });
+    const ok = opened !== null;
+    steps.push({ step: 'card', id, how, opened, bodyLength, failure, requests, ok });
+    if (ok) openedCards += 1;
     log(`card ${id} via ${how}: ${failure ? `FAILED ${failure}` : opened !== null
       ? `opened after ${opened}s (${bodyLength} chars)` : `NEVER rendered (${bodyLength} chars)`}` +
       `  [${requests} requests total]`);
+    if (!ok && attempt + 1 < maxAttempts) {
+      log(`retrying another card (${openedCards}/${opts.cards} verified)`);
+    }
   }
   return steps;
 }
@@ -250,8 +271,8 @@ for (const engine of opts.only ? [opts.only] : ['chrome', 'obscura']) {
       journey(page, line => console.log('   ' + line)));
     const cards = steps.filter(s => s.step === 'card');
     const opened = cards.filter(s => s.ok).length;
-    console.log(`   ${opened}/${cards.length} cards opened`);
-    if (opened < cards.length || !cards.length) failed += 1;
+    console.log(`   ${opened}/${opts.cards} cards opened (${cards.length} attempts)`);
+    if (opened < opts.cards) failed += 1;
   } catch (error) {
     console.log('   THREW ' + String(error).split('\n')[0].slice(0, 300));
     failed += 1;

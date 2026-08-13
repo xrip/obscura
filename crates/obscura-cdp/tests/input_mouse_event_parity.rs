@@ -312,6 +312,75 @@ async fn hit_testing_clips_scrolled_children_at_overflow_padding_edge() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn hit_testing_uses_tree_depth_and_ignores_non_rendered_elements() {
+    let (mut ctx, sid) = setup().await;
+    let result = evaluate(
+        &mut ctx,
+        2,
+        r#"(() => {
+            document.body.innerHTML = '';
+            const target = document.createElement('a');
+            target.id = 'target';
+            const parent = document.createElement('div');
+            parent.id = 'parent';
+            parent.appendChild(target);
+            document.body.appendChild(parent);
+
+            const wrapper = document.createElement('div');
+            const style = document.createElement('style');
+            style.id = 'style';
+            const hidden = document.createElement('div');
+            hidden.id = 'hidden';
+            hidden.style.visibility = 'hidden';
+            const noPointer = document.createElement('div');
+            noPointer.id = 'no-pointer';
+            noPointer.style.pointerEvents = 'none';
+            const noBoxParent = document.createElement('div');
+            noBoxParent.style.display = 'none';
+            const noBoxChild = document.createElement('div');
+            noBoxChild.id = 'no-box-child';
+            noBoxParent.appendChild(noBoxChild);
+            wrapper.appendChild(style);
+            wrapper.appendChild(hidden);
+            wrapper.appendChild(noPointer);
+            wrapper.appendChild(noBoxParent);
+            document.body.appendChild(wrapper);
+
+            const rect = {x: 0, y: 0, left: 0, top: 0, right: 100, bottom: 100,
+                          width: 100, height: 100, toJSON() { return this; }};
+            for (const element of [target, parent, style, hidden, noPointer,
+                                   noBoxParent, noBoxChild]) {
+                element.getBoundingClientRect = () => rect;
+            }
+            const imageParent = document.createElement('div');
+            const image = document.createElement('img');
+            imageParent.appendChild(image);
+            const overlay = document.createElement('a');
+            overlay.id = 'overlay';
+            overlay.style.position = 'absolute';
+            overlay.style.zIndex = '3';
+            document.body.appendChild(overlay);
+            document.body.appendChild(imageParent);
+            const overlayRect = {x: 200, y: 0, left: 200, top: 0, right: 300, bottom: 100,
+                                 width: 100, height: 100, toJSON() { return this; }};
+            overlay.getBoundingClientRect = () => overlayRect;
+            image.getBoundingClientRect = () => overlayRect;
+
+            return JSON.stringify({
+                depth: document.elementFromPoint(50, 50).id,
+                overlay: document.elementFromPoint(250, 50).id,
+            });
+        })()"#,
+        &sid,
+    )
+    .await;
+    let result: Value =
+        serde_json::from_str(result["result"]["value"].as_str().unwrap()).unwrap();
+    assert_eq!(result["depth"], "target");
+    assert_eq!(result["overlay"], "overlay");
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn content_quad_centers_hit_their_dense_wrapped_inline_owners() {
     let (mut ctx, sid) = setup().await;
     evaluate(
