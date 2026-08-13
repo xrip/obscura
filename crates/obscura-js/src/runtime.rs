@@ -3239,6 +3239,40 @@ mod tests {
     }
 
     #[test]
+    fn function_to_string_has_native_function_shape() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+
+        assert_eq!(
+            rt.evaluate(
+                r#"(() => {
+                    const fn = Function.prototype.toString;
+                    let constructible = true;
+                    try {
+                        Reflect.construct(function () {}, [], fn);
+                    } catch (error) {
+                        constructible = false;
+                    }
+                    return {
+                        source: fn.toString(),
+                        name: fn.name,
+                        length: fn.length,
+                        hasOwnPrototype: Object.prototype.hasOwnProperty.call(fn, "prototype"),
+                        constructible,
+                    };
+                })()"#,
+            )
+            .unwrap(),
+            serde_json::json!({
+                "source": "function toString() { [native code] }",
+                "name": "toString",
+                "length": 0,
+                "hasOwnPrototype": false,
+                "constructible": false,
+            })
+        );
+    }
+
+    #[test]
     fn native_date_and_intl_use_process_timezone() {
         // SAFETY: nextest gives this test its own process and no runtime or
         // worker thread exists before this point.
@@ -13571,18 +13605,32 @@ mod tests {
     }
 
     #[test]
-    fn test_location_replace_accepts_url_object() {
+    fn test_location_navigation_coerces_url_objects() {
         let mut rt = setup_runtime("<html><body></body></html>");
-        let href = rt
+        let hrefs = rt
             .evaluate(
-                "(function() { location.replace(new URL('/accepted', location.href)); return location.href; })()",
+                r#"(() => {
+                    location.href = new URL('/from-href', location.href);
+                    const href = location.href;
+                    location.assign(new URL('/from-assign', location.href));
+                    const assigned = location.href;
+                    location.replace(new URL('/from-replace', location.href));
+                    return [href, assigned, location.href];
+                })()"#,
             )
             .unwrap();
-        assert_eq!(href, serde_json::json!("http://example.com/accepted"));
+        assert_eq!(
+            hrefs,
+            serde_json::json!([
+                "http://example.com/from-href",
+                "http://example.com/from-assign",
+                "http://example.com/from-replace"
+            ])
+        );
         assert_eq!(
             rt.take_pending_navigation(),
             Some((
-                "http://example.com/accepted".to_string(),
+                "http://example.com/from-replace".to_string(),
                 "GET".to_string(),
                 "".to_string()
             ))
