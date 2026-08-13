@@ -3,6 +3,7 @@ use std::sync::Arc;
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use obscura_dom::{parse_html, DomTree};
 use obscura_js::frame::FrameRealm;
+use obscura_js::ops::PendingFrame;
 use obscura_js::runtime::ObscuraJsRuntime;
 use obscura_net::{
     CallbackRegistry, ObscuraHttpClient, ObscuraNetError, RequestCallback, ResourceRequest,
@@ -297,6 +298,7 @@ pub struct Page {
 const MAX_STYLESHEET_IMPORT_DEPTH: u8 = 4;
 const MAX_STYLESHEET_RESOURCES: usize = 128;
 const DEFAULT_NAVIGATION_TIMEOUT_MS: u64 = 30_000;
+const MAX_FRAME_NAVIGATION_HOPS: usize = 10;
 
 /// How many child frame realms one document may hold at once.
 ///
@@ -1008,8 +1010,15 @@ impl Page {
         if pending.is_empty() {
             return false;
         }
-
         for frame in pending {
+            if self.frame_owner_is_live(frame.parent_frame_id, frame.frame_id) == Some(false) {
+                tracing::debug!(
+                    "discarding stale queued frame document {}",
+                    frame.frame_id
+                );
+                self.forget_frame_references(frame.frame_id, frame.parent_frame_id);
+                continue;
+            }
             // A realm is a live v8::Context plus a DOM tree, and the page realm
             // holds its window and document, so nothing here can be collected
             // while the document lives. Frames are released when the document
@@ -1026,7 +1035,14 @@ impl Page {
                 continue;
             }
             let realm = match self.js.as_mut().and_then(|js| {
-                FrameRealm::new(js, frame.frame_id, frame.parent_frame_id, &frame.url, &frame.html)
+                FrameRealm::new_with_owner(
+                    js,
+                    frame.frame_id,
+                    frame.parent_frame_id,
+                    frame.owner_nid,
+                    &frame.url,
+                    &frame.html,
+                )
             }) {
                 Some(realm) => realm,
                 None => {
@@ -1060,14 +1076,34 @@ impl Page {
                 }
             }
 
+            let geometry = self.frame_element_geometry(
+                frame.parent_frame_id,
+                frame.frame_id,
+                frame.owner_nid,
+            );
+            let geometry_ready = geometry.is_some();
+            let geometry = geometry.unwrap_or((
+                0.0,
+                0.0,
+                frame.viewport_width as f64,
+                frame.viewport_height as f64,
+                f64::NAN,
+                f64::NAN,
+                f64::NAN,
+                f64::NAN,
+                ));
             if let Some(js) = self.js.as_mut() {
-                if let Err(error) = realm.set_viewport(
-                    js,
-                    frame.viewport_width as f64,
-                    frame.viewport_height as f64,
-                ) {
+                let (frame_x, frame_y, width, height, screen_x, screen_y,
+                    parent_input_screen_x, parent_input_screen_y) = geometry;
+                if let Err(error) = realm.set_viewport(js, width, height) {
                     tracing::debug!("frame {} viewport setup failed: {error}", frame.url);
                 }
+                realm.set_screen_position(js, screen_x, screen_y);
+                realm.set_input_screen_origin(
+                    js,
+                    parent_input_screen_x + frame_x,
+                    parent_input_screen_y + frame_y,
+                );
                 // Page.addScriptToEvaluateOnNewDocument applies to every new
                 // document, including child frames. Debug hooks and browser
                 // automation setup must be present before frame scripts run.
@@ -1086,6 +1122,20 @@ impl Page {
                     tracing::debug!("frame {} load events failed: {error}", frame.url);
                 }
             }
+            // The child realm's lifecycle events do not reach the embedding
+            // iframe element. Deliver its load event in the actual parent
+            // realm after the document and its scripts are ready.
+            self.execute_frame_owner_script(
+                frame.parent_frame_id,
+                &format!(
+                    "(function() {{ var frame = (globalThis.__obscura_frameElements || {{}})[{}];\
+                       if (frame) frame.dispatchEvent(new Event('load')); }})()",
+                    frame.frame_id,
+                ),
+            );
+            if !geometry_ready {
+                realm.mark_viewport_sync_pending();
+            }
             self.frames.push(realm);
         }
         true
@@ -1096,6 +1146,102 @@ impl Page {
     /// Reports whether anything was delivered, because a message usually causes
     /// a reply: a widget posts its result, the page answers, and the exchange
     /// only finishes if the caller settles and drains again.
+    fn sync_frame_viewport(&mut self, index: usize) -> bool {
+        let (parent_frame_id, frame_id) = {
+            let frame = match self.frames.get(index) {
+                Some(frame) => frame,
+                None => return false,
+            };
+            (frame.parent_frame_id(), frame.frame_id())
+        };
+        let Some((frame_x, frame_y, width, height, screen_x, screen_y,
+            parent_input_screen_x, parent_input_screen_y)) =
+            self.frame_element_geometry(parent_frame_id, frame_id, 0)
+        else {
+            tracing::debug!("frame {frame_id} embedding geometry unavailable");
+            return false;
+        };
+        self.frames[index].mark_viewport_sync_complete();
+        tracing::debug!(
+            "frame {frame_id} embedding viewport {:?}, current {:?}",
+            (width, height),
+            self.frames[index].viewport()
+        );
+        let Some(js) = self.js.as_mut() else {
+            return false;
+        };
+        let size_changed = self.frames[index].viewport() != Some((width, height));
+        if size_changed {
+            if let Err(error) = self.frames[index].set_viewport(js, width, height) {
+                tracing::debug!("frame {frame_id} viewport sync failed: {error}");
+            }
+        }
+        let position_changed = self.frames[index].set_screen_position(js, screen_x, screen_y);
+        let input_position_changed = self.frames[index].set_input_screen_origin(
+            js,
+            parent_input_screen_x + frame_x,
+            parent_input_screen_y + frame_y,
+        );
+        size_changed || position_changed || input_position_changed
+    }
+
+    /// Refresh live child browsing-context sizes from their embedding boxes.
+    /// Input routing calls this immediately before hit testing, which covers
+    /// frames whose parent layout settled after the event loop became idle.
+    pub fn sync_frame_viewports(&mut self) -> bool {
+        let mut changed = false;
+        for index in 0..self.frames.len() {
+            changed |= self.sync_frame_viewport(index);
+        }
+        changed
+    }
+
+    fn sync_pending_frame_viewports(&mut self) -> bool {
+        let mut changed = false;
+        for index in 0..self.frames.len() {
+            if self.frames[index].viewport_sync_pending() {
+                changed |= self.sync_frame_viewport(index);
+            }
+        }
+        changed
+    }
+
+    /// Check that a queued document still belongs to its current iframe.
+    /// Replacing an iframe invalidates the old queued document before the
+    /// event loop gets a chance to attach it.
+    fn frame_owner_is_live(&mut self, parent_frame_id: u32, frame_id: u32) -> Option<bool> {
+        let script = format!(
+            "(function() {{\
+                var frame = (globalThis.__obscura_frameElements || {{}})[{frame_id}];\
+                return !!(frame && frame.isConnected && frame._frameId === {frame_id});\
+            }})()",
+            frame_id = frame_id,
+        );
+        let value = if parent_frame_id == 0 {
+            match self.js.as_mut()?.evaluate(&script) {
+                Ok(value) => value,
+                Err(error) => {
+                    tracing::debug!("frame {frame_id} geometry evaluation failed: {error}");
+                    return None;
+                }
+            }
+        } else {
+            let index = self
+                .frames
+                .iter()
+                .position(|frame| frame.frame_id() == parent_frame_id)?;
+            let js = self.js.as_mut()?;
+            match self.frames[index].evaluate(js, &script) {
+                Ok(value) => value,
+                Err(error) => {
+                    tracing::debug!("frame {frame_id} parent geometry evaluation failed: {error}");
+                    return None;
+                }
+            }
+        };
+        value.as_bool()
+    }
+
     fn deliver_frame_messages(&mut self) -> bool {
         let pending = match self.js.as_ref() {
             Some(js) => js.take_pending_frame_messages(),
@@ -1142,6 +1288,96 @@ impl Page {
         true
     }
 
+    /// Resolve the owner iframe's current CSS box before running the child.
+    /// Dynamic widgets often create the iframe before the first render pass;
+    /// the loader then records the `300x150` fallback even when CSS settles to
+    /// a `300x65` challenge box. Keep the pending dimensions as a fallback,
+    /// and never retain the iframe or its DOM in native state.
+    fn frame_element_geometry(
+        &mut self,
+        parent_frame_id: u32,
+        frame_id: u32,
+        owner_nid: u32,
+    ) -> Option<(f64, f64, f64, f64, f64, f64, f64, f64)> {
+        let script = format!(
+            "(function() {{\
+                var frame = (globalThis.__obscura_frameElements || {{}})[{frame_id}];\
+                var owner = (frame && frame._nid) || {owner_nid};\
+                var rect = frame && frame.getBoundingClientRect ? frame.getBoundingClientRect() : null;\
+                if ((!rect || rect.width <= 0 || rect.height <= 0) && owner) {{\
+                    try {{\
+                        var raw = Deno.core.ops.op_layout_geometry(String(owner));\
+                        rect = raw ? JSON.parse(raw) : null;\
+                    }} catch (_) {{}}\
+                }}\
+                var style = null;\
+                if (frame) {{ try {{ style = getComputedStyle(frame); }} catch (_) {{}} }}\
+                var authoredWidth = null;\
+                var authoredHeight = null;\
+                if (owner) {{\
+                    try {{\
+                        var styleText = Deno.core.ops.op_dom('get_attribute', String(owner), 'style', 0);\
+                        try {{ styleText = JSON.parse(styleText); }} catch (_) {{}}\
+                        function authored(name) {{\
+                            var match = String(styleText || '').match(new RegExp('(?:^|;)\\\\s*' + name + '\\\\s*:\\\\s*([^;]+)', 'i'));\
+                            return match && match[1];\
+                        }}\
+                        authoredWidth = authored('width');\
+                        authoredHeight = authored('height');\
+                    }} catch (_) {{}}\
+                }}\
+                function dimension(value, fallback) {{\
+                    var n = parseFloat(value || '');\
+                    return Number.isFinite(n) && n > 0 ? n : fallback;\
+                }}\
+                var width = rect && rect.width > 0 ? rect.width :\
+                    dimension(style && style.width, dimension(authoredWidth, dimension(frame ? frame.getAttribute('width') : '', 0)));\
+                var height = rect && rect.height > 0 ? rect.height :\
+                    dimension(style && style.height, dimension(authoredHeight, dimension(frame ? frame.getAttribute('height') : '', 0)));\
+                if (!(width > 0 && height > 0)) return null;\
+                var parentScreenX = Number(globalThis.screenX) || 0;\
+                var parentScreenY = Number(globalThis.screenY) || 0;\
+                var parentInputScreenX = Number(globalThis.__obscura_inputScreenX);\
+                var parentInputScreenY = Number(globalThis.__obscura_inputScreenY);\
+                if (!Number.isFinite(parentInputScreenX)) parentInputScreenX = parentScreenX;\
+                if (!Number.isFinite(parentInputScreenY)) parentInputScreenY = parentScreenY;\
+                var frameX = rect ? Number(rect.x) || 0 : 0;\
+                var frameY = rect ? Number(rect.y) || 0 : 0;\
+                // An iframe has a different viewport, but its Window
+                // screenX/screenY describe the containing browser window, not
+                // the iframe element's CSS position. Input event screen
+                // coordinates add the frame offset at dispatch time.
+                return [frameX, frameY, width, height,
+                    parentScreenX, parentScreenY,
+                    parentInputScreenX, parentInputScreenY];\
+            }})()",
+            owner_nid = owner_nid,
+        );
+        let value = if parent_frame_id == 0 {
+            self.js.as_mut()?.evaluate(&script).ok()?
+        } else {
+            let index = self
+                .frames
+                .iter()
+                .position(|frame| frame.frame_id() == parent_frame_id)?;
+            let js = self.js.as_mut()?;
+            self.frames[index].evaluate(js, &script).ok()?
+        };
+        tracing::debug!("frame {frame_id} geometry raw value: {value:?}");
+        let values = value
+            .as_array()?
+            .iter()
+            .map(serde_json::Value::as_f64)
+            .collect::<Option<Vec<_>>>()?;
+        if values.len() != 8 || values.iter().any(|value| !value.is_finite()) {
+            return None;
+        }
+        (values[2] > 0.0 && values[3] > 0.0).then_some((
+            values[0], values[1], values[2], values[3], values[4], values[5],
+            values[6], values[7],
+        ))
+    }
+
     /// Removes the JS references owned by the iframe's parent realm and by the
     /// page's same-origin frame table. This also covers a frame rejected before
     /// a `FrameRealm` exists, so the normal drop path cannot be skipped.
@@ -1153,6 +1389,7 @@ impl Page {
                if (globalThis.__obscura_frameElements[{frame_id}]._iframeWin)\
                  globalThis.__obscura_frameElements[{frame_id}]._iframeWin._frameId = 0;\
              }}\
+             globalThis.__obscura_forget_frame?.({frame_id});\
              delete globalThis.__obscura_frameObjects[{frame_id}];\
              delete globalThis.__obscura_frameWindows[{frame_id}];\
              delete globalThis.__obscura_frameElements[{frame_id}];"
@@ -1160,7 +1397,8 @@ impl Page {
         self.execute_frame_owner_script(parent_frame_id, &script);
         if parent_frame_id != 0 {
             let page_script = format!(
-                "delete globalThis.__obscura_frameObjects[{frame_id}];"
+                "globalThis.__obscura_forget_frame?.({frame_id});\
+                 delete globalThis.__obscura_frameObjects[{frame_id}];"
             );
             if let Some(js) = self.js.as_mut() {
                 if let Err(error) = js.execute_script("<frame-detach>", &page_script) {
@@ -1273,6 +1511,119 @@ impl Page {
         tracing::debug!("discarded {} detached frame realm(s)", discarded.len());
     }
 
+    /// Loads a navigation requested by a child realm's location object. The
+    /// JS op only records the request because it cannot borrow the async HTTP
+    /// client; this host step performs the fetch and reuses the normal frame
+    /// document attach path.
+    async fn process_pending_frame_navigations(&mut self) -> bool {
+        let mut changed = false;
+        for _ in 0..MAX_FRAME_NAVIGATION_HOPS {
+            let pending = self.frames.iter().enumerate().find_map(|(index, frame)| {
+                frame
+                    .take_pending_navigation()
+                    .map(|navigation| (index, navigation))
+            });
+            let Some((index, (url, method, _body))) = pending else {
+                break;
+            };
+            let Some((frame_id, parent_frame_id, owner_nid, source_url)) =
+                self.frames.get(index).map(|frame| {
+                    (
+                        frame.frame_id(),
+                        frame.parent_frame_id(),
+                        frame.owner_nid(),
+                        frame.url().to_string(),
+                    )
+                })
+            else {
+                continue;
+            };
+            if !method.eq_ignore_ascii_case("GET") {
+                tracing::debug!("ignoring unsupported child navigation method {}", method);
+                continue;
+            }
+            if cross_scheme_to_file(&source_url, &url) {
+                tracing::warn!("blocking child navigation to file: {} -> {}", source_url, url);
+                continue;
+            }
+            let Ok(target) = Url::parse(&url) else {
+                tracing::debug!("ignoring invalid child navigation URL {}", url);
+                continue;
+            };
+            if self.should_block_url(&url) {
+                tracing::info!("blocked child navigation: {}", url);
+                continue;
+            }
+            let response = if target.scheme().eq_ignore_ascii_case("about") {
+                Ok(Response {
+                    url: target.clone(),
+                    status: 200,
+                    headers: std::collections::HashMap::new(),
+                    body: Vec::new(),
+                    redirected_from: Vec::new(),
+                })
+            } else if target.scheme().eq_ignore_ascii_case("data") {
+                let mut headers = std::collections::HashMap::new();
+                headers.insert(
+                    "content-type".to_string(),
+                    target
+                        .as_str()
+                        .strip_prefix("data:")
+                        .and_then(|value| value.split(',').next())
+                        .unwrap_or("text/html")
+                        .split(';')
+                        .next()
+                        .unwrap_or("text/html")
+                        .to_string(),
+                );
+                Ok(Response {
+                    url: target.clone(),
+                    status: 200,
+                    headers,
+                    body: decode_data_uri(&url).unwrap_or_default(),
+                    redirected_from: Vec::new(),
+                })
+            } else {
+                self.do_fetch_with_referrer(&target, &source_url).await
+            };
+            let Ok(response) = response else {
+                tracing::debug!("child navigation failed: {}", url);
+                continue;
+            };
+
+            let old = self.frames.remove(index);
+            if let Some(js) = self.js.as_mut() {
+                if let Err(error) = old.dispose_pending_tasks(js) {
+                    tracing::debug!("disposing navigated frame {} failed: {error}", frame_id);
+                }
+            }
+            drop(old);
+            self.release_detached_frames();
+
+            let clear_published = format!(
+                "delete globalThis.__obscura_frameObjects[{frame_id}];\
+                 delete globalThis.__obscura_frameWindows[{frame_id}];"
+            );
+            self.execute_frame_owner_script(parent_frame_id, &clear_published);
+            let queued = self.js.as_ref().is_some_and(|js| {
+                js.queue_pending_frame(PendingFrame {
+                    frame_id,
+                    owner_nid,
+                    url: response.url.to_string(),
+                    html: String::from_utf8_lossy(&response.body).into_owned(),
+                    viewport_width: 300,
+                    viewport_height: 150,
+                    parent_frame_id,
+                })
+            });
+            if !queued {
+                self.forget_frame_references(frame_id, parent_frame_id);
+            }
+            changed = true;
+        }
+        changed
+    }
+
     /// Moves the frame tree forward by one step: give any fetched frame
     /// document a realm, then hand on any message waiting for a realm.
     ///
@@ -1280,10 +1631,23 @@ impl Page {
     /// frame runs scripts that can post, and a message usually causes a reply,
     /// so neither queue is finished until both are quiet.
     async fn advance_frames(&mut self) -> bool {
+        self.release_detached_frames();
         let attached = self.attach_pending_frames().await;
         let delivered = self.deliver_frame_messages();
-        self.release_detached_frames();
-        attached || delivered
+        let navigated = self.process_pending_frame_navigations().await;
+        let viewport_changed = if attached || delivered || navigated {
+            self.sync_pending_frame_viewports()
+        } else {
+            false
+        };
+        attached || delivered || navigated || viewport_changed
+    }
+
+    /// Let one CDP command make progress on frame documents fetched by page
+    /// script. This keeps direct protocol users from observing a parent frame
+    /// before a nested frame created by it has had a host turn to attach.
+    pub async fn advance_frame_work(&mut self) -> bool {
+        self.advance_frames().await
     }
 
     /// URLs of the page's live child frames, in creation order.
@@ -1428,8 +1792,16 @@ impl Page {
     }
 
     async fn do_fetch(&self, url: &Url) -> Result<Response, ObscuraNetError> {
+        self.do_fetch_with_referrer(url, &self.referrer).await
+    }
+
+    async fn do_fetch_with_referrer(
+        &self,
+        url: &Url,
+        referrer: &str,
+    ) -> Result<Response, ObscuraNetError> {
         let mut request = ResourceRequest::navigation();
-        request.referrer = Url::parse(&self.referrer).ok();
+        request.referrer = Url::parse(referrer).ok();
         #[cfg(feature = "stealth")]
         if let Some(ref stealth) = self.stealth_client {
             return stealth

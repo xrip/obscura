@@ -182,7 +182,10 @@ if (globalThis.navigator) {
 // real constructors in a browser, so `Element` alone is not enough.
 if (typeof Element === 'function') {
   Object.defineProperty(globalThis, 'HTMLIFrameElement', {
-    value: class HTMLIFrameElement extends Element {},
+    value: class HTMLIFrameElement extends Element {
+      get srcdoc() { return this.getAttribute('srcdoc') || ''; }
+      set srcdoc(value) { this.setAttribute('srcdoc', String(value ?? '')); }
+    },
     writable: true, enumerable: false, configurable: true,
   });
   Object.defineProperty(globalThis, 'HTMLEmbedElement', {

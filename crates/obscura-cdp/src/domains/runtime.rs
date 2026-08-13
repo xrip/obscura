@@ -13,35 +13,41 @@ async fn emit_post_eval_nav(
     ctx: &mut CdpContext,
     session_id: &Option<String>,
 ) -> Result<(), String> {
-    let page = ctx
-        .get_session_page_mut(session_id)
-        .ok_or("No page")?;
-    let did_navigate = page.process_pending_navigation().await.map_err(|e| e.to_string())?;
-    if !did_navigate {
-        return Ok(());
-    }
-    let (frame_id, page_url, page_id, network_events, reached_idle) = {
-        let p = ctx.get_session_page_mut(session_id).ok_or("No page")?;
-        (
-            p.frame_id.clone(),
-            p.url_string(),
-            p.id.clone(),
-            p.network_events.drain(..).collect::<Vec<_>>(),
-            p.lifecycle.is_network_idle(),
-        )
+    let did_navigate = {
+        let page = ctx
+            .get_session_page_mut(session_id)
+            .ok_or("No page")?;
+        page.process_pending_navigation()
+            .await
+            .map_err(|e| e.to_string())?
     };
-    let loader_id = format!("loader-{}", uuid::Uuid::new_v4());
-    super::page::emit_navigation_events(
-        ctx,
-        session_id,
-        &frame_id,
-        &loader_id,
-        &page_url,
-        &page_id,
-        &network_events,
-        WaitUntil::Load,
-        reached_idle,
-    );
+    if did_navigate {
+        let (frame_id, page_url, page_id, network_events, reached_idle) = {
+            let p = ctx.get_session_page_mut(session_id).ok_or("No page")?;
+            (
+                p.frame_id.clone(),
+                p.url_string(),
+                p.id.clone(),
+                p.network_events.drain(..).collect::<Vec<_>>(),
+                p.lifecycle.is_network_idle(),
+            )
+        };
+        let loader_id = format!("loader-{}", uuid::Uuid::new_v4());
+        super::page::emit_navigation_events(
+            ctx,
+            session_id,
+            &frame_id,
+            &loader_id,
+            &page_url,
+            &page_id,
+            &network_events,
+            WaitUntil::Load,
+            reached_idle,
+        );
+    }
+    if let Some(page) = ctx.get_session_page_mut(session_id) {
+        let _ = page.advance_frame_work().await;
+    }
     Ok(())
 }
 

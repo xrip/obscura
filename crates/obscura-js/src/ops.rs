@@ -256,6 +256,10 @@ pub struct ObscuraState {
 /// A frame document waiting to be given a realm.
 pub struct PendingFrame {
     pub frame_id: u32,
+    /// The iframe node in the parent realm. It is used only to re-measure the
+    /// owner box before the child realm starts; it is not retained by the
+    /// frame realm.
+    pub owner_nid: u32,
     pub url: String,
     pub html: String,
     pub viewport_width: u64,
@@ -485,11 +489,21 @@ impl RealmStates {
         self.entries.retain(|(known, _, _)| known != context);
     }
 
-    fn by_frame_id(&self, frame_id: u32) -> Option<SharedState> {
+    pub(crate) fn by_frame_id(&self, frame_id: u32) -> Option<SharedState> {
         self.entries
             .iter()
             .find(|(_, id, _)| *id == frame_id)
             .map(|(_, _, state)| state.clone())
+    }
+
+    pub(crate) fn context_by_frame_id(
+        &self,
+        frame_id: u32,
+    ) -> Option<v8::Global<v8::Context>> {
+        self.entries
+            .iter()
+            .find(|(_, id, _)| *id == frame_id)
+            .map(|(context, _, _)| context.clone())
     }
 }
 
@@ -504,13 +518,18 @@ impl RealmStates {
 /// a page with no frames resolves on `frame_id == 0` alone.
 pub fn frame_state(op_state: &OpState, frame_id: u32) -> SharedState {
     let page = || op_state.borrow::<SharedState>().clone();
+    state_for_frame(op_state, frame_id).unwrap_or_else(page)
+}
+
+const MAX_FETCHED_URLS: usize = 4096;
+
+fn state_for_frame(op_state: &OpState, frame_id: u32) -> Option<SharedState> {
     if frame_id == 0 {
-        return page();
+        return Some(op_state.borrow::<SharedState>().clone());
     }
-    match op_state.try_borrow::<Rc<RefCell<RealmStates>>>() {
-        Some(registry) => registry.borrow().by_frame_id(frame_id).unwrap_or_else(page),
-        None => page(),
-    }
+    op_state
+        .try_borrow::<Rc<RefCell<RealmStates>>>()
+        .and_then(|registry| registry.borrow().by_frame_id(frame_id))
 }
 
 /// The state of the realm running right now, or the page's when the caller is
@@ -2216,7 +2235,9 @@ async fn op_fetch_url(
         // Record the resource the page pulled in via fetch()/XHR so `--dump
         // assets` can list it (issue #301). URL is already absolute here, since
         // reqwest needs an absolute URL to send the request.
-        gs.fetched_urls.push(url.clone());
+        if gs.fetched_urls.len() < MAX_FETCHED_URLS {
+            gs.fetched_urls.push(url.clone());
+        }
         let jar = gs.cookie_jar.clone();
         let in_flight = gs.http_client.as_ref().map(|c| c.in_flight.clone());
         // #139: thread the configured proxy through to the per-request
@@ -2256,6 +2277,12 @@ async fn op_fetch_url(
     let allow_private_network = http_client
         .as_ref()
         .is_some_and(|client| client.allow_private_network);
+    let default_user_agent = match http_client.as_ref() {
+        Some(client) => client.user_agent.read().await.clone(),
+        None => String::new(),
+    };
+    let (default_sec_ch_ua, default_sec_ch_ua_platform) =
+        obscura_net::client::chrome_client_hints(&default_user_agent);
     if let Ok(parsed_url) = url::Url::parse(&url) {
         if let Err(e) = validate_fetch_url(&parsed_url, allow_private_network) {
             return Ok(serde_json::json!({
@@ -2386,12 +2413,22 @@ async fn op_fetch_url(
         origin.clone()
     };
     let is_cross_origin = !page_origin.is_empty() && initial_request_origin != page_origin;
-    let credentials = FetchCredentials::parse(&credentials);
-
     let req_method: reqwest::Method = method.parse().unwrap_or(reqwest::Method::GET);
 
-    let custom_headers: std::collections::HashMap<String, String> =
+    let mut custom_headers: std::collections::HashMap<String, String> =
         override_headers.unwrap_or_else(|| serde_json::from_str(&headers_json).unwrap_or_default());
+    // Keep the internal iframe-navigation marker inside the existing header
+    // argument. op2 supports nine parameters including OpState, so adding a
+    // tenth native parameter would break every runtime binding.
+    let frame_navigation = custom_headers
+        .remove("__obscura-frame-navigation")
+        .as_deref()
+        == Some("1");
+    let credentials = if frame_navigation {
+        FetchCredentials::Include
+    } else {
+        FetchCredentials::parse(&credentials)
+    };
 
     // Passive request observation (non-blocking). Fires for every request that
     // reaches the network (Fulfill/Fail from the interception channel short-
@@ -2488,6 +2525,7 @@ async fn op_fetch_url(
                 document_url.clone(),
                 callbacks.clone(),
                 allow_private_network,
+                frame_navigation,
             )
             .await;
         }
@@ -2509,8 +2547,11 @@ async fn op_fetch_url(
         let current_is_cross_origin = request_origin(&current_url)
             .map(|request_origin| request_origin != page_origin)
             .unwrap_or(false);
-        if current_is_cross_origin {
+        if current_is_cross_origin && !frame_navigation {
             req = req.header("Origin", &page_origin);
+        }
+        if !frame_navigation {
+            req = req.header("Sec-Fetch-Storage-Access", "active");
         }
 
         let credentials_allowed = credentials.allows(&page_origin, &current_url);
@@ -2525,17 +2566,55 @@ async fn op_fetch_url(
             }
         }
 
-        // Send a default User-Agent on fetch()/XHR requests (the navigation path
-        // sets one, but this op did not, so scripted requests went out with no UA
-        // and UA-gated servers rejected them). Honor an explicit override.
+        // Navigation and scripted requests must use the same context identity.
+        // Honor an explicit page header, otherwise reuse the profile UA already
+        // stored by BrowserContext. A hard-coded fallback would contradict the
+        // selected navigator on every non-stealth fetch.
         if !custom_headers
             .keys()
             .any(|k| k.eq_ignore_ascii_case("user-agent"))
+            && !default_user_agent.is_empty()
         {
-            req = req.header(
-                "User-Agent",
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36",
-            );
+            req = req.header("User-Agent", default_user_agent.as_str());
+        }
+        if !custom_headers
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("sec-ch-ua"))
+            && !default_sec_ch_ua.is_empty()
+        {
+            req = req.header("Sec-CH-UA", default_sec_ch_ua.as_str());
+        }
+        if !custom_headers
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("sec-ch-ua-mobile"))
+        {
+            req = req.header("Sec-CH-UA-Mobile", "?0");
+        }
+        if !custom_headers
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case("sec-ch-ua-platform"))
+            && !default_sec_ch_ua_platform.is_empty()
+        {
+            req = req.header("Sec-CH-UA-Platform", default_sec_ch_ua_platform.as_str());
+        }
+
+        if frame_navigation {
+            req = req
+                .header(
+                    "Accept",
+                    "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+                )
+                .header("Sec-Fetch-Dest", "iframe")
+                .header("Sec-Fetch-Mode", "navigate")
+                .header(
+                    "Sec-Fetch-Site",
+                    if current_is_cross_origin {
+                        "cross-site"
+                    } else {
+                        "same-origin"
+                    },
+                )
+                .header("Upgrade-Insecure-Requests", "1");
         }
 
         for (k, v) in &custom_headers {
@@ -2658,7 +2737,7 @@ async fn op_fetch_url(
             return Ok(serde_json::json!({
                 "status": 0,
                 "body": "",
-                "url": url,
+                "url": current_url,
                 "headers": {},
                 "corsBlocked": true,
                 "corsError": if credentials == FetchCredentials::Include {
@@ -2682,7 +2761,7 @@ async fn op_fetch_url(
     let resp_body_base64 = BASE64.encode(&resp_bytes);
     if let Some(ref cbs) = callbacks {
         if cbs.has_response_callbacks().await {
-            let resp = fetch_response(&url, status, resp_headers.clone(), resp_bytes.to_vec());
+            let resp = fetch_response(&current_url, status, resp_headers.clone(), resp_bytes.to_vec());
             let info = RequestInfo {
                 url: resp.url.clone(),
                 method: method.clone(),
@@ -2694,7 +2773,7 @@ async fn op_fetch_url(
     }
     let response_request_id = record_scripted_request(
         &state,
-        &url,
+        &current_url,
         &method,
         status,
         &resp_headers,
@@ -2705,7 +2784,7 @@ async fn op_fetch_url(
     tracing::debug!(
         "op_fetch_url completed: {} {} ({} bytes)",
         method,
-        url,
+        current_url,
         resp_body.len()
     );
 
@@ -2714,7 +2793,7 @@ async fn op_fetch_url(
         "body": resp_body,
         "bodyBase64": resp_body_base64,
         "requestId": response_request_id,
-        "url": url,
+        "url": current_url,
         "headers": resp_headers,
     })
     .to_string())
@@ -2757,6 +2836,7 @@ async fn stealth_fetch_all(
     document_url: String,
     callbacks: Option<Arc<CallbackRegistry>>,
     allow_private_network: bool,
+    frame_navigation: bool,
 ) -> Result<String, deno_error::JsErrorBox> {
     let mut current_url = url.clone();
     let mut current_method = method;
@@ -2779,16 +2859,34 @@ async fn stealth_fetch_all(
         let fetch_mode = if mode.is_empty() { "cors" } else { mode.as_str() };
         req_headers.insert(
             "accept".to_string(),
-            custom_headers
-                .get("accept")
-                .cloned()
-                .unwrap_or_else(|| "*/*".to_string()),
+            if frame_navigation {
+                "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7".to_string()
+            } else {
+                custom_headers
+                    .get("accept")
+                    .cloned()
+                    .unwrap_or_else(|| "*/*".to_string())
+            },
         );
         req_headers.insert(
             "sec-fetch-dest".to_string(),
-            if fetch_mode == "no-cors" { "script" } else { "empty" }.to_string(),
+            if frame_navigation {
+                "iframe"
+            } else if fetch_mode == "no-cors" {
+                "script"
+            } else {
+                "empty"
+            }
+            .to_string(),
         );
-        req_headers.insert("sec-fetch-mode".to_string(), fetch_mode.to_string());
+        req_headers.insert(
+            "sec-fetch-mode".to_string(),
+            if frame_navigation {
+                "navigate".to_string()
+            } else {
+                fetch_mode.to_string()
+            },
+        );
         req_headers.insert(
             "sec-fetch-site".to_string(),
             if current_is_cross_origin {
@@ -2798,10 +2896,17 @@ async fn stealth_fetch_all(
             }
             .to_string(),
         );
-        if (!current_is_cross_origin && current_method != "GET" && current_method != "HEAD")
-            || current_is_cross_origin
+        if !frame_navigation {
+            req_headers.insert("sec-fetch-storage-access".to_string(), "active".to_string());
+        }
+        if !frame_navigation
+            && ((!current_is_cross_origin && current_method != "GET" && current_method != "HEAD")
+                || current_is_cross_origin)
         {
             req_headers.insert("origin".to_string(), page_origin.clone());
+        }
+        if frame_navigation {
+            req_headers.insert("upgrade-insecure-requests".to_string(), "1".to_string());
         }
         for (k, v) in &custom_headers {
             req_headers.insert(k.to_lowercase(), v.clone());
@@ -2885,7 +2990,7 @@ async fn stealth_fetch_all(
             .unwrap_or("");
         if !cors_response_allows(credentials, &page_origin, allowed, allow_credentials) {
             return Ok(serde_json::json!({
-                "status": 0, "body": "", "url": url, "headers": {},
+                "status": 0, "body": "", "url": current_url, "headers": {},
                 "corsBlocked": true,
                 "corsError": if credentials == FetchCredentials::Include {
                     format!(
@@ -2907,7 +3012,7 @@ async fn stealth_fetch_all(
     let resp_body_base64 = BASE64.encode(&resp_bytes);
     if let Some(ref cbs) = callbacks {
         if cbs.has_response_callbacks().await {
-            let resp = fetch_response(&url, status, resp_headers.clone(), resp_bytes.clone());
+            let resp = fetch_response(&current_url, status, resp_headers.clone(), resp_bytes.clone());
             let info = RequestInfo {
                 url: resp.url.clone(),
                 method: current_method.clone(),
@@ -2920,7 +3025,7 @@ async fn stealth_fetch_all(
 
     let request_id = record_scripted_request(
         &state,
-        &url,
+        &current_url,
         &current_method,
         status,
         &resp_headers,
@@ -2933,7 +3038,7 @@ async fn stealth_fetch_all(
         "body": resp_body,
         "bodyBase64": resp_body_base64,
         "requestId": request_id,
-        "url": url,
+        "url": current_url,
         "headers": resp_headers,
     })
     .to_string())
@@ -3605,6 +3710,7 @@ fn op_frame_document_ready(
     #[string] html: &str,
     #[number] viewport_width: u64,
     #[number] viewport_height: u64,
+    #[number] owner_nid: u64,
 ) -> u32 {
     // Whoever called this is the new frame's parent, which is how a frame
     // nested two deep gets `parent` pointing at the frame above it rather than
@@ -3631,6 +3737,7 @@ fn op_frame_document_ready(
     gs.pending_frame_bytes = gs.pending_frame_bytes.saturating_add(bytes);
     gs.pending_frames.push(PendingFrame {
         frame_id,
+        owner_nid: owner_nid.min(u32::MAX as u64) as u32,
         url: url.to_string(),
         html: html.to_string(),
         viewport_width,
@@ -3638,6 +3745,36 @@ fn op_frame_document_ready(
         parent_frame_id,
     });
     frame_id
+}
+
+/// Updates a provisional about:blank frame with markup written before the host
+/// has attached its real realm. The queue stays bounded by the same byte cap as
+/// frame navigation, so document.write cannot grow native state without limit.
+#[op2(fast)]
+fn op_frame_document_write(
+    state: &OpState,
+    #[number] frame_id: u64,
+    #[string] html: &str,
+) -> bool {
+    let gs = state.borrow::<SharedState>().clone();
+    let mut gs = gs.borrow_mut();
+    let Some(index) = gs
+        .pending_frames
+        .iter()
+        .position(|frame| u64::from(frame.frame_id) == frame_id)
+    else {
+        return false;
+    };
+    let frame = &gs.pending_frames[index];
+    let old_bytes = frame.url.len().saturating_add(frame.html.len());
+    let new_bytes = frame.url.len().saturating_add(html.len());
+    let total_without_frame = gs.pending_frame_bytes.saturating_sub(old_bytes);
+    if total_without_frame.saturating_add(new_bytes) > MAX_PENDING_FRAME_BYTES {
+        return false;
+    }
+    gs.pending_frames[index].html = html.to_string();
+    gs.pending_frame_bytes = total_without_frame.saturating_add(new_bytes);
+    true
 }
 
 /// Whether async host work can be scheduled without aborting the isolate.
@@ -3669,8 +3806,11 @@ async fn op_posted_task() {
 fn op_binding_called(state: &OpState, #[string] name: &str, #[string] payload: &str) {
     let gs = state.borrow::<SharedState>().clone();
     let mut gs = gs.borrow_mut();
-    gs.pending_binding_calls
-        .push((name.to_string(), payload.to_string()));
+    const MAX_PENDING_BINDING_CALLS: usize = 4096;
+    if gs.pending_binding_calls.len() < MAX_PENDING_BINDING_CALLS {
+        gs.pending_binding_calls
+            .push((name.to_string(), payload.to_string()));
+    }
 }
 
 /// Real WebCrypto `crypto.subtle.digest`. `algorithm` is the SubtleCrypto
@@ -4461,6 +4601,7 @@ pub fn build_extension() -> Extension {
         op_set_cookie(),
         op_navigate(),
         op_frame_document_ready(),
+        op_frame_document_write(),
         op_post_frame_message(),
         op_sleep(),
         op_async_runtime_available(),
@@ -5001,8 +5142,13 @@ fn cached_image_metadata_for_node(gs: &ObscuraState, node_id: NodeId) -> String 
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-fn op_image_metadata(state: &OpState, nid: u32, _cached_only: bool) -> String {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_image_metadata(
+    scope: &mut v8::HandleScope,
+    state: &OpState,
+    nid: u32,
+    _cached_only: bool,
+) -> String {
+    let shared = realm_state(scope, state);
     let gs = shared.borrow();
     let node_id = NodeId::new(nid);
     let is_image = gs.dom.as_ref().is_some_and(|dom| {
@@ -5092,10 +5238,17 @@ fn finish_async_image_metadata(
 #[cfg(feature = "render")]
 #[op2(async)]
 #[string]
-async fn op_load_image_metadata(state: Rc<RefCell<OpState>>, nid: u32) -> String {
+async fn op_load_image_metadata(
+    state: Rc<RefCell<OpState>>,
+    nid: u32,
+    frame_id: u32,
+) -> String {
     let shared = {
-        let state = state.borrow();
-        state.borrow::<SharedState>().clone()
+        let op_state = state.borrow();
+        let Some(shared) = state_for_frame(&op_state, frame_id) else {
+            return serde_json::json!({ "state": "stale", "currentSrc": "" }).to_string();
+        };
+        shared
     };
     let node_id = NodeId::new(nid);
     let (
@@ -5340,8 +5493,12 @@ fn clamp_scroll_offset_for_consumer(
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-fn op_layout_geometry(state: &OpState, #[string] nid_str: String) -> String {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_layout_geometry(
+    scope: &mut v8::HandleScope,
+    state: &OpState,
+    #[string] nid_str: String,
+) -> String {
+    let shared = realm_state(scope, state);
     let nid: u32 = nid_str.parse().unwrap_or(0);
     let nid = obscura_dom::tree::NodeId::new(nid);
     let mut gs = shared.borrow_mut();
@@ -5402,13 +5559,17 @@ fn op_layout_geometry(state: &OpState, #[string] nid_str: String) -> String {
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-fn op_resize_observer_measurements(state: &OpState, #[string] nids_json: String) -> String {
+fn op_resize_observer_measurements(
+    scope: &mut v8::HandleScope,
+    state: &OpState,
+    #[string] nids_json: String,
+) -> String {
     let nids = serde_json::from_str::<Vec<u32>>(&nids_json).unwrap_or_default();
     if nids.is_empty() {
         return "[]".to_string();
     }
 
-    let shared = state.borrow::<SharedState>().clone();
+    let shared = realm_state(scope, state);
     let mut gs = shared.borrow_mut();
     sample_live_document_animations(&mut gs);
     if ensure_resolved_scroll_for_geometry(&mut gs).is_none() {
@@ -5468,6 +5629,7 @@ fn op_resize_observer_measurements(state: &OpState, #[string] nids_json: String)
 #[op2]
 #[string]
 fn op_intersection_observer_measurements(
+    scope: &mut v8::HandleScope,
     state: &OpState,
     #[string] nids_json: String,
 ) -> String {
@@ -5476,7 +5638,7 @@ fn op_intersection_observer_measurements(
         return "[]".to_string();
     }
 
-    let shared = state.borrow::<SharedState>().clone();
+    let shared = realm_state(scope, state);
     let mut gs = shared.borrow_mut();
     sample_live_document_animations(&mut gs);
     if ensure_resolved_scroll_for_geometry(&mut gs).is_none() {
@@ -5526,8 +5688,12 @@ fn op_intersection_observer_measurements(
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-fn op_computed_style(state: &OpState, #[string] nid_str: String) -> String {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_computed_style(
+    scope: &mut v8::HandleScope,
+    state: &OpState,
+    #[string] nid_str: String,
+) -> String {
+    let shared = realm_state(scope, state);
     let nid: u32 = nid_str.parse().unwrap_or(0);
     let nid = obscura_dom::tree::NodeId::new(nid);
     let mut gs = shared.borrow_mut();
@@ -5564,8 +5730,8 @@ fn op_css_supports(#[string] name: &str, #[string] value: &str) -> bool {
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-fn op_layout_metrics(state: &OpState) -> String {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_layout_metrics(scope: &mut v8::HandleScope, state: &OpState) -> String {
+    let shared = realm_state(scope, state);
     let mut gs = shared.borrow_mut();
     sample_live_document_animations(&mut gs);
     let viewport = gs.viewport;
@@ -5581,8 +5747,12 @@ fn op_layout_metrics(state: &OpState) -> String {
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-fn op_element_scroll_metrics(state: &OpState, #[string] nid_str: String) -> String {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_element_scroll_metrics(
+    scope: &mut v8::HandleScope,
+    state: &OpState,
+    #[string] nid_str: String,
+) -> String {
+    let shared = realm_state(scope, state);
     let nid = NodeId::new(nid_str.parse().unwrap_or(0));
     let mut gs = shared.borrow_mut();
     sample_live_document_animations(&mut gs);
@@ -5618,8 +5788,14 @@ fn op_element_scroll_metrics(state: &OpState, #[string] nid_str: String) -> Stri
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-fn op_element_scroll_to(state: &OpState, #[string] nid_str: String, x: f64, y: f64) -> String {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_element_scroll_to(
+    scope: &mut v8::HandleScope,
+    state: &OpState,
+    #[string] nid_str: String,
+    x: f64,
+    y: f64,
+) -> String {
+    let shared = realm_state(scope, state);
     let nid = NodeId::new(nid_str.parse().unwrap_or(0));
     let mut gs = shared.borrow_mut();
     sample_live_document_animations(&mut gs);
@@ -5662,8 +5838,8 @@ fn op_element_scroll_to(state: &OpState, #[string] nid_str: String, x: f64, y: f
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-fn op_scroll_offset(state: &OpState) -> String {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_scroll_offset(scope: &mut v8::HandleScope, state: &OpState) -> String {
+    let shared = realm_state(scope, state);
     let mut gs = shared.borrow_mut();
     sample_live_document_animations(&mut gs);
     let requested = gs.scroll_offset;
@@ -5674,8 +5850,8 @@ fn op_scroll_offset(state: &OpState) -> String {
 #[cfg(feature = "render")]
 #[op2]
 #[string]
-fn op_scroll_to(state: &OpState, x: f64, y: f64) -> String {
-    let shared = state.borrow::<SharedState>().clone();
+fn op_scroll_to(scope: &mut v8::HandleScope, state: &OpState, x: f64, y: f64) -> String {
+    let shared = realm_state(scope, state);
     let mut gs = shared.borrow_mut();
     sample_live_document_animations(&mut gs);
     let (x, y) = clamp_scroll_offset_for_geometry(&mut gs, (x as f32, y as f32));

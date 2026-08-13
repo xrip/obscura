@@ -993,7 +993,7 @@ fn response_cache_lifetime(response: &Response) -> Option<Duration> {
 /// default UA is now empty until a profile supplies one, and inventing hints for
 /// a version nobody selected is exactly the contradiction this function exists
 /// to avoid. No UA means no hints.
-pub(crate) fn chrome_client_hints(ua: &str) -> (String, String) {
+pub fn chrome_client_hints(ua: &str) -> (String, String) {
     let Some(major) = ua
         .split("Chrome/")
         .nth(1)

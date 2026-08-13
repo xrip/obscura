@@ -68,6 +68,8 @@
     '__obscura_screen_w', '__obscura_screen_h', '__obscura_screen_emulated',
     '__obscura_viewport_w', '__obscura_viewport_h',
     '__obscura_click_target', '__obscura_mouse_down', '__obscura_focused',
+    '__obscura_forget_frame',
+    '__obscura_inputScreenX', '__obscura_inputScreenY',
     '__obscura_geo_lat', '__obscura_geo_lon',
     '__obscura_await_meta', '__obscura_await_rejected',
     '__obscura_css', '__obscura_clone_hooks', '__obscura_fingerprint_profile',

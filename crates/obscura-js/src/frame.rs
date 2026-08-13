@@ -22,6 +22,7 @@
 //! their parent, the way `iframe.contentWindow.document` does in a browser. A
 //! second isolate could never do that.
 
+use std::cell::Cell;
 use std::rc::Rc;
 
 use obscura_dom::parse_html;
@@ -37,8 +38,12 @@ pub struct FrameRealm {
     realms: Rc<std::cell::RefCell<RealmStates>>,
     frame_id: u32,
     parent_frame_id: u32,
+    owner_nid: u32,
     url: String,
     origin: String,
+    screen_position: Cell<Option<(f64, f64)>>,
+    input_screen_origin: Cell<Option<(f64, f64)>>,
+    viewport_sync_pending: Cell<bool>,
 }
 
 impl Drop for FrameRealm {
@@ -60,6 +65,33 @@ impl FrameRealm {
         url: &str,
         html: &str,
     ) -> Option<Self> {
+        Self::new_with_owner(parent, frame_id, parent_frame_id, 0, url, html)
+    }
+
+    /// Builds a frame realm and keeps only the owner's node id, not the owner
+    /// DOM node. The host needs the id when a child browsing context navigates
+    /// itself and must measure the same iframe again.
+    pub fn new_with_owner(
+        parent: &mut ObscuraJsRuntime,
+        frame_id: u32,
+        parent_frame_id: u32,
+        owner_nid: u32,
+        url: &str,
+        html: &str,
+    ) -> Option<Self> {
+        let realms = parent.realm_states();
+        let parent_context = realms
+            .borrow()
+            .context_by_frame_id(parent_frame_id);
+        let parent_origin = if parent_frame_id == 0 {
+            parent.page_origin()
+        } else {
+            realms
+                .borrow()
+                .by_frame_id(parent_frame_id)
+                .map(|state| origin_of(&state.borrow().url))
+                .unwrap_or_else(|| parent.page_origin())
+        };
         let context = parent.create_realm_context()?;
         if !parent.share_ops_with_realm(&context) {
             return None;
@@ -71,10 +103,21 @@ impl FrameRealm {
         // keeps its own security token, so V8 answers `undefined` for any
         // property the page tries to read out of it, and nothing about it is
         // published below.
-        let origin = origin_of(url);
-        let same_origin = origin != "null" && origin == parent.page_origin();
+        // An about:blank document inherits the creator's origin. This is the
+        // default document of every newly inserted iframe, so it must remain
+        // reachable by its parent until it navigates elsewhere.
+        let origin = if matches!(url, "about:blank" | "about:srcdoc") {
+            parent_origin.clone()
+        } else {
+            origin_of(url)
+        };
+        let same_origin = origin != "null" && origin == parent_origin;
         if same_origin {
-            parent.share_security_token_with_realm(&context);
+            if let Some(parent_context) = parent_context.as_ref() {
+                parent.share_security_token_from_realm(parent_context, &context);
+            } else {
+                parent.share_security_token_with_realm(&context);
+            }
         }
 
         let mut state = ObscuraState::new();
@@ -83,7 +126,6 @@ impl FrameRealm {
         state.frame_id = frame_id;
         parent.share_resources_with(&mut state);
 
-        let realms = parent.realm_states();
         realms.borrow_mut().register(
             context.clone(),
             frame_id,
@@ -95,8 +137,12 @@ impl FrameRealm {
             realms,
             frame_id,
             parent_frame_id,
+            owner_nid,
             url: url.to_string(),
             origin,
+            screen_position: Cell::new(None),
+            input_screen_origin: Cell::new(None),
+            viewport_sync_pending: Cell::new(false),
         };
         // Both ids before init, not after: init is what installs `parent` and
         // `top`, and a document that runs even one script believing it is
@@ -115,7 +161,11 @@ impl FrameRealm {
         // Only after init, so the document the page reaches through
         // `contentDocument` is the initialized one.
         if same_origin {
-            parent.publish_realm_objects(&realm.context, frame_id);
+            if let Some(parent_context) = parent_context.as_ref() {
+                parent.publish_realm_objects_in_context(parent_context, &realm.context, frame_id);
+            } else {
+                parent.publish_realm_objects(&realm.context, frame_id);
+            }
         }
         Some(realm)
     }
@@ -173,6 +223,28 @@ impl FrameRealm {
         self.frame_id
     }
 
+    pub fn viewport(&self) -> Option<(f64, f64)> {
+        self.realms
+            .borrow()
+            .by_frame_id(self.frame_id)
+            .map(|state| {
+                let state = state.borrow();
+                (state.viewport.0 as f64, state.viewport.1 as f64)
+            })
+    }
+
+    pub fn mark_viewport_sync_pending(&self) {
+        self.viewport_sync_pending.set(true);
+    }
+
+    pub fn viewport_sync_pending(&self) -> bool {
+        self.viewport_sync_pending.get()
+    }
+
+    pub fn mark_viewport_sync_complete(&self) {
+        self.viewport_sync_pending.set(false);
+    }
+
     /// Sets the frame document's viewport before any of its scripts run.
     pub fn set_viewport(
         &self,
@@ -190,10 +262,39 @@ impl FrameRealm {
         } else {
             150.0
         };
+        #[cfg(feature = "render")]
+        if let Some(state) = self.realms.borrow().by_frame_id(self.frame_id) {
+            let mut state = state.borrow_mut();
+            let viewport = (width as f32, height as f32);
+            if state.viewport != viewport {
+                state.viewport = viewport;
+                state.prepared_render = None;
+                state.pending_style_mutations.clear();
+                state.resolved_scroll = None;
+            }
+        }
+        // A child window keeps the containing browser's chrome inset, but its
+        // own outer dimensions are based on the child viewport. Reporting the
+        // parent's full outer window here exposes the top-level screen shape
+        // inside every iframe, unlike Chrome.
+        let parent_outer_height = parent
+            .evaluate("Number(outerHeight)")
+            .ok()
+            .and_then(|value| value.as_f64())
+            .unwrap_or(height);
+        let parent_inner_height = parent
+            .evaluate("Number(innerHeight)")
+            .ok()
+            .and_then(|value| value.as_f64())
+            .unwrap_or(height);
+        let chrome_height = (parent_outer_height - parent_inner_height).max(0.0);
+        let child_outer_width = width.max(1.0);
+        let child_outer_height = (height + chrome_height).max(height);
         self.execute_script(
             parent,
             &format!(
                 "globalThis.innerWidth={width};globalThis.innerHeight={height};\
+                 globalThis.outerWidth={child_outer_width};globalThis.outerHeight={child_outer_height};\
                  if(typeof globalThis.__obscura_set_visual_viewport_size==='function'){{\
                    globalThis.__obscura_set_visual_viewport_size({width},{height});\
                  }}else if(globalThis.visualViewport){{\
@@ -201,11 +302,96 @@ impl FrameRealm {
                    globalThis.visualViewport.height={height};\
                  }}"
             ),
-        )
+        )?;
+
+        // Keep the parent-side cross-origin contentWindow shim in step with
+        // the real child realm. The shim is what parent JavaScript can see.
+        let sync_window = format!(
+            "if(globalThis.__obscura_frameWindows && \
+                 globalThis.__obscura_frameWindows[{frame_id}]){{\
+               const w=globalThis.__obscura_frameWindows[{frame_id}];\
+               w.innerWidth={width};w.innerHeight={height};\
+               w.outerWidth={child_outer_width};w.outerHeight={child_outer_height};\
+             }}"
+            , frame_id = self.frame_id
+        );
+        if self.parent_frame_id == 0 {
+            parent.execute_script("sync iframe window metrics", &sync_window)
+        } else if let Some(context) = self
+            .realms
+            .borrow()
+            .context_by_frame_id(self.parent_frame_id)
+        {
+            parent.eval_in_realm(&context, &sync_window).map(|_| ())
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Set the child browsing context's screen position from its embedding
+    /// box. Input events in a real iframe use this screen origin.
+    pub fn set_screen_position(&self, parent: &mut ObscuraJsRuntime, x: f64, y: f64) -> bool {
+        if !x.is_finite() || !y.is_finite() || self.screen_position.get() == Some((x, y)) {
+            return false;
+        }
+        if self
+            .execute_script(
+                parent,
+                &format!(
+                    "globalThis.screenX={x};globalThis.screenY={y};\
+                     globalThis.screenLeft={x};globalThis.screenTop={y};"
+                ),
+            )
+            .is_err()
+        {
+            return false;
+        }
+        self.screen_position.set(Some((x, y)));
+        true
+    }
+
+    /// Set the absolute screen origin of the frame's viewport for input
+    /// events. This is separate from window.screenX/screenY: a child window
+    /// reports the containing browser window origin, while event screen
+    /// coordinates include the iframe's embedding offset.
+    pub fn set_input_screen_origin(
+        &self,
+        parent: &mut ObscuraJsRuntime,
+        x: f64,
+        y: f64,
+    ) -> bool {
+        if !x.is_finite() || !y.is_finite() || self.input_screen_origin.get() == Some((x, y)) {
+            return false;
+        }
+        if self
+            .execute_script(
+                parent,
+                &format!(
+                    "Object.defineProperty(globalThis,'__obscura_inputScreenX',{{value:{x},writable:true,configurable:true}});\
+                     Object.defineProperty(globalThis,'__obscura_inputScreenY',{{value:{y},writable:true,configurable:true}});"
+                ),
+            )
+            .is_err()
+        {
+            return false;
+        }
+        self.input_screen_origin.set(Some((x, y)));
+        true
     }
 
     pub fn parent_frame_id(&self) -> u32 {
         self.parent_frame_id
+    }
+
+    pub fn owner_nid(&self) -> u32 {
+        self.owner_nid
+    }
+
+    pub fn take_pending_navigation(&self) -> Option<(String, String, String)> {
+        self.realms
+            .borrow()
+            .by_frame_id(self.frame_id)
+            .and_then(|state| state.borrow_mut().pending_navigation.take())
     }
 
     pub fn url(&self) -> &str {
@@ -452,6 +638,139 @@ mod tests {
     }
 
     #[test]
+    fn nested_same_origin_frame_is_published_into_its_parent_realm() {
+        let mut parent = page(
+            "https://parent.example/page",
+            "<html><body><iframe></iframe></body></html>",
+        );
+        let outer = FrameRealm::new(
+            &mut parent,
+            1,
+            0,
+            "https://parent.example/outer",
+            "<html><body><iframe></iframe></body></html>",
+        )
+        .expect("outer frame realm");
+        let nested = FrameRealm::new(
+            &mut parent,
+            2,
+            1,
+            "about:blank",
+            "<html><body><p>Nested</p></body></html>",
+        )
+        .expect("nested frame realm");
+
+        assert_eq!(nested.origin(), "https://parent.example");
+        assert_eq!(
+            outer
+                .evaluate(
+                    &mut parent,
+                    "Boolean(globalThis.__obscura_frameObjects[2].document)"
+                )
+                .unwrap(),
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            outer
+                .evaluate(
+                    &mut parent,
+                    "globalThis.__obscura_frameObjects[2].document.querySelector('p').textContent"
+                )
+                .unwrap(),
+            serde_json::json!("Nested")
+        );
+    }
+
+    #[test]
+    fn iframe_document_inner_html_updates_its_pending_document() {
+        let mut parent = page(
+            "https://parent.example/page",
+            "<html><body></body></html>",
+        );
+        parent
+            .execute_script(
+                "iframe document write",
+                "(function(){const f=document.createElement('iframe');document.body.appendChild(f);f.contentDocument.body.innerHTML='<p>Nested</p>';})()",
+            )
+            .unwrap();
+
+        let pending = parent.take_pending_frames();
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].html.contains("<p>Nested</p>"));
+    }
+
+    #[test]
+    fn nested_iframe_document_inner_html_updates_its_pending_document() {
+        let mut parent = page(
+            "https://parent.example/page",
+            "<html><body></body></html>",
+        );
+        let outer = FrameRealm::new(
+            &mut parent,
+            1,
+            0,
+            "https://parent.example/outer",
+            "<html><body></body></html>",
+        )
+        .expect("outer frame realm");
+        outer
+            .execute_script(
+                &mut parent,
+                "(function(){const f=document.createElement('iframe');document.body.appendChild(f);f.contentDocument.body.innerHTML='<p>Nested</p>';})()",
+            )
+            .unwrap();
+
+        let pending = parent.take_pending_frames();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].parent_frame_id, 1);
+        assert!(pending[0].html.contains("<p>Nested</p>"));
+    }
+
+    #[test]
+    fn iframe_srcdoc_starts_a_pending_document() {
+        let mut parent = page(
+            "https://parent.example/page",
+            "<html><body></body></html>",
+        );
+        parent
+            .execute_script(
+                "iframe srcdoc",
+                "(function(){const f=document.createElement('iframe');f.srcdoc='<p>Srcdoc</p>';document.body.appendChild(f);})()",
+            )
+            .unwrap();
+
+        let pending = parent.take_pending_frames();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].url, "about:srcdoc");
+        assert!(pending[0].html.contains("<p>Srcdoc</p>"));
+    }
+
+    #[test]
+    fn srcdoc_html_without_body_keeps_head_scripts_visible() {
+        let mut parent = page("https://parent.example/page", "<html><body></body></html>");
+        let frame = FrameRealm::new(
+            &mut parent,
+            1,
+            0,
+            "about:srcdoc",
+            r#"<html><meta http-equiv="content-security-policy" content="script-src 'unsafe-inline'"><script>globalThis.srcdocRan = true;</script></html>"#,
+        )
+        .expect("srcdoc frame realm");
+
+        let problems = frame.run_document_scripts(&mut parent, |_| None);
+        assert!(problems.is_empty(), "unexpected problems: {problems:?}");
+        assert_eq!(
+            frame
+                .evaluate(
+                    &mut parent,
+                    "[document.querySelectorAll('script').length, globalThis.srcdocRan === true]",
+                )
+                .unwrap(),
+            serde_json::json!([1, true])
+        );
+    }
+
+    #[test]
     fn a_new_frame_starts_loading_until_load_events() {
         let mut parent = page("https://parent.example/", "<html><body></body></html>");
         let frame = FrameRealm::new(
@@ -540,6 +859,38 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "render")]
+    #[test]
+    fn frame_shadow_elements_have_layout_geometry() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let frame = FrameRealm::new(
+            &mut parent,
+            1,
+            0,
+            "https://child.example/frame",
+            "<html><body></body></html>",
+        )
+        .expect("frame realm");
+        frame.set_viewport(&mut parent, 300.0, 65.0).unwrap();
+
+        let result = frame
+            .evaluate(
+                &mut parent,
+                r#"(() => {
+                    const root = document.body.attachShadow({ mode: 'closed' });
+                    root.innerHTML = '<style>div { width: 100px; height: 20px }</style><div id="inside"></div>';
+                    const inside = root.querySelector('#inside');
+                    const rect = inside.getBoundingClientRect();
+                    const metrics = JSON.parse(Deno.core.ops.op_layout_metrics());
+                    return [innerWidth, metrics.clientWidth, metrics.clientHeight,
+                        root.childNodes.length, rect.width, rect.height,
+                        document.elementFromPoint(10, 10) === document.body];
+                })()"#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([300, 300, 65, 2, 100, 20, true]));
+    }
+
     #[test]
     fn frame_uses_its_embedding_viewport() {
         let mut parent = page(
@@ -555,15 +906,107 @@ mod tests {
         )
         .expect("frame realm");
 
+        parent
+            .execute_script(
+                "install iframe window test shim",
+                "__obscura_frameWindows[1]={innerWidth:300,innerHeight:150,outerWidth:300,outerHeight:150};",
+            )
+            .unwrap();
         frame.set_viewport(&mut parent, 300.0, 65.0).unwrap();
+        let parent_metrics = parent
+            .evaluate("[innerWidth,innerHeight,outerWidth,outerHeight]")
+            .unwrap();
+        let parent_inner_height = parent_metrics[1].as_f64().unwrap();
+        let parent_outer_height = parent_metrics[3].as_f64().unwrap();
+        let child_outer_height = 65.0 + (parent_outer_height - parent_inner_height).max(0.0);
+        let parent_window = parent
+            .evaluate(
+                "[__obscura_frameWindows[1].innerWidth,\
+                 __obscura_frameWindows[1].innerHeight,\
+                 __obscura_frameWindows[1].outerWidth,\
+                 __obscura_frameWindows[1].outerHeight]",
+            )
+            .unwrap();
+        let child_viewport = frame
+            .evaluate(
+                &mut parent,
+                "[innerWidth,innerHeight,outerWidth,outerHeight,visualViewport.width,visualViewport.height]",
+            )
+            .unwrap();
         assert_eq!(
-            frame
-                .evaluate(
-                    &mut parent,
-                    "[innerWidth,innerHeight,visualViewport.width,visualViewport.height]",
-                )
-                .unwrap(),
-            serde_json::json!([300, 65, 300, 65]),
+            child_viewport,
+            serde_json::json!([300, 65, 300, child_outer_height as u64, 300, 65]),
+        );
+        assert_eq!(
+            parent_window,
+            serde_json::json!([300, 65, 300, child_outer_height as u64]),
+        );
+    }
+
+    #[test]
+    fn dynamic_inner_html_starts_iframe_navigation() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let frame = FrameRealm::new(
+            &mut parent,
+            1,
+            0,
+            "https://child.example/frame",
+            "<html><body></body></html>",
+        )
+        .expect("frame realm");
+
+        let state = frame
+            .evaluate(
+                &mut parent,
+                r#"(function() {
+                    const oldFetch = globalThis.fetch;
+                    globalThis.fetch = () => Promise.resolve({ ok: false, type: 'basic' });
+                    const shadow = document.body.attachShadow({ mode: 'open' });
+                    shadow.innerHTML = '<iframe></iframe>';
+                    const iframe = shadow.querySelector('iframe');
+                    globalThis.fetch = oldFetch;
+                    return [iframe.src, iframe._iframeLoadingUrl, iframe._frameId];
+                })()"#,
+            )
+            .unwrap();
+
+        assert_eq!(
+            state,
+            serde_json::json!(["", "about:blank", 1])
+        );
+    }
+
+    #[test]
+    fn iframe_window_location_starts_navigation() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let frame = FrameRealm::new(
+            &mut parent,
+            1,
+            0,
+            "https://child.example/frame",
+            "<html><body></body></html>",
+        )
+        .expect("frame realm");
+
+        let state = frame
+            .evaluate(
+                &mut parent,
+                r#"(function() {
+                    const oldFetch = globalThis.fetch;
+                    globalThis.fetch = () => Promise.resolve({ ok: false, type: 'basic' });
+                    const iframe = document.createElement('iframe');
+                    document.body.appendChild(iframe);
+                    iframe.contentWindow.location.replace('https://nested.example/challenge');
+                    const result = [iframe._frameId, iframe._iframeLoadingUrl];
+                    globalThis.fetch = oldFetch;
+                    return result;
+                })()"#,
+            )
+            .unwrap();
+
+        assert_eq!(
+            state,
+            serde_json::json!([0, "https://nested.example/challenge"])
         );
     }
 
@@ -884,6 +1327,33 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_frames_rejected_promise_does_not_crash_the_isolate() {
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let frame = FrameRealm::new(
+            &mut parent,
+            2,
+            1,
+            "https://child.example/",
+            "<html><body></body></html>",
+        )
+        .expect("frame realm");
+
+        frame
+            .execute_script(
+                &mut parent,
+                "Promise.reject(new Error('child rejection'));",
+            )
+            .unwrap();
+
+        let error = parent
+            .run_event_loop_bounded(100)
+            .await
+            .expect_err("an unhandled rejection must still be reported");
+        assert!(error.contains("child rejection"), "unexpected error: {error}");
+        assert_eq!(parent.evaluate("1 + 1").unwrap(), serde_json::json!(2.0));
+    }
+
     /// A frame posting to `parent` must reach the page, arrive trusted, and
     /// carry the frame's origin. Turnstile and every widget like it drop an
     /// untrusted message silently, so an untrusted delivery is not a cosmetic
@@ -953,6 +1423,32 @@ mod tests {
         assert_eq!(
             parent.evaluate("[parent === window, top === window]").unwrap(),
             serde_json::json!([true, true]),
+        );
+    }
+
+    #[test]
+    fn a_framed_realm_uses_the_process_timezone() {
+        // SAFETY: nextest gives this test its own process and no runtime or
+        // worker thread exists before this point.
+        unsafe { std::env::set_var("TZ", "Europe/Istanbul"); }
+        let mut parent = page("https://parent.example/", "<html><body></body></html>");
+        let frame = FrameRealm::new(
+            &mut parent,
+            1,
+            0,
+            "https://child.example/f",
+            "<html><body></body></html>",
+        )
+        .expect("frame realm");
+
+        assert_eq!(
+            frame
+                .evaluate(
+                    &mut parent,
+                    "({zone:Intl.DateTimeFormat().resolvedOptions().timeZone,offset:new Date().getTimezoneOffset()})",
+                )
+                .unwrap(),
+            serde_json::json!({"zone": "Europe/Istanbul", "offset": -180}),
         );
     }
 
@@ -1121,7 +1617,7 @@ mod tests {
     }
 
     #[test]
-    fn opaque_origin_frames_are_never_same_origin() {
+    fn about_blank_frames_inherit_the_parent_origin() {
         let mut parent = page("https://parent.example/", "<html><body></body></html>");
         let frame = FrameRealm::new(
             &mut parent,
@@ -1131,8 +1627,7 @@ mod tests {
             "<html><body></body></html>",
         )
         .expect("frame realm");
-        assert_eq!(frame.origin(), "null");
-        assert!(!frame.is_same_origin_as("null"));
-        assert!(!frame.is_same_origin_as("https://parent.example"));
+        assert_eq!(frame.origin(), "https://parent.example");
+        assert!(frame.is_same_origin_as("https://parent.example"));
     }
 }

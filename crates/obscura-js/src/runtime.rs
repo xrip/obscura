@@ -398,6 +398,7 @@ impl ObscuraJsRuntime {
     pub(crate) fn create_realm_context(
         &mut self,
     ) -> Option<deno_core::v8::Global<deno_core::v8::Context>> {
+        let main_context = self.runtime.main_context();
         let context = {
             let isolate = self.runtime.v8_isolate();
             let scope = &mut deno_core::v8::HandleScope::new(isolate);
@@ -413,8 +414,36 @@ impl ObscuraJsRuntime {
                     deno_core::v8::ContextOptions::default(),
                 )
             })?;
+
+            // deno_core's isolate-wide promise rejection callback reads this
+            // pointer from whichever context rejected the promise. Additional
+            // snapshot contexts are not full JsRealm values, so deno_core does
+            // not fill the slot for us. Borrow the main realm's state: it owns
+            // the pointer for the whole isolate lifetime and Page drops every
+            // frame before it drops this runtime.
+            let main_context = deno_core::v8::Local::new(scope, main_context);
+            let context_state = main_context.get_aligned_pointer_from_embedder_data(
+                deno_core::CONTEXT_STATE_SLOT_INDEX,
+            );
+            if context_state.is_null() {
+                return None;
+            }
+            unsafe {
+                context.set_aligned_pointer_in_embedder_data(
+                    deno_core::CONTEXT_STATE_SLOT_INDEX,
+                    context_state,
+                );
+            }
             deno_core::v8::Global::new(scope, context)
         };
+        // A snapshot context can retain the zone that was active when the
+        // snapshot was built. Refresh V8's ICU date cache after restoring each
+        // child realm so Date and Intl match the live page realm.
+        self.runtime
+            .v8_isolate()
+            .date_time_configuration_change_notification(
+                deno_core::v8::TimeZoneDetection::Skip,
+            );
         Some(context)
     }
 
@@ -637,14 +666,24 @@ impl ObscuraJsRuntime {
         &mut self,
         realm: &deno_core::v8::Global<deno_core::v8::Context>,
     ) {
+        let main = self.runtime.main_context();
+        self.share_security_token_from_realm(&main, realm);
+    }
+
+    /// Gives a same-origin frame realm the security token of its actual parent.
+    /// Nested frames do not always belong to the page's context.
+    pub(crate) fn share_security_token_from_realm(
+        &mut self,
+        parent: &deno_core::v8::Global<deno_core::v8::Context>,
+        realm: &deno_core::v8::Global<deno_core::v8::Context>,
+    ) {
         use deno_core::v8;
 
-        let main = self.runtime.main_context();
         let isolate = self.runtime.v8_isolate();
         let scope = &mut v8::HandleScope::new(isolate);
-        let main = v8::Local::new(scope, main);
+        let parent = v8::Local::new(scope, parent);
         let realm = v8::Local::new(scope, realm);
-        let token = main.get_security_token(scope);
+        let token = parent.get_security_token(scope);
         realm.set_security_token(token);
     }
 
@@ -662,9 +701,19 @@ impl ObscuraJsRuntime {
         realm: &deno_core::v8::Global<deno_core::v8::Context>,
         frame_id: u32,
     ) -> bool {
+        let main = self.runtime.main_context();
+        self.publish_realm_objects_in_context(&main, realm, frame_id)
+    }
+
+    /// Publishes a frame realm into the realm that actually embeds it.
+    pub(crate) fn publish_realm_objects_in_context(
+        &mut self,
+        parent: &deno_core::v8::Global<deno_core::v8::Context>,
+        realm: &deno_core::v8::Global<deno_core::v8::Context>,
+        frame_id: u32,
+    ) -> bool {
         use deno_core::v8;
 
-        let main = self.runtime.main_context();
         let isolate = self.runtime.v8_isolate();
         let scope = &mut v8::HandleScope::new(isolate);
 
@@ -685,9 +734,9 @@ impl ObscuraJsRuntime {
             )
         };
 
-        let main_context = v8::Local::new(scope, main);
-        let scope = &mut v8::ContextScope::new(scope, main_context);
-        let global = main_context.global(scope);
+        let parent_context = v8::Local::new(scope, parent);
+        let scope = &mut v8::ContextScope::new(scope, parent_context);
+        let global = parent_context.global(scope);
         let Some(registry_key) = v8::String::new(scope, "__obscura_frameObjects") else {
             return false;
         };
@@ -730,6 +779,21 @@ impl ObscuraJsRuntime {
     /// Frame documents fetched by any realm that still need one of their own.
     /// The op queues onto the page's state whichever frame asked, so a frame
     /// nested inside a frame is drained here too.
+    pub fn queue_pending_frame(&self, frame: crate::ops::PendingFrame) -> bool {
+        const MAX_PENDING_FRAME_DOCUMENTS: usize = 64;
+        const MAX_PENDING_FRAME_BYTES: usize = 32 * 1024 * 1024;
+        let bytes = frame.url.len().saturating_add(frame.html.len());
+        let mut state = self.state.borrow_mut();
+        if state.pending_frames.len() >= MAX_PENDING_FRAME_DOCUMENTS
+            || state.pending_frame_bytes.saturating_add(bytes) > MAX_PENDING_FRAME_BYTES
+        {
+            return false;
+        }
+        state.pending_frame_bytes = state.pending_frame_bytes.saturating_add(bytes);
+        state.pending_frames.push(frame);
+        true
+    }
+
     pub fn take_pending_frames(&self) -> Vec<crate::ops::PendingFrame> {
         let mut state = self.state.borrow_mut();
         state.pending_frame_bytes = 0;
@@ -3155,6 +3219,26 @@ mod tests {
     }
 
     #[test]
+    fn inert_reflects_the_content_attribute() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_eq!(
+            rt.evaluate(
+                r#"(() => {
+                    const element = document.createElement('iframe');
+                    const descriptor = Object.getOwnPropertyDescriptor(Element.prototype, 'inert');
+                    element.inert = true;
+                    const enabled = [element.inert, element.hasAttribute('inert')];
+                    element.inert = false;
+                    return [typeof descriptor?.get, typeof descriptor?.set, enabled,
+                        element.inert, element.hasAttribute('inert')];
+                })()"#,
+            )
+            .unwrap(),
+            serde_json::json!(["function", "function", [true, true], false, false])
+        );
+    }
+
+    #[test]
     fn native_date_and_intl_use_process_timezone() {
         // SAFETY: nextest gives this test its own process and no runtime or
         // worker thread exists before this point.
@@ -3244,6 +3328,188 @@ mod tests {
         assert_eq!(
             rt.evaluate("__workerEvents").unwrap(),
             serde_json::json!(["boot", "ping"]),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_unqualified_onmessage_receives_a_trusted_message() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "worker-message-shape",
+            r#"
+                globalThis.__workerEvents = [];
+                const source = "onmessage = e => postMessage({data:e.data, trusted:e.isTrusted, origin:e.origin, source:e.source, platform:navigator.platform, document:typeof document, window:typeof window, parent:typeof parent, webAssembly:typeof self.WebAssembly, offscreenCanvas:typeof self.OffscreenCanvas, url:typeof self.URL, urlSearchParams:typeof self.URLSearchParams, selfTag:Object.prototype.toString.call(self), selfConstructor:self.constructor.name, workerGlobalScope:typeof WorkerGlobalScope, dedicatedWorkerGlobalScope:typeof DedicatedWorkerGlobalScope, workerSelf:self instanceof WorkerGlobalScope, dedicatedSelf:self instanceof DedicatedWorkerGlobalScope, workerLocation:self.location.protocol, workerLocationTag:Object.prototype.toString.call(self.location), workerLocationConstructor:self.location.constructor.name, workerLocationInstance:self.location instanceof WorkerLocation, workerNavigator:Object.prototype.toString.call(navigator)});";
+                const workerUrl = URL.createObjectURL(new Blob([source], {type: 'application/javascript'}));
+                const worker = new Worker(workerUrl);
+                worker.onerror = error => __workerEvents.push({workerError: String(error.message || error)});
+                URL.revokeObjectURL(workerUrl);
+                worker.onmessage = event => {
+                    __workerEvents.push(event.data);
+                    worker.terminate();
+                };
+                worker.postMessage('ping');
+            "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__workerEvents").unwrap(),
+            serde_json::json!([{
+                "data": "ping",
+                "trusted": true,
+                "origin": "",
+                "source": null,
+                "platform": "Win32",
+                "document": "undefined",
+                "window": "undefined",
+                "parent": "undefined",
+                "webAssembly": "object",
+                "offscreenCanvas": "function",
+                "url": "function",
+                "urlSearchParams": "function",
+                "selfTag": "[object DedicatedWorkerGlobalScope]",
+                "selfConstructor": "DedicatedWorkerGlobalScope",
+                "workerGlobalScope": "function",
+                "dedicatedWorkerGlobalScope": "function",
+                "workerSelf": true,
+                "dedicatedSelf": true,
+                "workerLocation": "blob:",
+                "workerLocationTag": "[object WorkerLocation]",
+                "workerLocationConstructor": "WorkerLocation",
+                "workerLocationInstance": true,
+                "workerNavigator": "[object WorkerNavigator]",
+            }]),
+        );
+        assert_eq!(rt.evaluate("globalThis.onmessage === null").unwrap(), serde_json::json!(true));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_messages_are_structured_cloned_and_queued() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "worker-message-clone",
+            r#"
+                globalThis.__workerEvents = [];
+                const source = "onmessage = e => postMessage({value:e.data.value, workerMessage:e instanceof MessageEvent, source:e.source})";
+                const workerUrl = URL.createObjectURL(new Blob([source], {type: 'application/javascript'}));
+                const worker = new Worker(workerUrl);
+                const payload = {value: 1};
+                worker.onerror = error => __workerEvents.push(['error', String(error.message || error)]);
+                worker.onmessage = event => {
+                    __workerEvents.push([
+                        event instanceof MessageEvent,
+                        event.data.value,
+                        event.data.workerMessage,
+                        event.data.source,
+                        event.source,
+                    ]);
+                    worker.terminate();
+                };
+                worker.postMessage(payload);
+                payload.value = 2;
+                __workerEvents.push('after-post');
+            "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("globalThis.__workerEvents").unwrap(),
+            serde_json::json!([
+                "after-post",
+                [true, 1, true, null, null],
+            ]),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn storage_access_api_reports_the_unpartitioned_context_store() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "storage-access-api",
+            r#"
+                globalThis.__storageAccess = (async () => ({
+                    shape: [
+                        typeof document.hasStorageAccess,
+                        typeof document.requestStorageAccess,
+                        typeof document.hasUnpartitionedCookieAccess,
+                    ],
+                    access: await document.hasStorageAccess(),
+                    unpartitioned: await document.hasUnpartitionedCookieAccess(),
+                    request: await document.requestStorageAccess(),
+                }))();
+            "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate_for_cdp("__storageAccess", true, true)
+                .await
+                .unwrap()
+                .value
+                .unwrap(),
+            serde_json::json!({
+                "shape": ["function", "function", "function"],
+                "access": true,
+                "unpartitioned": true,
+            }),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn worker_eval_runs_in_the_worker_scope() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.execute_script(
+            "worker-eval-scope",
+            r#"
+                globalThis.__workerEvalEvents = [];
+                const source = "onmessage = e => eval(\"postMessage({workerGlobal: self === globalThis, documentType: typeof document})\")";
+                const workerUrl = URL.createObjectURL(new Blob([source], {type: 'application/javascript'}));
+                const worker = new Worker(workerUrl);
+                worker.onerror = error => __workerEvents.push({workerError: String(error.message || error)});
+                worker.onmessage = event => {
+                    __workerEvalEvents.push(event.data);
+                    worker.terminate();
+                };
+                worker.postMessage('ping');
+            "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__workerEvalEvents").unwrap(),
+            serde_json::json!([{ "workerGlobal": true, "documentType": "undefined" }]),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn trusted_types_shape_is_available_in_page_and_worker_realms() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        assert_eq!(
+            rt.evaluate(
+                "(() => { const p = trustedTypes.createPolicy('test', {}); return [typeof trustedTypes, typeof trustedTypes.createPolicy, typeof trustedTypes.isHTML, p.createScript('x')]; })()",
+            )
+            .unwrap(),
+            serde_json::json!(["object", "function", "function", "x"]),
+        );
+        rt.execute_script(
+            "trusted-types-worker",
+            r#"
+                globalThis.__trustedTypesEvents = [];
+                const source = "onmessage = () => postMessage([typeof self.trustedTypes, typeof self.trustedTypes.createPolicy, self.trustedTypes.createPolicy('worker', {}).createScript('x')])";
+                const workerUrl = URL.createObjectURL(new Blob([source], {type: 'application/javascript'}));
+                const worker = new Worker(workerUrl);
+                worker.onmessage = event => {
+                    __trustedTypesEvents.push(event.data);
+                    worker.terminate();
+                };
+                worker.postMessage('ping');
+            "#,
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(
+            rt.evaluate("__trustedTypesEvents").unwrap(),
+            serde_json::json!([["object", "function", "x"]]),
         );
     }
 
@@ -12592,6 +12858,36 @@ mod tests {
 
     #[cfg(feature = "render")]
     #[tokio::test(flavor = "current_thread")]
+    async fn parser_image_starts_eager_load_without_lifecycle_observer() {
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let loader_calls = calls.clone();
+        let png = two_by_three_png();
+        let mut rt = parser_image_runtime(
+            r#"<img id="eager" src="eager.png">"#,
+            move |_url: &str| {
+                loader_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Some(png.clone())
+            },
+        );
+
+        rt.execute_script(
+            "capture-parser-image",
+            r#"globalThis.eager = document.getElementById("eager");"#,
+        )
+        .unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+
+        rt.run_event_loop_bounded(100).await.unwrap();
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            rt.evaluate("[eager.complete, eager.naturalWidth, eager.naturalHeight]")
+                .unwrap(),
+            serde_json::json!([true, 2, 3])
+        );
+    }
+
+    #[cfg(feature = "render")]
+    #[tokio::test(flavor = "current_thread")]
     async fn parser_image_failure_completes_and_rejects_decode() {
         let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let loader_calls = calls.clone();
@@ -13208,6 +13504,56 @@ mod tests {
     }
 
     #[test]
+    fn composed_mouse_event_crosses_shadow_root_to_host() {
+        let mut rt = setup_runtime(r#"<div id="host"></div>"#);
+        let result = rt
+            .evaluate(
+                r#"
+                const host = document.getElementById('host');
+                const root = host.attachShadow({ mode: 'closed' });
+                const target = document.createElement('button');
+                root.appendChild(target);
+                const calls = [];
+                let path = [];
+                target.addEventListener('click', event => {
+                    path = event.composedPath();
+                    calls.push('target');
+                });
+                root.addEventListener('click', () => calls.push('root'));
+                host.addEventListener('click', event => {
+                    calls.push(event.target === host ? 'host-host' : 'host-other');
+                });
+                document.addEventListener('click', event => {
+                    calls.push(event.target === host ? 'document-host' : 'document-other');
+                });
+                const clickEvent = new MouseEvent('click', {
+                    bubbles: true,
+                    composed: true,
+                });
+                target.dispatchEvent(clickEvent);
+                return [
+                    calls,
+                    path.includes(target),
+                    path.includes(root),
+                    path.includes(host),
+                    path.includes(document),
+                ];
+                "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                ["target", "root", "host-host", "document-host"],
+                true,
+                true,
+                true,
+                true,
+            ])
+        );
+    }
+
+    #[test]
     fn test_location_href_assignment_updates_navigation_state() {
         let mut rt = setup_runtime("<html><body></body></html>");
         let href = rt
@@ -13284,6 +13630,10 @@ mod tests {
         assert_eq!(wd, serde_json::json!(false));
         let plugins = rt.evaluate("navigator.plugins.length").unwrap();
         assert!(plugins.as_f64().unwrap() > 0.0, "Should have plugins");
+        let plugin_mime_lengths = rt
+            .evaluate("Array.from(navigator.plugins).map(plugin => plugin.length)")
+            .unwrap();
+        assert_eq!(plugin_mime_lengths, serde_json::json!([2, 2, 2, 2, 2]));
         let chrome = rt.evaluate("typeof window.chrome").unwrap();
         assert_eq!(chrome, serde_json::json!("object"));
     }
@@ -14101,10 +14451,14 @@ mod tests {
                 r#"async () => {
                     const originalFetchOp = Deno.core.ops.op_fetch_url;
                     const calls = [];
+                    const requestBodies = [];
                     try {
                         Deno.core.ops.op_fetch_url =
                             (url, method, headers, body, origin, mode, credentials) => {
                                 calls.push({ url, credentials });
+                                if (body || headers !== '{}') {
+                                    requestBodies.push({ url, method, headers: JSON.parse(headers), body });
+                                }
                                 return JSON.stringify({
                                     status: 200,
                                     headers: {},
@@ -14119,6 +14473,13 @@ mod tests {
                         await fetch(request);
                         await fetch(request.clone());
                         await fetch(request, { credentials: "same-origin" });
+                        const requestWithBody = new Request("/request-body", {
+                            method: "POST",
+                            headers: { "X-Request-Header": "yes" },
+                            body: "payload",
+                            credentials: "include",
+                        });
+                        await fetch(requestWithBody);
 
                         const sendXhr = (path, withCredentials) => new Promise((resolve, reject) => {
                             const xhr = new XMLHttpRequest();
@@ -14138,7 +14499,7 @@ mod tests {
                             invalidFetchRejected = error instanceof TypeError;
                         }
 
-                        return { calls, invalidFetchRejected };
+                        return { calls, requestBodies, invalidFetchRejected };
                     } finally {
                         Deno.core.ops.op_fetch_url = originalFetchOp;
                     }
@@ -14160,9 +14521,19 @@ mod tests {
                     { "url": "http://example.com/included", "credentials": "include" },
                     { "url": "http://example.com/included", "credentials": "include" },
                     { "url": "http://example.com/included", "credentials": "same-origin" },
+                    { "url": "http://example.com/request-body", "credentials": "include" },
                     { "url": "http://example.com/xhr-default", "credentials": "same-origin" },
                     { "url": "http://example.com/xhr-credentialed", "credentials": "include" },
                 ],
+                "requestBodies": [{
+                    "url": "http://example.com/request-body",
+                    "method": "POST",
+                    "headers": {
+                        "x-request-header": "yes",
+                        "Content-Type": "text/plain;charset=UTF-8"
+                    },
+                    "body": "payload"
+                }],
                 "invalidFetchRejected": true,
             })
         );
@@ -14504,6 +14875,10 @@ mod tests {
             .evaluate("document.createEvent('KeyboardEvent') instanceof KeyboardEvent")
             .unwrap();
         assert_eq!(kb, serde_json::json!(true));
+        let touch = rt
+            .evaluate("document.createEvent('TouchEvent') instanceof TouchEvent")
+            .unwrap();
+        assert_eq!(touch, serde_json::json!(true));
     }
 
     #[test]
@@ -14525,15 +14900,91 @@ mod tests {
         let mut rt = setup_runtime("<html><body></body></html>");
         let result = rt
             .evaluate(
-                "(function(){var out=[];for(var name of ['NotARealType','TouchEvent']){try{document.createEvent(name);out.push(null)}catch(error){out.push([error.name,error instanceof DOMException])}}return out})()",
+                "(function(){try{document.createEvent('NotARealType');return null}catch(error){return [error.name,error instanceof DOMException]}})()",
             )
             .unwrap();
         assert_eq!(
             result,
-            serde_json::json!([
-                ["NotSupportedError", true],
-                ["NotSupportedError", true]
-            ])
+            serde_json::json!(["NotSupportedError", true])
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_adds_the_default_content_type_for_string_bodies() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate_for_cdp(
+                r#"(async () => {
+                    const original = Deno.core.ops.op_fetch_url;
+                    const calls = [];
+                    try {
+                        Deno.core.ops.op_fetch_url = (url, method, headers, body) => {
+                            calls.push({ url, method, headers: JSON.parse(headers), body });
+                            return JSON.stringify({ status: 200, headers: {}, body: "ok", url });
+                        };
+                        await fetch("/implicit", { method: "POST", body: "hello" });
+                        await fetch("/explicit", {
+                            method: "POST",
+                            headers: { "Content-Type": "application/custom" },
+                            body: "world",
+                        });
+                        return calls;
+                    } finally {
+                        Deno.core.ops.op_fetch_url = original;
+                    }
+                })()"#,
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.value,
+            Some(serde_json::json!([
+                {
+                    "url": "http://example.com/implicit",
+                    "method": "POST",
+                    "headers": { "Content-Type": "text/plain;charset=UTF-8" },
+                    "body": "hello",
+                },
+                {
+                    "url": "http://example.com/explicit",
+                    "method": "POST",
+                    "headers": { "Content-Type": "application/custom" },
+                    "body": "world",
+                },
+            ]))
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn private_state_token_queries_are_read_only_when_unbacked() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate_for_cdp(
+                "Promise.all([document.hasPrivateToken('https://issuer.example'), document.hasRedemptionRecord('https://issuer.example')])",
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.value, Some(serde_json::json!([false, false])));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn response_exposes_a_readable_body_stream() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate_for_cdp(
+                "(async () => { const response = new Response(new Uint8Array([65, 66])); const body = response.body; const reader = body.getReader(); const first = await reader.read(); const second = await reader.read(); return [body instanceof ReadableStream, Array.from(first.value), first.done, second.done, new Response(null).body === null]; })()",
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            result.value,
+            Some(serde_json::json!([true, [65, 66], false, true, true]))
         );
     }
 
@@ -14753,6 +15204,31 @@ mod tests {
             .evaluate("document.elementFromPoint(10, 10)?.tagName")
             .unwrap();
         assert_eq!(tag, serde_json::json!("BODY"));
+    }
+
+    #[test]
+    fn test_element_from_point_retargets_closed_shadow_content() {
+        let mut rt = setup_runtime("<html><body><x-closed-hit style='display:block;width:100px;height:100px'></x-closed-hit></body></html>");
+        let result = rt
+            .evaluate(
+                "(function() {\
+                    const host = document.querySelector('x-closed-hit');\
+                    const root = host.attachShadow({ mode: 'closed' });\
+                    root.innerHTML = '<div style=\"width:100px;height:100px\"></div>';
+                    const inner = root.querySelector('div');\
+                    const controlHost = document.createElement('x-control-hit');\
+                    controlHost.style = 'position:absolute;left:200px;top:0;width:100px;height:100px';\
+                    document.body.appendChild(controlHost);\
+                    const controlRoot = controlHost.attachShadow({ mode: 'closed' });\
+                    controlRoot.innerHTML = '<input style=\"position:absolute;left:0;top:0;width:100px;height:100px\"><span style=\"position:absolute;left:0;top:0;width:100px;height:100px\"></span>';
+                    const input = controlRoot.querySelector('input');\
+                    return [document.elementFromPoint(10, 10) === host,\
+                            root.elementFromPoint(10, 10) === inner,\
+                            controlRoot.elementFromPoint(210, 10) === input];\
+                })()",
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([true, true, true]));
     }
 
     #[test]
