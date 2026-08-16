@@ -9551,6 +9551,15 @@ fn is_flattenable_inline(
     if element.local.as_ref() == "br" {
         return false;
     }
+    if rendered_descendants(tree, id).iter().any(|descendant| {
+        tree.get_node(*descendant).is_some_and(|node| {
+            node.as_element().is_some_and(|element| {
+                crate::inline::is_replaced(element.local.as_ref())
+            })
+        })
+    }) {
+        return false;
+    }
     let Some(style) = styles.get(&id) else {
         return false;
     };
@@ -12294,6 +12303,64 @@ fn build(
             let leaf = taffy_tree.new_leaf_with_context(taffy_style, item).ok()?;
             id_map.insert(leaf, id);
             ifc_items.whole.insert(id, item);
+            return Some(leaf);
+        }
+    }
+
+    // An ordinary inline wrapper that contains a replaced child (for example
+    // `<a><img><span>Product</span></a>`) is not a pure text context, but it is
+    // still an inline formatting context. The generic element path has no
+    // block children to measure here and can leave the owner at zero size when
+    // the image has no intrinsic dimensions. Keep the owner as a shrink-to-fit
+    // flex wrapper so its text remains clickable even when the image is broken.
+    let has_replaced_inline_descendant = style.display == crate::Display::Inline
+        && !style.is_inline_block
+        && rendered_descendants(tree, id).iter().any(|descendant| {
+            tree.get_node(*descendant).is_some_and(|node| {
+                node.as_element().is_some_and(|element| {
+                    crate::inline::is_replaced(element.local.as_ref())
+                })
+            })
+        });
+    if has_replaced_inline_descendant {
+        let children: Vec<_> = rendered_children(tree, id)
+            .into_iter()
+            .flat_map(|cid| {
+                let child_has_replaced = tree.get_node(cid).is_some_and(|node| {
+                    node.as_element().is_some_and(|element| {
+                        crate::inline::is_replaced(element.local.as_ref())
+                    }) || rendered_descendants(tree, cid).iter().any(|descendant| {
+                        tree.get_node(*descendant).is_some_and(|node| {
+                            node.as_element().is_some_and(|element| {
+                                crate::inline::is_replaced(element.local.as_ref())
+                            })
+                        })
+                    })
+                });
+                let child_is_plain_inline = styles
+                    .get(&cid)
+                    .is_some_and(|child_style| child_style.display == crate::Display::Inline)
+                    && !child_has_replaced;
+                if child_is_plain_inline {
+                    build(
+                        tree, cid, taffy_tree, id_map, words, engine, ifc_items, styles,
+                    )
+                    .into_iter()
+                    .collect::<Vec<_>>()
+                } else {
+                    build_any(
+                        tree, cid, taffy_tree, id_map, words, engine, ifc_items, styles,
+                    )
+                }
+            })
+            .collect();
+        if !children.is_empty() {
+            let mut inline_style = run_wrapper_style(style, true);
+            inline_style.flex_grow = 0.0;
+            let leaf = taffy_tree
+                .new_with_children(inline_style, &children)
+                .ok()?;
+            id_map.insert(leaf, id);
             return Some(leaf);
         }
     }
@@ -20303,5 +20370,17 @@ mod tests {
         let width = |id| laid.rects[&tree.get_element_by_id(id).unwrap()].width;
 
         assert!(width("keep") > width("normal"));
+    }
+
+    #[test]
+    fn inline_owner_with_replaced_child_keeps_text_geometry() {
+        let tree = parse_html(
+            r#"<article><a id="card"><img src="broken"><span>Product</span></a></article>"#,
+        );
+        let laid = layout_dom(&tree, (800.0, 600.0));
+        let card = laid.rects[&tree.get_element_by_id("card").unwrap()];
+
+        assert!(card.width > 0.0, "inline owner width collapsed: {card:?}");
+        assert!(card.height > 0.0, "inline owner height collapsed: {card:?}");
     }
 }
