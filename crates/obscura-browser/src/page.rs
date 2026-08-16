@@ -312,18 +312,6 @@ fn max_live_frames() -> usize {
         .unwrap_or(64)
 }
 
-/// How many child frame realms one document may hold at once.
-///
-/// Real pages use a handful; the cap exists so a page that creates iframes in a
-/// loop cannot make the engine hold an unbounded number of contexts and DOM
-/// trees. Frames are released when the document is replaced.
-fn max_live_frames() -> usize {
-    std::env::var("OBSCURA_MAX_LIVE_FRAMES")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(64)
-}
-
 fn default_navigation_timeout() -> std::time::Duration {
     navigation_timeout_from_env_value(std::env::var("OBSCURA_NAV_TIMEOUT_MS").ok().as_deref())
 }
