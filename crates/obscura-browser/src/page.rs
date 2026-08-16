@@ -312,6 +312,18 @@ fn max_live_frames() -> usize {
         .unwrap_or(64)
 }
 
+/// How many child frame realms one document may hold at once.
+///
+/// Real pages use a handful; the cap exists so a page that creates iframes in a
+/// loop cannot make the engine hold an unbounded number of contexts and DOM
+/// trees. Frames are released when the document is replaced.
+fn max_live_frames() -> usize {
+    std::env::var("OBSCURA_MAX_LIVE_FRAMES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(64)
+}
+
 fn default_navigation_timeout() -> std::time::Duration {
     navigation_timeout_from_env_value(std::env::var("OBSCURA_NAV_TIMEOUT_MS").ok().as_deref())
 }
@@ -3448,6 +3460,13 @@ impl Page {
 
         self.lifecycle = LifecycleState::DomContentLoaded;
 
+        // Before any `wait_until` can return, because the frames belong to the
+        // document rather than to one readiness level. Puppeteer and Playwright
+        // send `Page.navigate` with no `waitUntil`, which lands here and returns
+        // on the next line, so building frames further down left every real CDP
+        // client seeing a page with no frames at all.
+        self.build_document_frames().await;
+
         if wait_until == crate::lifecycle::WaitUntil::DomContentLoaded {
             return Ok(());
         }
@@ -4392,6 +4411,12 @@ impl Page {
         } else {
             self.suspended_started_script_ids.clear();
         }
+        // Every frame realm holds a V8 handle into this isolate, so the frames
+        // go before the runtime does — the same order init_js keeps on a new
+        // document. Suspending is a teardown of the realm the frames live in,
+        // and a realm cannot be suspended and resumed the way the page's DOM
+        // can, so they are rebuilt when the page next loads a document.
+        self.frames.clear();
         self.js = None;
     }
 
@@ -5308,6 +5333,157 @@ mod tests {
         assert!(!script_response_is_executable(401));
         assert!(!script_response_is_executable(404));
         assert!(!script_response_is_executable(500));
+    }
+
+    /// `/` puts its iframe inside a closed shadow root, `/plain.html` puts the
+    /// same iframe straight in the document, and `/child.html` is the frame.
+    async fn spawn_shadow_frame_server() -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 2048];
+                    let read = socket.read(&mut buf).await.unwrap_or(0);
+                    let request = String::from_utf8_lossy(&buf[..read]).to_string();
+                    let body = if request.starts_with("GET /child.html ") {
+                        "<html><body><script>window.__ran = 'YES';</script></body></html>"
+                    } else if request.starts_with("GET /plain.html ") {
+                        "<html><body><iframe src=\"/child.html\"></iframe></body></html>"
+                    } else {
+                        "<html><body><div id=\"host\"></div><script>\
+                         var r = document.getElementById('host').attachShadow({mode:'closed'});\
+                         var f = document.createElement('iframe');\
+                         f.src = '/child.html';\
+                         r.appendChild(f);\
+                         </script></body></html>"
+                    };
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(resp.as_bytes()).await;
+                });
+            }
+        });
+        format!("http://{addr}/")
+    }
+
+    /// A `FrameRealm` owns a `v8::Global` into the runtime's isolate, which is
+    /// why `init_js` clears the frames before it drops the runtime. `suspend_js`
+    /// drops the same runtime and has to honour the same order, otherwise the
+    /// realms of a suspended page outlive the isolate they point into and the
+    /// next navigation drops those handles against a different one.
+    #[tokio::test]
+    async fn suspending_the_runtime_releases_the_frame_realms_it_owns() {
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let base = spawn_shadow_frame_server().await;
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            "suspend-frames".to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        let mut page = super::Page::new("suspend-frames".to_string(), context);
+        page.navigate(&format!("{base}plain.html")).await.unwrap();
+        assert_eq!(
+            page.frame_urls().len(),
+            1,
+            "the page never built its child frame, so this proves nothing"
+        );
+
+        page.suspend_js();
+        assert!(
+            page.frame_urls().is_empty(),
+            "the frame realms outlived the isolate they hold a handle into: {:?}",
+            page.frame_urls()
+        );
+
+        // The page still works afterwards: resuming rebuilds the runtime, and
+        // navigating again builds the frames of the new document.
+        page.resume_js();
+        page.navigate(&format!("{base}plain.html")).await.unwrap();
+        assert_eq!(page.frame_urls().len(), 1);
+    }
+
+    fn frame_page(name: &str) -> super::Page {
+        let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
+            name.to_string(),
+            None,
+            false,
+            None,
+            None,
+            true,
+        ));
+        super::Page::new(name.to_string(), context)
+    }
+
+    /// An iframe inside a shadow root is absent from
+    /// `document.querySelectorAll('iframe')` — real Chrome reports 0 for it too
+    /// — so a liveness check built on that query reads a live frame as detached
+    /// and tears it down. That is the shape a challenge widget uses, so the
+    /// frame it depends on would be discarded moments after it loaded.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_frame_inside_a_shadow_root_survives_the_detach_sweep() {
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let base = spawn_shadow_frame_server().await;
+        let mut page = frame_page("shadow-frame-survives");
+        page.navigate(&base).await.unwrap();
+        page.settle(1_000).await;
+
+        assert_eq!(
+            page.frames.len(),
+            1,
+            "the shadow-root frame was discarded as detached: {:?}",
+            page.frame_urls()
+        );
+        // The realm is not merely alive; the page can still reach into it.
+        let published = page
+            .js
+            .as_mut()
+            .unwrap()
+            .evaluate("Object.keys(globalThis.__obscura_frameObjects).length")
+            .unwrap();
+        assert_eq!(published.as_f64(), Some(1.0), "the page cannot reach the frame");
+    }
+
+    /// The sweep still does its job: an iframe removed from the document has
+    /// its realm and every reference the page realm holds to it released.
+    #[tokio::test(flavor = "current_thread")]
+    async fn removing_an_iframe_releases_its_realm() {
+        std::env::set_var("OBSCURA_ALLOW_PRIVATE_NETWORK", "1");
+        let base = spawn_shadow_frame_server().await;
+        let mut page = frame_page("detached-frame-released");
+        page.navigate(&format!("{base}plain.html")).await.unwrap();
+        page.settle(1_000).await;
+        assert_eq!(page.frames.len(), 1, "no frame to remove");
+
+        page.js
+            .as_mut()
+            .unwrap()
+            .evaluate("(document.querySelector('iframe').remove(), 1)")
+            .unwrap();
+        page.release_detached_frames();
+
+        assert!(page.frames.is_empty(), "the detached realm was kept");
+        let left = page
+            .js
+            .as_mut()
+            .unwrap()
+            .evaluate(
+                "Object.keys(globalThis.__obscura_frameObjects).length\
+                 + Object.keys(globalThis.__obscura_frameWindows).length\
+                 + Object.keys(globalThis.__obscura_frameElements).length",
+            )
+            .unwrap();
+        assert_eq!(
+            left.as_f64(),
+            Some(0.0),
+            "a reference to the discarded frame survived, so its context cannot be collected"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
