@@ -12285,6 +12285,49 @@ mod tests {
     }
 
     #[test]
+    fn dom_string_map_is_exposed_and_backs_dataset() {
+        let mut rt = setup_runtime(r#"<div id="x" data-foo="bar"></div>"#);
+        let result = rt
+            .evaluate(
+                r#"(() => {
+                    const dataset = document.getElementById("x").dataset;
+                    const interface = window.DOMStringMap;
+                    const descriptor = Object.getOwnPropertyDescriptor(window, "DOMStringMap");
+                    let illegalConstructor = false;
+                    if (interface) {
+                        try { new interface(); }
+                        catch (error) { illegalConstructor = error instanceof TypeError; }
+                    }
+                    return JSON.stringify({
+                        type: typeof interface,
+                        instance: !!interface && dataset instanceof interface,
+                        prototype: !!interface && Object.getPrototypeOf(dataset) === interface.prototype,
+                        constructor: !!interface && dataset.constructor === interface,
+                        tag: Object.prototype.toString.call(dataset),
+                        enumerable: descriptor ? descriptor.enumerable : "missing",
+                        illegalConstructor,
+                        value: dataset.foo,
+                    });
+                })()"#,
+            )
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(result.as_str().unwrap()).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "function",
+                "instance": true,
+                "prototype": true,
+                "constructor": true,
+                "tag": "[object DOMStringMap]",
+                "enumerable": false,
+                "illegalConstructor": true,
+                "value": "bar",
+            })
+        );
+    }
+
+    #[test]
     fn style_declaration_reflects_and_removes_parsed_attributes() {
         let mut rt = setup_runtime(
             "<html><body><div id='icon' style='font-size: 0px; color: red'></div></body></html>",
@@ -15035,6 +15078,14 @@ mod tests {
             .evaluate("document.createEvent('TouchEvent') instanceof TouchEvent")
             .unwrap();
         assert_eq!(touch, serde_json::json!(true));
+        let hash_change = rt
+            .evaluate("document.createEvent('HashChangeEvent') instanceof HashChangeEvent")
+            .unwrap();
+        assert_eq!(hash_change, serde_json::json!(true));
+        let message = rt
+            .evaluate("document.createEvent('MessageEvent') instanceof MessageEvent")
+            .unwrap();
+        assert_eq!(message, serde_json::json!(true));
     }
 
     #[test]
@@ -15217,6 +15268,28 @@ mod tests {
             )
             .unwrap();
         assert_eq!(result, serde_json::json!(["NotSupportedError", true]));
+    }
+
+    #[test]
+    fn test_create_event_supports_legacy_event_aliases() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                r#"['Event', 'Events', 'HTMLEvents', 'SVGEvents'].map(name => {
+                    const event = document.createEvent(name);
+                    return [event instanceof Event, event.constructor === Event, event.type];
+                })"#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([
+                [true, true, ""],
+                [true, true, ""],
+                [true, true, ""],
+                [true, true, ""]
+            ])
+        );
     }
 
     #[test]

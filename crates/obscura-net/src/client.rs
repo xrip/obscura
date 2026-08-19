@@ -1644,6 +1644,10 @@ impl ObscuraHttpClient {
         *self.user_agent.write().await = ua.to_string();
     }
 
+    pub async fn set_accept_language(&self, accept_language: &str) {
+        *self.accept_language.write().await = accept_language.to_string();
+    }
+
     pub async fn set_extra_headers(&self, headers: HashMap<String, String>) {
         *self.extra_headers.write().await = headers;
     }
@@ -1982,6 +1986,27 @@ mod ssrf_tests {
         let request = received.recv().await.unwrap().to_ascii_lowercase();
         assert!(!request.contains("origin:"));
         assert!(request.contains("cookie: same=1\r\n"));
+    }
+
+    #[tokio::test]
+    async fn accept_language_override_reaches_the_wire() {
+        let (target, mut received) = http_fixture(vec![ok_response("", "ok")]).await;
+        let client = ObscuraHttpClient::with_full_options(
+            Arc::new(CookieJar::new()),
+            None,
+            true,
+        );
+        client.set_accept_language("de-DE,de;q=0.9").await;
+
+        client.fetch(&target).await.unwrap();
+
+        let request = received.recv().await.unwrap();
+        assert!(
+            request
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("accept-language: de-DE,de;q=0.9")),
+            "request did not contain the configured Accept-Language header: {request}"
+        );
     }
 
     #[tokio::test]

@@ -53,7 +53,7 @@
     'Node', 'Element', 'Document', 'DocumentFragment', 'DocumentType',
     'Animation', 'KeyframeEffect', 'DocumentTimeline',
     'Text', 'Comment', 'CDATASection', 'ProcessingInstruction', 'CharacterData',
-    'CSSStyleDeclaration', 'DOMTokenList', 'NamedNodeMap', 'Screen', 'NetworkInformation',
+    'CSSStyleDeclaration', 'DOMStringMap', 'DOMTokenList', 'NamedNodeMap', 'Screen', 'NetworkInformation',
     'MessageChannel', 'MessagePort', 'BroadcastChannel', 'CustomElementRegistry',
     'Scheduler',
     'XMLHttpRequestEventTarget', 'HTMLMediaElement', 'HTMLVideoElement',
@@ -2558,6 +2558,16 @@ class DOMTokenList {
   toString() { return this.value; }
 }
 
+const _domStringMapConstructionKey = {};
+class DOMStringMap {
+  constructor(key) {
+    if (key !== _domStringMapConstructionKey) {
+      throw new TypeError("Failed to construct 'DOMStringMap': Illegal constructor");
+    }
+  }
+  get [Symbol.toStringTag]() { return "DOMStringMap"; }
+}
+
 // CDATASection: a Text-derived node (nodeType 4) used only in XML documents.
 // Extends Text so data/length/textContent/childNodes reuse the working text
 // node machinery; only the type-identifying getters differ.
@@ -4303,17 +4313,30 @@ class Element extends Node {
     const dataKeys = () => el.getAttributeNames()
       .filter((n) => n.startsWith("data-"))
       .map((n) => _cssKebabToCamel(n.slice(5)));
-    this._dataset = new Proxy({}, {
-      get(_, k) { if (typeof k !== "string") return undefined; return el.hasAttribute(attrFor(k)) ? el.getAttribute(attrFor(k)) : undefined; },
-      set(_, k, v) { el.setAttribute(attrFor(k), String(v)); return true; },
-      has(_, k) { return typeof k === "string" && el.hasAttribute(attrFor(k)); },
-      deleteProperty(_, k) { if (typeof k === "string") el.removeAttribute(attrFor(k)); return true; },
+    this._dataset = new Proxy(new DOMStringMap(_domStringMapConstructionKey), {
+      get(target, k, receiver) {
+        if (typeof k === "string" && el.hasAttribute(attrFor(k))) return el.getAttribute(attrFor(k));
+        return Reflect.get(target, k, receiver);
+      },
+      set(target, k, v, receiver) {
+        if (typeof k !== "string") return Reflect.set(target, k, v, receiver);
+        el.setAttribute(attrFor(k), String(v));
+        return true;
+      },
+      has(target, k) {
+        return (typeof k === "string" && el.hasAttribute(attrFor(k))) || Reflect.has(target, k);
+      },
+      deleteProperty(target, k) {
+        if (typeof k !== "string") return Reflect.deleteProperty(target, k);
+        el.removeAttribute(attrFor(k));
+        return true;
+      },
       ownKeys() { return dataKeys(); },
-      getOwnPropertyDescriptor(_, k) {
+      getOwnPropertyDescriptor(target, k) {
         if (typeof k === "string" && el.hasAttribute(attrFor(k))) {
           return { value: el.getAttribute(attrFor(k)), writable: true, enumerable: true, configurable: true };
         }
-        return undefined;
+        return Reflect.getOwnPropertyDescriptor(target, k);
       },
     });
     return this._dataset;
@@ -5246,7 +5269,9 @@ class Document extends Node {
       'keyboardevent': KeyboardEvent, 'keyboardevents': KeyboardEvent,
       'focusevent': FocusEvent,
       'touchevent': TouchEvent,
+      'hashchangeevent': HashChangeEvent,
       'inputevent': InputEvent,
+      'messageevent': MessageEvent,
       'uievent': UIEvent, 'uievents': UIEvent,
       'compositionevent': CompositionEvent,
       'wheelevent': WheelEvent,
@@ -10364,6 +10389,61 @@ if (typeof URLSearchParams === "undefined") globalThis.URLSearchParams = class U
   [Symbol.iterator](){ return this.entries(); }
 };
 
+// Conservative XML well-formedness check for DOMParser. Only detects clear
+// errors (tag balance / single root); defaults to well-formed when unsure so
+// valid XML is never falsely flagged.
+const _checkXmlWellFormed = (html) => {
+  // Strip comments, CDATA sections, processing instructions, and DOCTYPE
+  // declarations — they may contain angle brackets.
+  const s = html
+    .replace(/<!--[\s\S]*?-->/g, '')
+    .replace(/<!\[CDATA\[[\s\S]*?\]\]>/g, '')
+    .replace(/<\?[\s\S]*?\?>/g, '')
+    .replace(/<!DOCTYPE\s[^>]*?>/gi, '');
+
+  const stack = [];
+  // Match open / close / self-closing tags.
+  // Group 1: tag name.  Group 2: optional '/' before '>'.
+  const tagRe = /<\/?([a-zA-Z_][\w.\-:]*)(?:\s[^>]*?)?(\/)?>/g;
+  let rootFound = false;
+  let match;
+
+  while ((match = tagRe.exec(s)) !== null) {
+    const fullTag = match[0];
+    const tagName = match[1];
+    const isClosing = fullTag.startsWith('</');
+    const isSelfClosing = match[2] === '/';
+
+    if (isClosing) {
+      if (stack.length === 0) {
+        return { wellFormed: false, error: 'error on line 1: extra closing tag </' + tagName + '>' };
+      }
+      const open = stack.pop();
+      if (open !== tagName) {
+        return { wellFormed: false, error: 'error on line 1: opening and ending tag mismatch: ' + open + ' and ' + tagName };
+      }
+      if (stack.length === 0) rootFound = true;
+    } else {
+      // Opening or self-closing tag. Check for extra content after root.
+      if (stack.length === 0 && rootFound) {
+        return { wellFormed: false, error: 'error on line 1: extra content after root element' };
+      }
+      if (isSelfClosing) {
+        // Self-closing: complete element, mark rootFound if at root level.
+        if (stack.length === 0) rootFound = true;
+      } else {
+        stack.push(tagName);
+      }
+    }
+  }
+
+  if (stack.length > 0) {
+    return { wellFormed: false, error: 'error on line 1: unclosed tag <' + stack[stack.length - 1] + '>' };
+  }
+
+  return { wellFormed: true };
+};
+
 // Real-enough DOMParser. The previous one-liner returned `globalThis.document`,
 // so anything that did `new DOMParser().parseFromString(s, 'text/html')` and
 // then read `.body.innerHTML` mutated the LIVE page (jQuery 3.x's selector
@@ -10426,11 +10506,22 @@ globalThis.DOMParser = class DOMParser {
     const html = String(source ?? "");
     const isXml = typeof mimeType === "string" && /xml/i.test(mimeType);
     const root = document.createElement("html");
-    // innerHTML parses children via html5ever fragment-parsing rules. Most
-    // HTML inputs start with `<!DOCTYPE>` / `<html>` / `<head>` etc.; the
-    // fragment parser strips the outer `<html>` and emits its head+body
-    // children, which is what callers want.
-    try { root.innerHTML = html; } catch (e) { /* leave empty on parse error */ }
+
+    // For XML mime types, check well-formedness first (conservative: only
+    // clear errors like tag mismatch / extra root are flagged).  If the
+    // check fires, build a <parsererror> root so callers doing
+    // doc.querySelector('parsererror') get the same signal as in Chrome.
+    const xmlError = isXml ? _checkXmlWellFormed(html) : null;
+    const isParserError = xmlError && !xmlError.wellFormed;
+    if (isParserError) {
+      root.innerHTML = '<parsererror>' + xmlError.error + '</parsererror>';
+    } else {
+      // innerHTML parses children via html5ever fragment-parsing rules. Most
+      // HTML inputs start with `<!DOCTYPE>` / `<html>` / `<head>` etc.; the
+      // fragment parser strips the outer `<html>` and emits its head+body
+      // children, which is what callers want.
+      try { root.innerHTML = html; } catch (e) { /* leave empty on parse error */ }
+    }
 
     // For XML mime types, surface a <parsererror> on clearly-malformed input so
     // error-detection code (doc.querySelector('parsererror')) works, matching
@@ -10460,7 +10551,12 @@ globalThis.DOMParser = class DOMParser {
       nodeName: "#document",
       nodeType: 9,
       contentType: isXml ? (mimeType || "application/xml") : "text/html",
-      get documentElement() { return root; },
+      get documentElement() {
+        // For XML parsererror docs, return the <parsererror> child, not the
+        // <html> wrapper — matches Chrome's behavior.
+        if (isParserError) return root.firstElementChild;
+        return root;
+      },
       get body() { return findByTagName("BODY"); },
       get head() { return findByTagName("HEAD"); },
       get title() {
@@ -10502,7 +10598,11 @@ globalThis.DOMParser = class DOMParser {
       get ownerDocument() { return null; },
       createTreeWalker(r, ws, f) { return document.createTreeWalker(r || root, ws, f); },
       createNodeIterator(r, ws, f) { return document.createNodeIterator(r || root, ws, f); },
-      querySelector(s) { return root.querySelector(s); },
+      querySelector(s) {
+        // For XML parsererror docs, check the root element as well —
+        // the <parsererror> is the documentElement, not a descendant.
+        return root.querySelector(s) || (isParserError && root.matches(s) ? root : null);
+      },
       querySelectorAll(s) { return root.querySelectorAll(s); },
       getElementById(id) {
         return walk(root, n => n.getAttribute && n.getAttribute("id") === id);
@@ -11810,6 +11910,7 @@ globalThis.Document = Document;
 // undefined (so `el.style instanceof CSSStyleDeclaration` threw). Assigning here
 // only fills the value; the property stays enumerable:false, matching Chrome.
 globalThis.CSSStyleDeclaration = CSSStyleDeclaration;
+globalThis.DOMStringMap = DOMStringMap;
 globalThis.Animation = Animation;
 globalThis.KeyframeEffect = KeyframeEffect;
 globalThis.DocumentTimeline = DocumentTimeline;
