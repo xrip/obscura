@@ -209,7 +209,7 @@ async function journey(page, log) {
           // DOM scroll and mouse-input paths without Playwright's stability wait.
           await card.evaluate(element => element.scrollIntoView({ block: 'center', inline: 'nearest' }));
           await new Promise(done => setTimeout(done, 400 + Math.random() * 600));
-          await card.click({ force: true, timeout: 15000 });
+          await card.click({ force: true, timeout: 90000 });
         } else {
           await card.scrollIntoViewIfNeeded({ timeout: 15000 });
           await new Promise(done => setTimeout(done, 400 + Math.random() * 600));

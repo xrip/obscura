@@ -164,7 +164,7 @@ async function captureScreenshot(page, result, engine) {
         const blocked = [
           'проверяем браузер', 'checking your browser', 'checking browser',
           'just a moment', 'verify you are human', 'доступ ограничен',
-          'access denied',
+          'access denied', 'подозрительная активность', 'что-то не так',
         ].some(marker => lower.includes(marker));
         const path = location.pathname.toLowerCase();
         const isProduct = /\/catalog\/\d+(?:\/|$)/.test(path) ||

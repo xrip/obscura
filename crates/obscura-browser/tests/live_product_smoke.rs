@@ -159,7 +159,7 @@ async fn wait_for_product_card(page: &mut Page, case: &ProductCase) -> Result<Va
             .await
             .map_err(|error| format!("{} challenge navigation failed: {error}", case.name))?;
         if reached_idle {
-            tokio::task::yield_now().await;
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 }
