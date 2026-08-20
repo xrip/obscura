@@ -43,6 +43,7 @@ pub struct FrameRealm {
     origin: String,
     screen_position: Cell<Option<(f64, f64)>>,
     input_screen_origin: Cell<Option<(f64, f64)>>,
+    viewport: Cell<Option<(f64, f64)>>,
     viewport_sync_pending: Cell<bool>,
 }
 
@@ -142,6 +143,7 @@ impl FrameRealm {
             origin,
             screen_position: Cell::new(None),
             input_screen_origin: Cell::new(None),
+            viewport: Cell::new(None),
             viewport_sync_pending: Cell::new(false),
         };
         // Both ids before init, not after: init is what installs `parent` and
@@ -224,13 +226,7 @@ impl FrameRealm {
     }
 
     pub fn viewport(&self) -> Option<(f64, f64)> {
-        self.realms
-            .borrow()
-            .by_frame_id(self.frame_id)
-            .map(|state| {
-                let state = state.borrow();
-                (state.viewport.0 as f64, state.viewport.1 as f64)
-            })
+        self.viewport.get()
     }
 
     pub fn mark_viewport_sync_pending(&self) {
@@ -303,6 +299,7 @@ impl FrameRealm {
                  }}"
             ),
         )?;
+        self.viewport.set(Some((width, height)));
 
         // Keep the parent-side cross-origin contentWindow shim in step with
         // the real child realm. The shim is what parent JavaScript can see.

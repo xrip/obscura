@@ -185,6 +185,7 @@ async fn live_product_cards_load_with_the_selected_profile() {
         None,
     ));
     let mut page = Page::new("live-product-smoke-page".to_string(), context);
+    page.set_navigation_timeout(Duration::from_secs(90));
     let mut failures = Vec::new();
 
     for case in CASES {

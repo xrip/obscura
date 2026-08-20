@@ -964,6 +964,10 @@ impl ObscuraJsRuntime {
         self.state.borrow_mut().pending_navigation.take()
     }
 
+    pub fn has_pending_navigation(&self) -> bool {
+        self.state.borrow().pending_navigation.is_some()
+    }
+
     pub fn take_pending_binding_calls(&self) -> Vec<(String, String)> {
         std::mem::take(&mut self.state.borrow_mut().pending_binding_calls)
     }
@@ -3269,6 +3273,29 @@ mod tests {
                 "hasOwnPrototype": false,
                 "constructible": false,
             })
+        );
+    }
+
+    #[test]
+    fn native_function_errors_hide_internal_stack_frames() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+
+        let stack = rt
+            .evaluate(
+                r#"(() => {
+                    try {
+                        Function.prototype.toString.call(1);
+                    } catch (error) {
+                        return error.stack;
+                    }
+                })()"#,
+            )
+            .unwrap();
+        let stack = stack.as_str().expect("TypeError must have a stack string");
+        assert!(stack.starts_with("TypeError:"), "unexpected stack: {stack}");
+        assert!(
+            !stack.contains("<obscura:"),
+            "engine-owned source leaked through the stack: {stack}"
         );
     }
 

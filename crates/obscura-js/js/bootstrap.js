@@ -173,7 +173,19 @@ const _functionToString = {
     if (_nativeFns.has(this)) {
       return `function ${this.name || ''}() { [native code] }`;
     }
-    return _origToString.call(this);
+    try {
+      return _origToString.call(this);
+    } catch (error) {
+      if (error && typeof error.stack === 'string') {
+        try {
+          Object.defineProperty(error, 'stack', {
+            value: _sanitizeStack(error.stack),
+            writable: true, enumerable: false, configurable: true,
+          });
+        } catch (_) {}
+      }
+      throw error;
+    }
   },
 }.toString;
 Function.prototype.toString = _functionToString;
@@ -272,13 +284,20 @@ _nativeFns.add(_functionToString);
   } catch(e) {}
 });
 
+function _sanitizeStack(stack) {
+  if (typeof stack !== 'string') return stack;
+  return stack.split('\n').filter(line => !line.includes('<obscura:')).join('\n');
+}
+
 const _stackCache = new WeakMap();
 const _origStackDesc = Object.getOwnPropertyDescriptor(Error.prototype, 'stack');
 if (_origStackDesc && _origStackDesc.get) {
   Object.defineProperty(Error.prototype, 'stack', {
     configurable: false, enumerable: false,
     get: function() {
-      if (!_stackCache.has(this)) _stackCache.set(this, _origStackDesc.get.call(this));
+      if (!_stackCache.has(this)) {
+        _stackCache.set(this, _sanitizeStack(_origStackDesc.get.call(this)));
+      }
       return _stackCache.get(this);
     }
   });

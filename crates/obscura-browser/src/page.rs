@@ -3089,6 +3089,95 @@ impl Page {
         }
     }
 
+    #[cfg(feature = "stealth")]
+    async fn settle_stealth_post_load(&mut self) {
+        if !self.context.stealth {
+            return;
+        }
+
+        let dynamic_settle_ms = std::env::var("OBSCURA_DYNAMIC_SCRIPT_SETTLE_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(10_000)
+            .max(500);
+        let settle_wd = self.js.as_mut().map(|js| {
+            js.arm_watchdog(std::time::Duration::from_millis(dynamic_settle_ms + 250))
+        });
+        let started = tokio::time::Instant::now();
+        let minimum_deadline = started + tokio::time::Duration::from_millis(500);
+        let deadline = started + tokio::time::Duration::from_millis(dynamic_settle_ms);
+        let mut idle_count = 0u32;
+        let mut saw_async_work = false;
+        let mut idle_since: Option<tokio::time::Instant> = None;
+
+        loop {
+            match self.js.as_ref() {
+                Some(js) if js.has_pending_navigation() => break,
+                Some(_) => {}
+                None => break,
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let result = match self.js.as_mut() {
+                Some(js) => tokio::time::timeout(
+                    tokio::time::Duration::from_millis(10),
+                    js.run_event_loop(),
+                )
+                .await,
+                None => break,
+            };
+
+            let attached = self.attach_pending_frames().await;
+            let delivered = self.deliver_frame_messages();
+            if attached || delivered {
+                saw_async_work = true;
+                idle_since = None;
+                idle_count = 0;
+            }
+
+            match result {
+                Ok(Ok(())) => {
+                    let active_requests = self.active_network_requests();
+                    let pending_scripts = self
+                        .js
+                        .as_mut()
+                        .is_some_and(|js| js.has_pending_dynamic_scripts());
+                    if active_requests == 0 && !pending_scripts && !attached && !delivered {
+                        if saw_async_work {
+                            let idle_start = idle_since.get_or_insert(now);
+                            if now.duration_since(*idle_start)
+                                >= tokio::time::Duration::from_millis(1_000)
+                            {
+                                break;
+                            }
+                        } else {
+                            idle_count += 1;
+                            if idle_count >= 2 && now >= minimum_deadline {
+                                break;
+                            }
+                        }
+                        tokio::task::yield_now().await;
+                    } else {
+                        saw_async_work = true;
+                        idle_since = None;
+                        idle_count = 0;
+                        tokio::time::sleep(tokio::time::Duration::from_millis(1)).await;
+                    }
+                }
+                Ok(Err(_)) => break,
+                Err(_) => idle_count = 0,
+            }
+        }
+
+        if let Some(token) = settle_wd {
+            if let Some(js) = self.js.as_mut() {
+                js.disarm_watchdog(token);
+            }
+        }
+    }
+
     /// Pump the event loop and retain the full requested wall-clock delay.
     /// The CLI uses this for an explicitly supplied `--wait`; callers asking
     /// for a fixed capture delay should not be silently shortened by adaptive
@@ -3456,6 +3545,9 @@ impl Page {
         // send `Page.navigate` with no `waitUntil`, which lands here and returns
         // on the next line, so building frames further down left every real CDP
         // client seeing a page with no frames at all.
+        #[cfg(feature = "stealth")]
+        self.settle_stealth_post_load().await;
+
         self.build_document_frames().await;
 
         if wait_until == crate::lifecycle::WaitUntil::DomContentLoaded {
@@ -5594,11 +5686,16 @@ mod tests {
         assert_eq!(result, serde_json::json!("1"));
     }
 
-    fn import_map_test_page(name: &str, base: &str, html: &str) -> super::Page {
+    fn import_map_test_page_with_stealth(
+        name: &str,
+        base: &str,
+        html: &str,
+        stealth: bool,
+    ) -> super::Page {
         let context = std::sync::Arc::new(crate::BrowserContext::with_storage_and_network(
             name.to_string(),
             None,
-            false,
+            stealth,
             None,
             None,
             true,
@@ -5608,6 +5705,10 @@ mod tests {
         page.dom = Some(parse_html(html));
         page.init_js();
         page
+    }
+
+    fn import_map_test_page(name: &str, base: &str, html: &str) -> super::Page {
+        import_map_test_page_with_stealth(name, base, html, false)
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -6171,6 +6272,33 @@ mod tests {
                 .unwrap(),
             serde_json::json!(["true", "Hydrated app"]),
             "the automation caller's adaptive settle must retain timer hydration",
+        );
+    }
+
+    #[cfg(feature = "stealth")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn stealth_post_load_pump_exposes_delayed_navigation_to_outer_loop() {
+        let mut page = import_map_test_page_with_stealth(
+            "stealth-delayed-navigation",
+            "http://example.com",
+            r#"<html><body><script>
+                window.addEventListener('load', () => {
+                    setTimeout(() => { location.href = '/challenge-complete'; }, 750);
+                });
+            </script></body></html>"#,
+            true,
+        );
+
+        page.execute_scripts().await;
+        page.settle_stealth_post_load().await;
+
+        assert_eq!(
+            page.take_pending_navigation(),
+            Some((
+                "http://example.com/challenge-complete".to_string(),
+                "GET".to_string(),
+                String::new(),
+            )),
         );
     }
 
