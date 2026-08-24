@@ -5780,7 +5780,7 @@ fn layout_dom_once(
             .filter_map(|(&id, style)| {
                 let node = tree.get_node(id)?;
                 let element = node.as_element()?;
-                matches!(element.local.as_ref(), "input" | "select").then(|| {
+                matches!(element.local.as_ref(), "input" | "select" | "textarea").then(|| {
                     (
                         id,
                         (
@@ -5914,26 +5914,54 @@ fn layout_dom_once(
                 let intrinsic_width = label_width + horizontal_edges;
                 let intrinsic_height =
                     crate::inline::used_line_height(style).max(1.0) * rows + vertical_edges;
-                let (stretch_inline, stretch_block) = native_control_grid_stretch
-                    .get(&id)
-                    .copied()
-                    .unwrap_or_default();
-                if style.width == crate::Dimension::Auto && !stretch_inline {
-                    style.width =
-                        crate::Dimension::Px(if style.box_sizing == crate::BoxSizing::ContentBox {
-                            label_width
-                        } else {
-                            intrinsic_width
-                        });
-                }
-                if style.height == crate::Dimension::Auto && !stretch_block {
-                    style.height =
-                        crate::Dimension::Px(if style.box_sizing == crate::BoxSizing::ContentBox {
-                            (intrinsic_height - vertical_edges).max(0.0)
-                        } else {
-                            intrinsic_height
-                        });
-                }
+                assign_native_control_size(
+                    style,
+                    native_control_grid_stretch.get(&id).copied().unwrap_or_default(),
+                    intrinsic_width,
+                    intrinsic_height,
+                    horizontal_edges,
+                    vertical_edges,
+                );
+                continue;
+            }
+            if element.local.as_ref() == "textarea" {
+                // A native textarea's intrinsic border box comes from the
+                // rows/cols content attributes (HTML defaults 2 and 20), not
+                // from its text content: an empty textarea is still a
+                // visible, clickable control (Chromium cols=20 rows=2 ->
+                // 168x36, rows=8 -> 126 tall). Per-column width is the
+                // fixed-pitch average advance calibrated to Chromium's
+                // control metrics; per-row height is the normal line height.
+                let rows = node
+                    .get_attribute("rows")
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .filter(|&value| value > 0)
+                    .unwrap_or(2) as f32;
+                let cols = node
+                    .get_attribute("cols")
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .filter(|&value| value > 0)
+                    .unwrap_or(20) as f32;
+                let font_size = style.font_size.unwrap_or(13.333_333).max(1.0);
+                let horizontal_edges = style.padding.left
+                    + style.padding.right
+                    + style.border.left
+                    + style.border.right;
+                let vertical_edges = style.padding.top
+                    + style.padding.bottom
+                    + style.border.top
+                    + style.border.bottom;
+                let intrinsic_width = cols * font_size * 0.6075 + horizontal_edges;
+                let intrinsic_height =
+                    crate::inline::used_line_height(style).max(1.0) * rows + vertical_edges;
+                assign_native_control_size(
+                    style,
+                    native_control_grid_stretch.get(&id).copied().unwrap_or_default(),
+                    intrinsic_width,
+                    intrinsic_height,
+                    horizontal_edges,
+                    vertical_edges,
+                );
                 continue;
             }
             if element.local.as_ref() != "input" {
@@ -5950,10 +5978,6 @@ fn layout_dom_once(
             }
 
             let font_size = style.font_size.unwrap_or(13.333_333).max(1.0);
-            let (stretch_inline, stretch_block) = native_control_grid_stretch
-                .get(&id)
-                .copied()
-                .unwrap_or_default();
             let horizontal_edges =
                 style.padding.left + style.padding.right + style.border.left + style.border.right;
             let vertical_edges =
@@ -5993,22 +6017,14 @@ fn layout_dom_once(
                     )
                 }
             };
-            if style.width == crate::Dimension::Auto && !stretch_inline {
-                let declared_width = if style.box_sizing == crate::BoxSizing::ContentBox {
-                    (intrinsic_width - horizontal_edges).max(0.0)
-                } else {
-                    intrinsic_width
-                };
-                style.width = crate::Dimension::Px(declared_width);
-            }
-            if style.height == crate::Dimension::Auto && !stretch_block {
-                let declared_height = if style.box_sizing == crate::BoxSizing::ContentBox {
-                    (intrinsic_height - vertical_edges).max(0.0)
-                } else {
-                    intrinsic_height
-                };
-                style.height = crate::Dimension::Px(declared_height);
-            }
+            assign_native_control_size(
+                style,
+                native_control_grid_stretch.get(&id).copied().unwrap_or_default(),
+                intrinsic_width,
+                intrinsic_height,
+                horizontal_edges,
+                vertical_edges,
+            );
         }
 
         resolve_grid_areas(tree, root_id, &mut styles);
@@ -9551,15 +9567,6 @@ fn is_flattenable_inline(
     if element.local.as_ref() == "br" {
         return false;
     }
-    if rendered_descendants(tree, id).iter().any(|descendant| {
-        tree.get_node(*descendant).is_some_and(|node| {
-            node.as_element().is_some_and(|element| {
-                crate::inline::is_replaced(element.local.as_ref())
-            })
-        })
-    }) {
-        return false;
-    }
     let Some(style) = styles.get(&id) else {
         return false;
     };
@@ -11405,6 +11412,39 @@ enum ContainerAutoBlockSize {
     StretchedGridItem,
 }
 
+/// Assign a native control's intrinsic border-box size to its auto axes.
+/// The intrinsic figures are border boxes (Chromium's control metrics), so
+/// a content-box control receives the content part. An authored width or
+/// height keeps winning, as does a grid axis that stretches the item:
+/// only an untouched auto axis adopts the intrinsic value.
+fn assign_native_control_size(
+    style: &mut crate::LayoutStyle,
+    stretched_grid_item: (bool, bool),
+    intrinsic_width: f32,
+    intrinsic_height: f32,
+    horizontal_edges: f32,
+    vertical_edges: f32,
+) {
+    let (stretch_inline, stretch_block) = stretched_grid_item;
+    let content_box = style.box_sizing == crate::BoxSizing::ContentBox;
+    if style.width == crate::Dimension::Auto && !stretch_inline {
+        let declared = if content_box {
+            (intrinsic_width - horizontal_edges).max(0.0)
+        } else {
+            intrinsic_width
+        };
+        style.width = crate::Dimension::Px(declared);
+    }
+    if style.height == crate::Dimension::Auto && !stretch_block {
+        let declared = if content_box {
+            (intrinsic_height - vertical_edges).max(0.0)
+        } else {
+            intrinsic_height
+        };
+        style.height = crate::Dimension::Px(declared);
+    }
+}
+
 /// Classify how an auto inline-size is resolved. Stretched grid items need
 /// their intrinsic contribution contained without replacing the final auto
 /// size that stretch alignment consumes.
@@ -12303,64 +12343,6 @@ fn build(
             let leaf = taffy_tree.new_leaf_with_context(taffy_style, item).ok()?;
             id_map.insert(leaf, id);
             ifc_items.whole.insert(id, item);
-            return Some(leaf);
-        }
-    }
-
-    // An ordinary inline wrapper that contains a replaced child (for example
-    // `<a><img><span>Product</span></a>`) is not a pure text context, but it is
-    // still an inline formatting context. The generic element path has no
-    // block children to measure here and can leave the owner at zero size when
-    // the image has no intrinsic dimensions. Keep the owner as a shrink-to-fit
-    // flex wrapper so its text remains clickable even when the image is broken.
-    let has_replaced_inline_descendant = style.display == crate::Display::Inline
-        && !style.is_inline_block
-        && rendered_descendants(tree, id).iter().any(|descendant| {
-            tree.get_node(*descendant).is_some_and(|node| {
-                node.as_element().is_some_and(|element| {
-                    crate::inline::is_replaced(element.local.as_ref())
-                })
-            })
-        });
-    if has_replaced_inline_descendant {
-        let children: Vec<_> = rendered_children(tree, id)
-            .into_iter()
-            .flat_map(|cid| {
-                let child_has_replaced = tree.get_node(cid).is_some_and(|node| {
-                    node.as_element().is_some_and(|element| {
-                        crate::inline::is_replaced(element.local.as_ref())
-                    }) || rendered_descendants(tree, cid).iter().any(|descendant| {
-                        tree.get_node(*descendant).is_some_and(|node| {
-                            node.as_element().is_some_and(|element| {
-                                crate::inline::is_replaced(element.local.as_ref())
-                            })
-                        })
-                    })
-                });
-                let child_is_plain_inline = styles
-                    .get(&cid)
-                    .is_some_and(|child_style| child_style.display == crate::Display::Inline)
-                    && !child_has_replaced;
-                if child_is_plain_inline {
-                    build(
-                        tree, cid, taffy_tree, id_map, words, engine, ifc_items, styles,
-                    )
-                    .into_iter()
-                    .collect::<Vec<_>>()
-                } else {
-                    build_any(
-                        tree, cid, taffy_tree, id_map, words, engine, ifc_items, styles,
-                    )
-                }
-            })
-            .collect();
-        if !children.is_empty() {
-            let mut inline_style = run_wrapper_style(style, true);
-            inline_style.flex_grow = 0.0;
-            let leaf = taffy_tree
-                .new_with_children(inline_style, &children)
-                .ok()?;
-            id_map.insert(leaf, id);
             return Some(leaf);
         }
     }
@@ -19360,30 +19342,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "paint")]
-    #[test]
-    fn adjacent_inline_owners_keep_only_their_own_wrapped_line_fragments() {
-        let tree = parse_html(
-            r#"<style>
-                html,body,p { margin:0 }
-                p { width:60px; font:16px/20px monospace }
-            </style>
-            <p><a id="a0">item0</a> <a id="a1">item1</a> <a id="a2">item2</a></p>"#,
-        );
-        let laid = layout_dom(&tree, (200.0, 100.0));
-
-        for id in ["a0", "a1", "a2"] {
-            let node = tree.get_element_by_id(id).unwrap();
-            let fragments = &laid.inline_fragments[&node];
-            assert_eq!(fragments.len(), 1, "{id} claimed another line: {fragments:?}");
-            assert!(
-                fragments[0].width > 0.0,
-                "{id} has no inline width: {fragments:?}"
-            );
-            assert_eq!(laid.rects[&node], fragments[0]);
-        }
-    }
-
     #[test]
     fn wrapped_decorated_inline_exposes_three_ordered_font_box_fragments() {
         let tree = parse_html(
@@ -20373,14 +20331,45 @@ mod tests {
     }
 
     #[test]
-    fn inline_owner_with_replaced_child_keeps_text_geometry() {
+    fn textarea_intrinsic_box_comes_from_rows_and_cols() {
+        // #685: an empty textarea must keep a real control box instead of
+        // laying out as a plain block. Chromium calibrates cols=20/rows=2 to
+        // a 168x36 border box with one 15px control line per row.
         let tree = parse_html(
-            r#"<article><a id="card"><img src="broken"><span>Product</span></a></article>"#,
+            r#"<style>html, body { margin: 0 }</style>
+            <div><textarea id="plain"></textarea></div>
+            <div><textarea id="rows8" rows="8"></textarea></div>
+            <div><textarea id="cssheight" style="height: 36px"></textarea></div>
+            <div><textarea id="invalid-rows" rows="0"></textarea></div>"#,
         );
-        let laid = layout_dom(&tree, (800.0, 600.0));
-        let card = laid.rects[&tree.get_element_by_id("card").unwrap()];
+        let laid = layout_dom(&tree, (1280.0, 720.0));
+        let rect = |id: &str| laid.rects[&tree.get_element_by_id(id).unwrap()];
 
-        assert!(card.width > 0.0, "inline owner width collapsed: {card:?}");
-        assert!(card.height > 0.0, "inline owner height collapsed: {card:?}");
+        let plain = rect("plain");
+        assert!((plain.width - 168.0).abs() < 0.5, "{}", plain.width);
+        assert!((plain.height - 36.0).abs() < 0.5, "{}", plain.height);
+
+        let rows8 = rect("rows8");
+        assert!((rows8.width - 168.0).abs() < 0.5);
+        assert!((rows8.height - 126.0).abs() < 0.5, "{}", rows8.height);
+
+        // Author height wins over the rows-derived intrinsic height, and the
+        // control is border-box, so 36px stays the border-box height.
+        let cssheight = rect("cssheight");
+        assert!(
+            (cssheight.height - 36.0).abs() < 0.5,
+            "{}",
+            cssheight.height
+        );
+
+        // rows/cols are limited to positive numbers; anything else falls
+        // back to the HTML defaults (rows=2).
+        let invalid = rect("invalid-rows");
+        assert!((invalid.height - 36.0).abs() < 0.5, "{}", invalid.height);
+
+        // The control is an atomic inline-block, not a stretched block.
+        let style = &laid.styles[&tree.get_element_by_id("plain").unwrap()];
+        assert_eq!(style.display, crate::Display::Inline);
+        assert!(style.is_inline_block);
     }
 }

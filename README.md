@@ -37,7 +37,31 @@ Obscura is a headless browser engine written in Rust, built for web scraping and
 | Puppeteer    | **Yes**      | Yes              |
 | Playwright   | **Yes**      | Yes              |
 
-## 🎉 10,000 stars and what's next
+<table>
+  <tr>
+    <td width="90" align="center">
+      <a href="https://blog.cloudflare.com/kitesurf/">
+        <img
+          src="https://cdn.simpleicons.org/cloudflare/F38020"
+          alt="Cloudflare"
+          width="54"
+        />
+      </a>
+    </td>
+    <td>
+      <strong>Obscura inspired Cloudflare Kitesurf’s first prototype</strong>
+      <br>
+      Cloudflare began by porting Obscura to Workers while developing its
+      new agent-first browser.
+      <br>
+      <a href="https://blog.cloudflare.com/kitesurf/">
+        Read Cloudflare’s engineering story →
+      </a>
+    </td>
+  </tr>
+</table>
+
+## Obscura Cloud
 
 We are working on **Obscura Cloud** the hosted version, with managed infrastructure, residential proxies, and dedicated support. For people who want the engine without operating it themselves.
 
@@ -56,18 +80,21 @@ Want to sponsor? Email [hello@obscura.sh](mailto:hello@obscura.sh).
 <table>
    <tr>
     <td width="200" align="center" valign="middle">
-      <a href="https://go.nodemaven.com/obscura" target="_blank">
-        <img alt="NodeMaven" src="assets/sponsors/nodemaven.svg" width="180"/>
+      <a href="https://go.nodemaven.com/obscuraRMaugust" target="_blank">
+        <img alt="NodeMaven" src="assets/sponsors/nodemaven2.png" width="180"/>
       </a>
     </td>
     <td valign="middle">
-      <a href="https://go.nodemaven.com/obscuraread"><b>NodeMaven</b></a> — the most reliable proxy provider with the highest quality IPs on the market. Built for automation, web scraping, SEO research, and social media management.<br><br>
-      <b>99.9% uptime<br>
-      Sticky sessions up to 7 days<br>
-      IP filtering on every proxy<br>
+      <a href="https://go.nodemaven.com/obscuraRMaugust" target="_blank"><b>NodeMaven</b></a>: The most efficient proxy provider for Web Scraping and Automation with the Highest Quality IP on the market.<br><br>
+      <b>Why <a href="https://go.nodemaven.com/obscuraRMaugust" target="_blank">NodeMaven</a>?</b><br>
+      ZIP targeting<br>
+      99.9% uptime<br>
+      IP filtering: all proxies have fraud score &lt;97%<br>
       No KYC required<br>
-      Cashback on traffic — earn up to 10% back<br><br></b>
-      🎁 Use code <b>OBSCURA35</b> for 35% off Mobile & Residential, or <b>OBSCURA40</b> for 40% off ISP (Static) proxies.
+      Unique free tools: Proxy Bandwidth Checker, Meta Tag Checker, IP Lookup and others!<br><br>
+      🎁 <b>Special codes for Obscura users:</b><br>
+      <b>OBSCURA35</b> - 35% off to Mobile and Residential Proxies<br>
+      <b>OBSCURA40</b> - 40% off to ISP (Static) Proxies
     </td>
   </tr>
   <tr>
@@ -87,16 +114,6 @@ Want to sponsor? Email [hello@obscura.sh](mailto:hello@obscura.sh).
       🎁 Use code <b>OBSCURA35</b> for a <b>35% recurring discount</b>.<br><br></b>
       Better proxies. Fewer blocks. More scalable automation.
     </td>
-  </tr>
-      <td width="200" align="center" valign="middle">
-        <a href="https://9proxy.com/?utm_source=Github&utm_campaign=obscura" target="_blank">
-          <img alt="9Proxy" src="assets/sponsors/9proxy.png" width="180"/>
-        </a>
-      </td>
-      <td valign="middle">
-        <a href="https://9proxy.com/?utm_source=Github&utm_campaign=obscura"><b>9Proxy</b></a> provides residential proxies from
-  just $0.018/IP or $0.68/GB. 20M+ IPs across 90+ countries. Sticky or rotating sessions, managed from desktop or mobile app.
-      </td>
     </tr>
     <td width="200" align="center" valign="middle">
       <a href="https://www.thordata.com/?ls=dob&lk=dob" target="_blank">
@@ -254,6 +271,22 @@ obscura fetch https://example.com --screenshot page.png
 
 # The screenshot flag also has a short form
 obscura fetch https://example.com -s page.png
+
+### Testing against localhost / LAN dev servers
+
+Obscura blocks fetches to private/internal IPs by default (SSRF protection).
+To point it at a local dev server, pass `--allow-private-network` (or set
+`OBSCURA_ALLOW_PRIVATE_NETWORK=1`):
+
+```bash
+obscura fetch http://127.0.0.1:3000 --allow-private-network --dump text
+
+# Works on any subcommand, e.g. the CDP server for local Puppeteer/Playwright:
+obscura serve --port 9222 --allow-private-network
+```
+
+See [docs/Environment-variables.md](docs/Environment-variables.md) for the
+full allow/deny rules (DNS-resolution-time checks included).
 ```
 
 ## Rendering

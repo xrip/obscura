@@ -2,103 +2,39 @@ use serde_json::{json, Value};
 
 use crate::dispatch::CdpContext;
 
-fn frame_hit_in_realm(
-    page: &mut obscura_browser::Page,
-    frame_index: Option<usize>,
-    x: f64,
-    y: f64,
-) -> Option<(u32, f64, f64)> {
-    let expression = format!(
-        "(function() {{\
-            var best = null;\
-            var frames = globalThis.__obscura_frameElements || {{}};\
-            Object.keys(frames).forEach(function(key) {{\
-                var frame = frames[key];\
-                if (!frame || !frame._frameId || !frame.getBoundingClientRect) return;\
-                var rect = frame.getBoundingClientRect();\
-                if ({x} < rect.left || {x} > rect.right || {y} < rect.top || {y} > rect.bottom) return;\
-                var area = Math.max(1, rect.width * rect.height);\
-                if (!best || area < best.area) best = {{\
-                    frameId: frame._frameId >>> 0,\
-                    x: {x} - rect.left,\
-                    y: {y} - rect.top,\
-                    area: area\
-                }};\
-            }});\
-            return best;\
-        }})()",
-        x = x,
-        y = y,
-    );
-    let hit = match frame_index {
-        Some(index) => page.evaluate_in_frame(index, &expression).ok()?,
-        None => page.evaluate(&expression),
-    };
-    let frame_id = hit.get("frameId").and_then(Value::as_u64)? as u32;
-    let local_x = hit.get("x").and_then(Value::as_f64)?;
-    let local_y = hit.get("y").and_then(Value::as_f64)?;
-    Some((frame_id, local_x, local_y))
-}
-
-fn frame_at_point(
-    page: &mut obscura_browser::Page,
-    x: f64,
-    y: f64,
-) -> Option<(usize, f64, f64)> {
-    let (root_frame_id, mut local_x, mut local_y) = frame_hit_in_realm(page, None, x, y)?;
-    let frame_index = page
-        .frames
-        .iter()
-        .position(|frame| frame.frame_id() == root_frame_id)?;
-
-    // A browsing context can contain another browsing context. CDP coordinates
-    // must be reduced one owner rectangle at a time until the deepest realm is
-    // reached, otherwise the event lands on the outer iframe element.
-    let mut current_index = frame_index;
-    for _ in 0..32 {
-        let current_frame_id = page.frames[current_index].frame_id();
-        let Some((nested_frame_id, nested_x, nested_y)) =
-            frame_hit_in_realm(page, Some(current_index), local_x, local_y)
-        else {
-            break;
-        };
-        let Some(nested_index) = page.frames.iter().position(|frame| {
-            frame.parent_frame_id() == current_frame_id && frame.frame_id() == nested_frame_id
-        }) else {
-            break;
-        };
-        current_index = nested_index;
-        local_x = nested_x;
-        local_y = nested_y;
-    }
-
-    Some((current_index, local_x, local_y))
-}
-
-// Insert `escaped_text` at the caret, replacing any non-collapsed selection
-// the way a real browser does when you type over selected text (for example
-// after a triple-click select-all). selectionStart is null during ordinary
-// typing, so the legacy append path is kept when no selection is tracked.
-fn insert_text_js(escaped_text: &str) -> String {
+// Insert `text` at the caret, replacing any non-collapsed selection the way a
+// real browser does when you type over selected text (for example after a
+// triple-click select-all). selectionStart is null during ordinary typing, so
+// the legacy append path is kept when no selection is tracked.
+//
+// The text is embedded as a JSON string literal rather than escaped by hand
+// into single quotes. JSON string syntax is a subset of JavaScript's, so this
+// covers the quote and the backslash of issue #433 and the control characters
+// they left out: a newline inside a single-quoted literal is a syntax error,
+// so the whole snippet was dropped and nothing was inserted. obscura-mcp
+// already builds its typing snippet this way.
+fn insert_text_js(text: &str) -> String {
+    let literal = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_string());
     format!(
         "(function() {{\
             var t = document.activeElement;\
             if (!t || (t.localName !== 'input' && t.localName !== 'textarea')) return;\
+            var ins = {text};\
             var v = t.value || '';\
             var s = t.selectionStart, e = t.selectionEnd;\
             if (s == null) {{\
-                globalThis.__obscura_setFieldValue(t, 'value', v + '{text}');\
+                globalThis.__obscura_setFieldValue(t, 'value', v + ins);\
             }} else {{\
                 s = Math.max(0, Math.min(s, v.length));\
                 e = (e == null) ? s : Math.max(0, Math.min(e, v.length));\
                 var lo = Math.min(s, e), hi = Math.max(s, e);\
-                globalThis.__obscura_setFieldValue(t, 'value', v.slice(0, lo) + '{text}' + v.slice(hi));\
-                var caret = lo + ('{text}').length;\
+                globalThis.__obscura_setFieldValue(t, 'value', v.slice(0, lo) + ins + v.slice(hi));\
+                var caret = lo + ins.length;\
                 t.setSelectionRange(caret, caret);\
             }}\
             t.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {{bubbles:true}})));\
         }})()",
-        text = escaped_text,
+        text = literal,
     )
 }
 
@@ -180,35 +116,19 @@ pub async fn handle(
             let modifiers = params.get("modifiers").and_then(|v| v.as_u64()).unwrap_or(0);
             let (alt_key, ctrl_key, meta_key, shift_key) = modifier_flags(modifiers);
 
-            if matches!(event_type, "mouseMoved" | "mousePressed" | "mouseReleased") {
-                if let Some(page) = ctx.get_session_page_mut(session_id) {
-                    page.sync_frame_viewports();
-                }
-            }
-
             if event_type == "mousePressed" {
                 if let Some(page) = ctx.get_session_page_mut(session_id) {
-                    let frame = frame_at_point(page, x, y);
-                    let (event_x, event_y) = frame
-                        .map(|(_, local_x, local_y)| (local_x, local_y))
-                        .unwrap_or((x, y));
                     let code = format!(
                         "(function() {{\
-                            if ({button_code} === 0 && typeof globalThis.__obscura_prepareMouse === 'function') {{\
-                                globalThis.__obscura_prepareMouse('mousePressed', {x}, {y}, {click_count});\
-                                return;\
-                            }}\
                             var target = (document.elementFromPoint && document.elementFromPoint({x},{y})) || globalThis.__obscura_click_target || document.activeElement || document.body;\
                             if (!target) return;\
                             globalThis.__obscura_click_target = target;\
                             globalThis.__obscura_mouse_down = {{target:target,button:{button_code},clickCount:{click_count}}};\
-                            var pointerInit = {{bubbles:true,cancelable:true,view:globalThis,screenX:{x} + (globalThis.__obscura_inputScreenX ?? globalThis.screenX ?? 0),screenY:{y} + (globalThis.__obscura_inputScreenY ?? globalThis.screenY ?? 0),clientX:{x},clientY:{y},pageX:{x},pageY:{y},button:{button_code},buttons:{buttons},detail:{click_count},pointerId:1,pointerType:'mouse',isPrimary:true,pressure:0.5,width:1,height:1,altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}};\
-                            target.dispatchEvent(globalThis.__obscura_markTrusted(new PointerEvent('pointerdown', pointerInit)));\
-                            var evt = globalThis.__obscura_markTrusted(new MouseEvent('mousedown', {{bubbles:true,cancelable:true,view:globalThis,screenX:{x} + (globalThis.__obscura_inputScreenX ?? globalThis.screenX ?? 0),screenY:{y} + (globalThis.__obscura_inputScreenY ?? globalThis.screenY ?? 0),clientX:{x},clientY:{y},pageX:{x},pageY:{y},button:{button_code},buttons:{buttons},detail:{click_count},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
+                            var evt = globalThis.__obscura_markTrusted(new MouseEvent('mousedown', {{bubbles:true,cancelable:true,view:globalThis,clientX:{x},clientY:{y},button:{button_code},buttons:{buttons},detail:{click_count},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
                             target.dispatchEvent(evt);\
                         }})()",
-                        x = event_x,
-                        y = event_y,
+                        x = x,
+                        y = y,
                         button_code = button_code,
                         buttons = buttons,
                         click_count = click_count,
@@ -217,32 +137,18 @@ pub async fn handle(
                         meta_key = meta_key,
                         shift_key = shift_key,
                     );
-                    if let Some((frame_index, _, _)) = frame {
-                        let _ = page.evaluate_in_frame(frame_index, &code);
-                    } else {
-                        page.evaluate(&code);
-                    }
+                    page.evaluate(&code);
                 }
             } else if event_type == "mouseReleased" {
-                let navigation = if let Some(page) = ctx.get_session_page_mut(session_id) {
-                    let frame = frame_at_point(page, x, y);
-                    let (event_x, event_y) = frame
-                        .map(|(_, local_x, local_y)| (local_x, local_y))
-                        .unwrap_or((x, y));
+                if let Some(page) = ctx.get_session_page_mut(session_id) {
                     let code = format!(
                         "(function() {{\
-                            var routed = {button_code} === 0 && typeof globalThis.__obscura_prepareMouse === 'function'\
-                                ? globalThis.__obscura_prepareMouse('mouseReleased', {x}, {y}, {click_count}) : null;\
-                            var target = routed || (document.elementFromPoint && document.elementFromPoint({x},{y})) || globalThis.__obscura_click_target || document.activeElement || document.body;\
+                            var target = (document.elementFromPoint && document.elementFromPoint({x},{y})) || globalThis.__obscura_click_target || document.activeElement || document.body;\
                             if (!target) return;\
                             var down = globalThis.__obscura_mouse_down;\
                             globalThis.__obscura_mouse_down = null;\
-                            if (!routed) {{\
-                                var pointerInit = {{bubbles:true,cancelable:true,composed:true,view:globalThis,screenX:{x} + (globalThis.__obscura_inputScreenX ?? globalThis.screenX ?? 0),screenY:{y} + (globalThis.__obscura_inputScreenY ?? globalThis.screenY ?? 0),clientX:{x},clientY:{y},pageX:{x},pageY:{y},button:{button_code},buttons:0,detail:{click_count},pointerId:1,pointerType:'mouse',isPrimary:true,pressure:0,width:1,height:1,altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}};\
-                                target.dispatchEvent(globalThis.__obscura_markTrusted(new PointerEvent('pointerup', pointerInit)));\
-                                var evt = globalThis.__obscura_markTrusted(new MouseEvent('mouseup', {{bubbles:true,cancelable:true,composed:true,view:globalThis,screenX:{x} + (globalThis.__obscura_inputScreenX ?? globalThis.screenX ?? 0),screenY:{y} + (globalThis.__obscura_inputScreenY ?? globalThis.screenY ?? 0),clientX:{x},clientY:{y},pageX:{x},pageY:{y},button:{button_code},buttons:0,detail:{click_count},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
-                                target.dispatchEvent(evt);\
-                            }}\
+                            var evt = globalThis.__obscura_markTrusted(new MouseEvent('mouseup', {{bubbles:true,cancelable:true,view:globalThis,clientX:{x},clientY:{y},button:{button_code},buttons:0,detail:{click_count},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
+                            target.dispatchEvent(evt);\
                             if (!down || down.button !== {button_code} || {button_code} !== 0) return;\
                             var clickTarget = down.target;\
                             while (clickTarget && clickTarget !== target && !(clickTarget.contains && clickTarget.contains(target))) {{\
@@ -270,7 +176,7 @@ pub async fn handle(
                             }} else if (checkable) {{\
                                 clickTarget.checked = !oldChecked;\
                             }}\
-                            var click = globalThis.__obscura_markTrusted(new MouseEvent('click', {{bubbles:true,cancelable:true,composed:true,view:globalThis,screenX:{x} + (globalThis.__obscura_inputScreenX ?? globalThis.screenX ?? 0),screenY:{y} + (globalThis.__obscura_inputScreenY ?? globalThis.screenY ?? 0),clientX:{x},clientY:{y},pageX:{x} + (globalThis.scrollX || 0),pageY:{y} + (globalThis.scrollY || 0),button:0,buttons:0,detail:{click_count},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
+                            var click = globalThis.__obscura_markTrusted(new MouseEvent('click', {{bubbles:true,cancelable:true,view:globalThis,clientX:{x},clientY:{y},button:0,buttons:0,detail:{click_count},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
                             var cancelled = !clickTarget.dispatchEvent(click);\
                             if (cancelled) {{\
                                 if (radioStates) {{\
@@ -300,8 +206,8 @@ pub async fn handle(
                                 else {{ clickTarget.selectionStart = 0; clickTarget.selectionEnd = len; }}\
                             }}\
                         }})()",
-                        x = event_x,
-                        y = event_y,
+                        x = x,
+                        y = y,
                         button_code = button_code,
                         click_count = click_count,
                         alt_key = alt_key,
@@ -309,68 +215,17 @@ pub async fn handle(
                         meta_key = meta_key,
                         shift_key = shift_key,
                     );
-                    if let Some((frame_index, _, _)) = frame {
-                        let _ = page.evaluate_in_frame(frame_index, &code);
-                    } else {
-                        page.evaluate(&code);
-                    }
+                    page.evaluate(&code);
                     let moved = page
                         .process_pending_navigation()
                         .await
                         .map_err(|e| e.to_string())?;
+                    // Fork: a single page app answers a click by routing itself,
+                    // with no document fetch. The client still has to be told the
+                    // frame moved, or the click looks like it did nothing.
                     if moved {
                         let url = page.url_string();
                         let frame_id = page.frame_id.clone();
-                        let page_id = page.id.clone();
-                        let is_document_navigation = page.network_events.iter().any(|event| {
-                            event.resource_type == "Document" && event.url == url
-                        });
-                        let network_events = if is_document_navigation {
-                            page.network_events.drain(..).collect::<Vec<_>>()
-                        } else {
-                            Vec::new()
-                        };
-                        Some((
-                            url,
-                            frame_id,
-                            page_id,
-                            network_events,
-                            page.lifecycle.is_network_idle(),
-                            is_document_navigation,
-                        ))
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-
-                if let Some((
-                    url,
-                    frame_id,
-                    page_id,
-                    network_events,
-                    reached_network_idle,
-                    is_document_navigation,
-                )) = navigation
-                {
-                    if is_document_navigation {
-                        let loader_id = format!("loader-{}", uuid::Uuid::new_v4());
-                        super::page::emit_navigation_events(
-                            ctx,
-                            session_id,
-                            &frame_id,
-                            &loader_id,
-                            &url,
-                            &page_id,
-                            &network_events,
-                            obscura_browser::lifecycle::WaitUntil::Load,
-                            reached_network_idle,
-                        );
-                    } else {
-                        // A single page app may answer a click by routing itself
-                        // without replacing its realm. Report the frame move, but
-                        // keep the still-live execution contexts intact.
                         ctx.pending_events.push(crate::types::CdpEvent {
                             method: "Page.frameNavigated".into(),
                             params: json!({
@@ -386,34 +241,6 @@ pub async fn handle(
                             }),
                             session_id: Some(session_id.clone().unwrap_or_default()),
                         });
-                    }
-                }
-            } else if event_type == "mouseMoved" {
-                if let Some(page) = ctx.get_session_page_mut(session_id) {
-                    if let Some((frame_index, local_x, local_y)) = frame_at_point(page, x, y) {
-                        let code = format!(
-                            "(function() {{\
-                                if (typeof globalThis.__obscura_prepareMouse === 'function') {{\
-                                    globalThis.__obscura_prepareMouse('mouseMoved', {x}, {y}, {click_count});\
-                                    return;\
-                                }}\
-                                var target = (document.elementFromPoint && document.elementFromPoint({x},{y})) || document.body;\
-                                if (!target) return;\
-                                var pointerInit = {{bubbles:true,cancelable:false,view:globalThis,screenX:{x} + (globalThis.__obscura_inputScreenX ?? globalThis.screenX ?? 0),screenY:{y} + (globalThis.__obscura_inputScreenY ?? globalThis.screenY ?? 0),clientX:{x},clientY:{y},pageX:{x},pageY:{y},button:{button_code},buttons:{buttons},detail:0,pointerId:1,pointerType:'mouse',isPrimary:true,pressure:0,width:1,height:1,altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}};\
-                                target.dispatchEvent(globalThis.__obscura_markTrusted(new PointerEvent('pointermove', pointerInit)));\
-                                target.dispatchEvent(globalThis.__obscura_markTrusted(new MouseEvent('mousemove', {{bubbles:true,cancelable:false,view:globalThis,screenX:{x} + (globalThis.__obscura_inputScreenX ?? globalThis.screenX ?? 0),screenY:{y} + (globalThis.__obscura_inputScreenY ?? globalThis.screenY ?? 0),clientX:{x},clientY:{y},pageX:{x},pageY:{y},button:{button_code},buttons:{buttons},detail:{click_count},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}})));\
-                            }})()",
-                            x = local_x,
-                            y = local_y,
-                            button_code = button_code,
-                            buttons = buttons,
-                            click_count = click_count,
-                            alt_key = alt_key,
-                            ctrl_key = ctrl_key,
-                            meta_key = meta_key,
-                            shift_key = shift_key,
-                        );
-                        let _ = page.evaluate_in_frame(frame_index, &code);
                     }
                 }
             } else if event_type == "mouseWheel" {
@@ -494,10 +321,7 @@ pub async fn handle(
                         page.evaluate(&js);
 
                         if !text.is_empty() && text != "\r" && text != "\n" {
-                            // Need to escape backslash BEFORE single-quote so the new
-                            // backslashes from quote escaping don't get double-escaped.
-                            let escaped_text = text.replace('\\', "\\\\").replace('\'', "\\'");
-                            page.evaluate(&insert_text_js(&escaped_text));
+                            page.evaluate(&insert_text_js(text));
                         }
 
                         if key == "Enter" {
@@ -538,8 +362,7 @@ pub async fn handle(
                     }
                     "char" => {
                         if !text.is_empty() {
-                            let escaped_text = text.replace('\\', "\\\\").replace('\'', "\\'");
-                            page.evaluate(&insert_text_js(&escaped_text));
+                            page.evaluate(&insert_text_js(text));
                             // Pump event loop so Angular change detection picks up the input
                             page.settle(50).await;
                         }
