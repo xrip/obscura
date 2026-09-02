@@ -52,7 +52,8 @@ pub(crate) const CHROME_TRANSPORT_PROFILES: &[(u32, wreq_util::Profile)] = &[
     (146, wreq_util::Profile::Chrome146),
     (147, wreq_util::Profile::Chrome147),
     (148, wreq_util::Profile::Chrome148),
-    (149, wreq_util::Profile::Chrome149),
+    // wreq-util 3.0.0-rc.12 caps at Chrome148; Chrome149/150 fall through
+    // to nearest-match above and emit a one-time warn_transport_mismatch_once.
 ];
 
 
