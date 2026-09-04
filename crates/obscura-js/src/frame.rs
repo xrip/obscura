@@ -1345,11 +1345,12 @@ mod tests {
             )
             .unwrap();
 
-        let error = parent
+        // Upstream #699 (ad29745) made unhandled rejections page-local: the
+        // bounded pump warns and keeps scheduling instead of surfacing Err.
+        parent
             .run_event_loop_bounded(100)
             .await
-            .expect_err("an unhandled rejection must still be reported");
-        assert!(error.contains("child rejection"), "unexpected error: {error}");
+            .expect("an unhandled rejection must not kill the pump");
         assert_eq!(parent.evaluate("1 + 1").unwrap(), serde_json::json!(2.0));
     }
 

@@ -3300,8 +3300,15 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
-            use tokio::io::AsyncWriteExt;
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
             let (mut sock, _) = listener.accept().await.unwrap();
+            // Drain the request head before answering. Windows sends RST when
+            // a socket closes with unread data, which aborts a fast client
+            // read of the short body (WSAECONNABORTED in this test). On
+            // loopback the request head arrives in one segment, so one read
+            // clears it.
+            let mut request = vec![0u8; 4096];
+            let _ = sock.read(&mut request).await;
             let mut header = String::from("HTTP/1.1 200 OK\r\nConnection: close\r\n");
             if with_content_length {
                 header.push_str(&format!("Content-Length: {body_len}\r\n"));
