@@ -140,7 +140,7 @@ pub async fn handle(
                     page.evaluate(&code);
                 }
             } else if event_type == "mouseReleased" {
-                if let Some(page) = ctx.get_session_page_mut(session_id) {
+                let moved_frame = if let Some(page) = ctx.get_session_page_mut(session_id) {
                     let code = format!(
                         "(function() {{\
                             var target = (document.elementFromPoint && document.elementFromPoint({x},{y})) || globalThis.__obscura_click_target || document.activeElement || document.body;\
@@ -157,8 +157,10 @@ pub async fn handle(
                             if (!clickTarget) return;\
                             var tag = clickTarget.tagName;\
                             var type = (clickTarget.getAttribute && clickTarget.getAttribute('type') || '').toLowerCase();\
+                            if (globalThis.__obscura_isDisabled(clickTarget)) return;\
                             var checkable = tag === 'INPUT' && (type === 'checkbox' || type === 'radio');\
                             var oldChecked = checkable ? !!clickTarget.checked : false;\
+                            var oldIndeterminate = checkable ? !!clickTarget.indeterminate : false;\
                             var radioStates = null;\
                             if (checkable && type === 'radio') {{\
                                 var radioName = clickTarget.getAttribute('name') || '';\
@@ -175,19 +177,26 @@ pub async fn handle(
                                 clickTarget.checked = true;\
                             }} else if (checkable) {{\
                                 clickTarget.checked = !oldChecked;\
+                                clickTarget.indeterminate = false;\
                             }}\
                             var click = globalThis.__obscura_markTrusted(new MouseEvent('click', {{bubbles:true,cancelable:true,view:globalThis,clientX:{x},clientY:{y},button:0,buttons:0,detail:{click_count},altKey:{alt_key},ctrlKey:{ctrl_key},metaKey:{meta_key},shiftKey:{shift_key}}}));\
                             var cancelled = !clickTarget.dispatchEvent(click);\
                             if (cancelled) {{\
                                 if (radioStates) {{\
                                     for (var rr = 0; rr < radioStates.length; rr++) radioStates[rr][0].checked = radioStates[rr][1];\
-                                }} else if (checkable) clickTarget.checked = oldChecked;\
+                                }} else if (checkable) {{ clickTarget.checked = oldChecked; clickTarget.indeterminate = oldIndeterminate; }}\
                                 return;\
                             }}\
                             if (checkable && clickTarget.checked !== oldChecked) {{\
                                 try {{ clickTarget.dispatchEvent(globalThis.__obscura_markTrusted(new Event('input', {{bubbles:true}}))); }} catch(e) {{}}\
                                 try {{ clickTarget.dispatchEvent(globalThis.__obscura_markTrusted(new Event('change', {{bubbles:true}}))); }} catch(e) {{}}\
                                 return;\
+                            }}\
+                            var labelHost = tag === 'LABEL' ? clickTarget : (clickTarget.closest ? clickTarget.closest('label') : null);\
+                            var interactiveHost = globalThis.__obscura_interactiveHost(clickTarget);\
+                            if (labelHost && !(interactiveHost && labelHost.contains(interactiveHost))) {{\
+                                var ctl = globalThis.__obscura_labeledControl(labelHost);\
+                                if (ctl && ctl !== clickTarget && globalThis.__obscura_activateLabel(labelHost, ctl, true)) {{ return; }}\
                             }}\
                             var link = clickTarget.closest ? clickTarget.closest('a[href]') : null;\
                             if (!link && tag === 'A' && clickTarget.getAttribute('href')) link = clickTarget;\
@@ -226,22 +235,33 @@ pub async fn handle(
                     if moved {
                         let url = page.url_string();
                         let frame_id = page.frame_id.clone();
-                        ctx.pending_events.push(crate::types::CdpEvent {
-                            method: "Page.frameNavigated".into(),
-                            params: json!({
-                                "frame": {
-                                    "id": frame_id,
-                                    "url": url,
-                                    "domainAndRegistry": "",
-                                    "securityOrigin": "",
-                                    "mimeType": "text/html",
-                                    "adFrameStatus": { "adFrameType": "none" },
-                                },
-                                "type": "Navigation",
-                            }),
-                            session_id: Some(session_id.clone().unwrap_or_default()),
-                        });
+                        Some((page.id.clone(), frame_id, url))
+                    } else {
+                        None
                     }
+                } else {
+                    None
+                };
+                if let Some((page_id, frame_id, url)) = moved_frame {
+                    let loader_id = ctx
+                        .current_loader_ids
+                        .get(&page_id)
+                        .cloned()
+                        .unwrap_or_else(|| format!("loader-blank-{page_id}"));
+                    ctx.pending_events.push(crate::types::CdpEvent {
+                        method: "Page.frameNavigated".into(),
+                        params: json!({
+                            "frame": crate::domains::page::frame_value(
+                                &frame_id,
+                                None,
+                                &loader_id,
+                                &url,
+                                "text/html",
+                            ),
+                            "type": "Navigation",
+                        }),
+                        session_id: Some(session_id.clone().unwrap_or_default()),
+                    });
                 }
             } else if event_type == "mouseWheel" {
                 let delta_x = params.get("deltaX").and_then(|v| v.as_f64()).unwrap_or(0.0);

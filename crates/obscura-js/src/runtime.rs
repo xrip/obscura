@@ -14,7 +14,8 @@ use crate::module_loader::{ModuleLoadActivity, ObscuraModuleLoader};
 #[cfg(all(test, feature = "render"))]
 use crate::ops::ensure_prepared_render;
 use crate::ops::{
-    build_extension, node_is_script, ObscuraState, OriginStorage, StoredNetworkResponseBody,
+    build_extension, node_is_script, ObscuraState, OriginStorage, RuntimeEvent,
+    RuntimeExceptionEvent, StoredNetworkResponseBody,
 };
 #[cfg(feature = "render")]
 use crate::ops::{
@@ -87,6 +88,18 @@ fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> &str {
         .map(String::as_str)
         .or_else(|| payload.downcast_ref::<&'static str>().copied())
         .unwrap_or("unknown panic")
+}
+
+/// Whether an event-loop task error is fatal to the page or page-local noise.
+/// deno_core reports a task's uncaught exception and an unhandled promise
+/// rejection as an event-loop error, but a browser treats both as page-local:
+/// window.onerror / unhandledrejection fire and later tasks still run. Only
+/// engine-level failures (watchdog termination, the heap cap, an exhausted
+/// task budget) make the loop itself unusable. (#699)
+pub fn is_fatal_event_loop_error(error: &str) -> bool {
+    error.contains("execution terminated")
+        || error.contains("heap limit exceeded")
+        || error.contains("task budget")
 }
 
 #[cfg(feature = "render")]
@@ -310,6 +323,15 @@ impl ObscuraJsRuntime {
             let _create_guard = ISOLATE_CREATE_LOCK
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+            // ICU falls back to the host OS locale when no default is set,
+            // so Intl.* formats and resolvedOptions().locale leaked the
+            // operator's real locale (an en-AU host showed en-AU) while
+            // navigator.language and Accept-Language say en-US. Pin the one
+            // locale the other surfaces claim (#734). Process-global and
+            // idempotent; setting it under the create lock guarantees it
+            // lands before the first isolate exists.
+            deno_core::v8::icu::set_default_locale("en-US");
 
             let mut runtime = JsRuntime::new(RuntimeOptions {
                 extensions: vec![build_extension()],
@@ -972,6 +994,101 @@ impl ObscuraJsRuntime {
         std::mem::take(&mut self.state.borrow_mut().pending_binding_calls)
     }
 
+    pub fn take_pending_runtime_events(&mut self) -> Vec<RuntimeEvent> {
+        let events: Vec<_> = self
+            .state
+            .borrow_mut()
+            .pending_runtime_events
+            .drain(..)
+            .collect();
+        for event in &events {
+            let RuntimeEvent::Console(event) = event else {
+                continue;
+            };
+            for arg in &event.args {
+                let Some(object_id) = arg.get("objectId").and_then(|value| value.as_str()) else {
+                    continue;
+                };
+                let frame_id = object_id
+                    .strip_prefix("console-")
+                    .and_then(|rest| rest.split_once('-'))
+                    .and_then(|(frame_id, _)| frame_id.parse::<u32>().ok())
+                    .unwrap_or(0);
+                let retrieval = if frame_id == 0 {
+                    format!("globalThis.__obscura_objects['{object_id}']")
+                } else {
+                    format!(
+                        "globalThis.__obscura_frameObjects[{frame_id}]?.window?.__obscura_objects['{object_id}']"
+                    )
+                };
+                self.object_store.insert(object_id.to_string(), retrieval);
+            }
+        }
+        events
+    }
+
+    pub fn set_runtime_events_enabled(&self, enabled: bool) {
+        self.state.borrow_mut().runtime_events_enabled = enabled;
+    }
+
+    fn record_uncaught_exception(&self, error: &deno_core::error::JsError, fallback_url: &str) {
+        let mut state = self.state.borrow_mut();
+        if !state.runtime_events_enabled {
+            return;
+        }
+        state.runtime_exception_counter = state.runtime_exception_counter.saturating_add(1);
+        let first = error.frames.first();
+        let url = first
+            .and_then(|frame| frame.file_name.clone())
+            .filter(|url| !url.is_empty())
+            .unwrap_or_else(|| fallback_url.to_string());
+        let line_number = first
+            .and_then(|frame| frame.line_number)
+            .unwrap_or(1)
+            .saturating_sub(1);
+        let column_number = first
+            .and_then(|frame| frame.column_number)
+            .unwrap_or(1)
+            .saturating_sub(1);
+        let stack_trace = error
+            .frames
+            .iter()
+            .map(|frame| {
+                serde_json::json!({
+                    "functionName": frame.function_name.as_deref().unwrap_or(""),
+                    "scriptId": "",
+                    "url": frame.file_name.as_deref().unwrap_or(fallback_url),
+                    "lineNumber": frame.line_number.unwrap_or(1).saturating_sub(1),
+                    "columnNumber": frame.column_number.unwrap_or(1).saturating_sub(1),
+                })
+            })
+            .collect();
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64()
+            * 1_000.0;
+        if state.pending_runtime_events.len() >= 1_024 {
+            state.pending_runtime_events.pop_front();
+        }
+        let exception_id = state.runtime_exception_counter;
+        state
+            .pending_runtime_events
+            .push_back(RuntimeEvent::Exception(RuntimeExceptionEvent {
+                exception_id,
+                name: error.name.clone().unwrap_or_else(|| "Error".to_string()),
+                description: error
+                    .stack
+                    .clone()
+                    .unwrap_or_else(|| error.exception_message.clone()),
+                url,
+                line_number,
+                column_number,
+                stack_trace,
+                timestamp,
+            }));
+    }
+
     pub fn get_network_response_body(&self, request_id: &str) -> Option<StoredNetworkResponseBody> {
         self.state
             .borrow()
@@ -1213,6 +1330,41 @@ impl ObscuraJsRuntime {
             viewport,
             base_url,
             [255, 255, 255, 255],
+        )
+    }
+
+    /// Paint an unprepared view of the current document against the runtime's
+    /// retained resource cache.
+    ///
+    /// `Page` falls back to a raw-DOM paint when a capture's viewport does not
+    /// match the prepared render key. That fallback used a fresh
+    /// `RenderResourceCache`, so it refetched every image on every call and a
+    /// repeated capture paid the network cost per frame. Reusing the cache the
+    /// runtime already holds for this document keeps the fallback correct while
+    /// fetching each resource once.
+    #[cfg(feature = "render")]
+    pub fn screenshot_unprepared_with_retained_resources(
+        &self,
+        viewport: (f32, f32),
+        base_url: Option<&str>,
+        scroll: (f32, f32),
+        animation_sample_time: obscura_render::AnimationSampleTime,
+        surface_color: [u8; 4],
+    ) -> Option<Vec<u8>> {
+        let mut state = self.state.borrow_mut();
+        let ObscuraState {
+            dom,
+            render_resources,
+            ..
+        } = &mut *state;
+        obscura_render::screenshot_png_scrolled_at_animation_time_with_surface_color_and_resources(
+            dom.as_ref()?,
+            viewport,
+            base_url,
+            scroll,
+            animation_sample_time,
+            surface_color,
+            render_resources,
         )
     }
 
@@ -1954,16 +2106,40 @@ impl ObscuraJsRuntime {
 
     pub fn release_object(&mut self, object_id: &str) {
         if self.object_store.remove(object_id).is_some() {
-            let code = format!("delete globalThis.__obscura_objects['{}'];", object_id,);
+            let frame_id = object_id
+                .strip_prefix("console-")
+                .and_then(|rest| rest.split_once('-'))
+                .and_then(|(frame_id, _)| frame_id.parse::<u32>().ok())
+                .unwrap_or(0);
+            let code = if frame_id == 0 {
+                format!("delete globalThis.__obscura_objects['{object_id}'];")
+            } else {
+                format!(
+                    "delete globalThis.__obscura_frameObjects[{frame_id}]?.window?.__obscura_objects['{object_id}'];"
+                )
+            };
             let _ = self.execute_runtime_script("<release>", code);
         }
     }
 
     pub fn release_object_group(&mut self) {
-        let _ = self.execute_runtime_script(
-            "<releaseGroup>",
-            "globalThis.__obscura_objects = {};".to_string(),
-        );
+        let mut frame_ids: Vec<u32> = self
+            .object_store
+            .keys()
+            .filter_map(|object_id| object_id.strip_prefix("console-"))
+            .filter_map(|rest| rest.split_once('-'))
+            .filter_map(|(frame_id, _)| frame_id.parse().ok())
+            .filter(|frame_id| *frame_id != 0)
+            .collect();
+        frame_ids.sort_unstable();
+        frame_ids.dedup();
+        let mut code = "globalThis.__obscura_objects = {};".to_string();
+        for frame_id in frame_ids {
+            code.push_str(&format!(
+                "if(globalThis.__obscura_frameObjects[{frame_id}]?.window)globalThis.__obscura_frameObjects[{frame_id}].window.__obscura_objects={{}};"
+            ));
+        }
+        let _ = self.execute_runtime_script("<releaseGroup>", code);
         self.object_store.clear();
     }
     pub async fn load_module(&mut self, url: &str, budget_ms: u64) -> Result<(), String> {
@@ -2221,16 +2397,17 @@ impl ObscuraJsRuntime {
 
     fn execute_classic_script(&mut self, name: &str, source: &str) -> Result<(), String> {
         self.begin_javascript_task();
+        let script_url = name.to_string();
         // JsRuntime::execute_script in deno_core 0.350 restricts `name` to a
         // &'static str. Browser script URLs are runtime data, and V8 uses this
         // origin as import()'s referrer, so compile in the runtime's main
         // context directly instead of substituting the fixed "<script>" name.
-        let result = (|| {
+        let result: Result<(), (String, Option<deno_core::error::JsError>)> = (|| {
             let scope = &mut self.runtime.handle_scope();
             let source = deno_core::v8::String::new(scope, source)
-                .ok_or_else(|| "JS error: source allocation failed".to_string())?;
+                .ok_or_else(|| ("JS error: source allocation failed".to_string(), None))?;
             let name = deno_core::v8::String::new(scope, name)
-                .ok_or_else(|| "JS error: script URL allocation failed".to_string())?;
+                .ok_or_else(|| ("JS error: script URL allocation failed".to_string(), None))?;
             let origin = deno_core::v8::ScriptOrigin::new(
                 scope,
                 name.into(),
@@ -2249,35 +2426,46 @@ impl ObscuraJsRuntime {
             let Some(script) = script else {
                 if scope.is_execution_terminating() {
                     scope.cancel_terminate_execution();
-                    return Err("JS error: Uncaught Error: execution terminated".to_string());
+                    return Err(("JS error: Uncaught Error: execution terminated".to_string(), None));
                 }
                 return match scope.exception() {
                     Some(exception) => {
                         let error = deno_core::error::JsError::from_v8_exception(scope, exception);
-                        Err(format!("JS error: {error}"))
+                        Err((format!("JS error: {error}"), Some(error)))
                     }
-                    None => {
-                        Err("JS error: script compilation failed without an exception".to_string())
-                    }
+                    None => Err((
+                        "JS error: script compilation failed without an exception".to_string(),
+                        None,
+                    )),
                 };
             };
             if script.run(scope).is_none() {
                 if scope.is_execution_terminating() {
                     scope.cancel_terminate_execution();
-                    return Err("JS error: Uncaught Error: execution terminated".to_string());
+                    return Err(("JS error: Uncaught Error: execution terminated".to_string(), None));
                 }
                 return match scope.exception() {
                     Some(exception) => {
                         let error = deno_core::error::JsError::from_v8_exception(scope, exception);
-                        Err(format!("JS error: {error}"))
+                        Err((format!("JS error: {error}"), Some(error)))
                     }
-                    None => {
-                        Err("JS error: script execution failed without an exception".to_string())
-                    }
+                    None => Err((
+                        "JS error: script execution failed without an exception".to_string(),
+                        None,
+                    )),
                 };
             }
             Ok(())
         })();
+        let result = match result {
+            Ok(()) => Ok(()),
+            Err((message, error)) => {
+                if let Some(error) = error.as_ref() {
+                    self.record_uncaught_exception(error, &script_url);
+                }
+                Err(message)
+            }
+        };
         self.finish_heap_checked(result)
     }
 
@@ -2503,7 +2691,17 @@ impl ObscuraJsRuntime {
                     self.runtime.v8_isolate().perform_microtask_checkpoint();
                     tokio::task::yield_now().await;
                 }
-                Ok(Err(error)) => break Err(error),
+                Ok(Err(error)) => {
+                    if is_fatal_event_loop_error(&error) {
+                        break Err(error);
+                    }
+                    // A page task threw or a promise rejected without a
+                    // handler. Chrome reports it and keeps scheduling; the
+                    // pump must do the same, or one throwing script starves
+                    // every later task (#699). The wall deadline above still
+                    // bounds a page that errors on every turn.
+                    tracing::warn!("page task error, continuing the event loop: {error}");
+                }
                 Err(_) => break Ok(()),
             }
         };
@@ -2619,6 +2817,15 @@ impl ObscuraJsRuntime {
             }
             match tick {
                 std::task::Poll::Ready(Ok(())) => std::task::Poll::Ready(Ok(true)),
+                // A page task error (uncaught exception, unhandled rejection)
+                // is page-local in a browser: log it, report one delivered
+                // task, and let the owner keep pumping (#699).
+                std::task::Poll::Ready(Err(error))
+                    if !is_fatal_event_loop_error(&error.to_string()) =>
+                {
+                    tracing::warn!("page task error, continuing the event loop: {error}");
+                    std::task::Poll::Ready(Ok(false))
+                }
                 std::task::Poll::Ready(Err(error)) => std::task::Poll::Ready(Err(format!(
                     "Event loop error: {error}"
                 ))),
@@ -2758,6 +2965,11 @@ impl ObscuraJsRuntime {
             match tick {
                 Ok(Ok(true)) => break Ok(()),
                 Ok(Ok(false)) | Err(_) => {}
+                // A page task error is page-local noise, not a reason to stop
+                // settling: later timers and fetches still run (#699).
+                Ok(Err(error)) if !is_fatal_event_loop_error(&error) => {
+                    tracing::warn!("page task error, continuing the event loop: {error}");
+                }
                 Ok(Err(error)) => break Err(error),
             }
         };
@@ -13609,6 +13821,301 @@ mod tests {
     }
 
     #[test]
+    fn test_label_click_activates_its_labeled_control() {
+        let mut rt = setup_runtime(
+            r#"<label id="explicit" for="a">a</label><input type="checkbox" id="a">
+               <label id="implicit">b <input type="checkbox" id="b"></label>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+            const ids = ['explicit', 'implicit'];
+            for (const id of ids) { document.getElementById(id).click(); }
+            return [document.getElementById('a').checked, document.getElementById('b').checked];
+        "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([true, true]));
+    }
+
+    #[test]
+    fn test_label_click_honors_the_association_rules() {
+        // A present `for` associates by id alone: an empty value associates
+        // nothing and must not fall back to the nested control, and a dangling
+        // id activates nothing. A disabled control has no activation behavior.
+        let mut rt = setup_runtime(
+            r#"<label id="empty" for="">a <input type="checkbox" id="a"></label>
+               <label id="dangling" for="missing">b</label><input type="checkbox" id="b">
+               <label id="disabled" for="c">c</label><input type="checkbox" id="c" disabled>
+               <label id="both" for="d">d <input type="checkbox" id="e"></label>
+               <input type="checkbox" id="d">"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+            for (const id of ['empty', 'dangling', 'disabled', 'both']) {
+                document.getElementById(id).click();
+            }
+            return ['a', 'b', 'c', 'd', 'e'].map(id => document.getElementById(id).checked);
+        "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([false, false, false, true, false])
+        );
+    }
+
+    #[test]
+    fn test_label_activation_does_not_double_fire_or_recurse() {
+        // Clicking the control inside its own label toggles once, and a click
+        // handler that clicks that label back cannot re-enter the forwarding.
+        let mut rt = setup_runtime(
+            r#"<label id="wrapper"><input type="checkbox" id="nested"></label>
+               <label id="host" for="reentrant">r</label>
+               <input type="checkbox" id="reentrant">"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+            const reentrant = document.getElementById('reentrant');
+            document.getElementById('nested').click();
+            let bounces = 0;
+            reentrant.addEventListener('click', () => {
+                if (bounces++ < 1) { document.getElementById('host').click(); }
+            });
+            document.getElementById('host').click();
+            return [document.getElementById('nested').checked, reentrant.checked, bounces];
+        "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([true, true, 1]));
+    }
+
+    #[test]
+    fn test_click_respects_disabled_controls_and_interactive_content() {
+        // A disabled control has no activation behaviour, whether it is clicked
+        // directly, reached through its label, or disabled by an ancestor
+        // fieldset. Interactive content inside a label swallows the label's
+        // activation, but an <a> without href is not interactive content.
+        let mut rt = setup_runtime(
+            r#"<input type="checkbox" id="direct" disabled>
+               <fieldset disabled><label id="in-set" for="set-box">s</label>
+                 <input type="checkbox" id="set-box"></fieldset>
+               <label id="link"><a href="/x"><span id="in-link">go</span></a>
+                 <input type="checkbox" id="link-box"></label>
+               <label id="plain"><a><span id="in-plain">go</span></a>
+                 <input type="checkbox" id="plain-box"></label>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+            const ids = ['direct', 'in-set', 'in-link', 'in-plain'];
+            for (const id of ids) { document.getElementById(id).click(); }
+            return ['direct', 'set-box', 'link-box', 'plain-box']
+                .map(id => document.getElementById(id).checked);
+        "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([false, false, false, true]));
+    }
+
+    #[test]
+    fn test_checkbox_indeterminate_is_idl_only_and_cleared_by_activation() {
+        // `indeterminate` has no content attribute, so it exists only if the
+        // prototype defines it -- `'indeterminate' in el` is the check that
+        // fails when it is missing. Activation clears it as well as toggling
+        // checkedness (HTML legacy-pre-activation behaviour), and a cancelled
+        // click puts both back, so a script-set flag is never left stuck.
+        let mut rt = setup_runtime(
+            r#"<input type="checkbox" id="fresh">
+               <input type="checkbox" id="click">
+               <input type="checkbox" id="cancel">"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+            const fresh = document.getElementById('fresh');
+            const present = 'indeterminate' in fresh;
+            const initial = fresh.indeterminate;
+            fresh.indeterminate = true;
+            const roundTrip = fresh.indeterminate;
+
+            const clicked = document.getElementById('click');
+            clicked.indeterminate = true;
+            clicked.click();
+
+            const cancelled = document.getElementById('cancel');
+            cancelled.indeterminate = true;
+            cancelled.addEventListener('click', e => e.preventDefault());
+            cancelled.click();
+
+            return [present, initial, roundTrip,
+                    clicked.checked, clicked.indeterminate,
+                    cancelled.checked, cancelled.indeterminate];
+        "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([true, false, true, true, false, false, true])
+        );
+    }
+
+    #[test]
+    fn test_disabled_only_applies_to_disableable_elements() {
+        // A `disabled` attribute is meaningless on anything that cannot be
+        // disabled, and only listed form controls inherit it from a fieldset.
+        // Component libraries do put `disabled` on plain <div>s, so treating
+        // that as disabled would silently stop their clicks.
+        let mut rt = setup_runtime(
+            r#"<div id="plain" disabled>x</div>
+               <fieldset disabled><a id="link" href="x">l</a>
+                 <input type="checkbox" id="control"></fieldset>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+            const seen = [];
+            for (const id of ['plain', 'link']) {
+                const el = document.getElementById(id);
+                el.addEventListener('click', e => { seen.push(id); e.preventDefault(); });
+                el.click();
+            }
+            document.getElementById('control').click();
+            return [seen.join(','), document.getElementById('control').checked];
+        "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!(["plain,link", false]));
+    }
+
+    #[test]
+    fn test_label_forwarding_uses_interactive_content_not_labelable() {
+        // meter, output and progress are labelable but not interactive, so a
+        // click on one still activates the label. An <a> counts only with href.
+        let mut rt = setup_runtime(
+            r#"<label id="l1" for="c1"><output id="o">v</output></label>
+               <input type="checkbox" id="c1">
+               <label id="l2" for="c2"><a id="bare">t</a></label>
+               <input type="checkbox" id="c2">
+               <label id="l3" for="c3"><a id="linked" href="x">t</a></label>
+               <input type="checkbox" id="c3">
+               <label id="l4" for="c4"><button id="btn" type="button">b</button></label>
+               <input type="checkbox" id="c4">"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+            const ids = ['o', 'bare', 'linked', 'btn'];
+            for (const id of ids) { document.getElementById(id).click(); }
+            return ['c1', 'c2', 'c3', 'c4'].map(id => document.getElementById(id).checked);
+        "#,
+            )
+            .unwrap();
+        assert_eq!(result, serde_json::json!([true, true, false, false]));
+    }
+
+    #[test]
+    fn test_radio_activation_moves_the_checked_peer_and_reverts_on_cancel() {
+        let mut rt = setup_runtime(
+            r#"<form><label id="pick" for="b">b</label>
+                 <input type="radio" name="g" id="a" checked>
+                 <input type="radio" name="g" id="b"></form>
+               <form><label id="veto" for="d">d</label>
+                 <input type="radio" name="h" id="c" checked>
+                 <input type="radio" name="h" id="d"></form>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+            const seen = [];
+            document.getElementById('b').addEventListener('change', () => seen.push('change'));
+            document.getElementById('pick').click();
+            document.getElementById('d').addEventListener('click', e => e.preventDefault());
+            document.getElementById('veto').click();
+            return [
+                document.getElementById('a').checked, document.getElementById('b').checked,
+                document.getElementById('c').checked, document.getElementById('d').checked,
+                seen.join(','),
+            ];
+        "#,
+            )
+            .unwrap();
+        // Activating b unchecks its peer a; the cancelled activation of d
+        // restores c.
+        assert_eq!(
+            result,
+            serde_json::json!([false, true, true, false, "change"])
+        );
+    }
+
+    #[test]
+    fn test_disabled_fieldset_exemption_is_the_first_legend_child_only() {
+        // Every disabled fieldset ancestor counts, and only descendants of that
+        // fieldset's first <legend> child escape it. A legend wrapped in a div
+        // is not the fieldset's legend, a second legend does not exempt, and an
+        // inner fieldset's legend does not escape an outer disabled fieldset.
+        let mut rt = setup_runtime(
+            r#"<fieldset disabled><legend><input type="checkbox" id="a"></legend>
+                 <input type="checkbox" id="b"></fieldset>
+               <fieldset disabled><legend>x</legend>
+                 <legend><input type="checkbox" id="c"></legend></fieldset>
+               <fieldset disabled><div><legend>
+                 <input type="checkbox" id="d"></legend></div></fieldset>
+               <fieldset disabled><div><fieldset disabled><legend>
+                 <input type="checkbox" id="e"></legend></fieldset></div></fieldset>
+               <fieldset disabled><fieldset><legend>
+                 <input type="checkbox" id="f"></legend></fieldset></fieldset>"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+            const ids = ['a', 'b', 'c', 'd', 'e', 'f'];
+            for (const id of ids) { document.getElementById(id).click(); }
+            return ids.map(id => document.getElementById(id).checked);
+        "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!([true, false, false, false, false, false])
+        );
+    }
+
+    #[test]
+    fn test_label_click_runs_checkbox_pre_click_activation() {
+        // The control flips before the click event dispatches, so listeners
+        // observe the new state, `input` and `change` follow, and a cancelled
+        // event restores the old state.
+        let mut rt = setup_runtime(
+            r#"<label id="live" for="live-box">a</label><input type="checkbox" id="live-box">
+               <label id="cancel" for="cancel-box">b</label>
+               <input type="checkbox" id="cancel-box">"#,
+        );
+        let result = rt
+            .evaluate(
+                r#"
+            const events = [];
+            const live = document.getElementById('live-box');
+            for (const type of ['click', 'input', 'change']) {
+                live.addEventListener(type, () => events.push(type + ':' + live.checked));
+            }
+            document.getElementById('live').click();
+            const cancelled = document.getElementById('cancel-box');
+            cancelled.addEventListener('click', event => event.preventDefault());
+            document.getElementById('cancel').click();
+            return [events.join(','), live.checked, cancelled.checked];
+        "#,
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!(["click:true,input:true,change:true", true, false])
+        );
+    }
+
+    #[test]
     fn test_dispatch_mouse_event_runs_listener() {
         let mut rt = setup_runtime(r#"<button id="go">Go</button>"#);
         let result = rt
@@ -14538,6 +15045,320 @@ mod tests {
         );
     }
 
+    /// Document URL two levels deep, base one level deep and the origin root on neither of the
+    /// two. The three possible bases land on three different paths, and one assert keeps them
+    /// apart:
+    ///   document base URL  ->  /app/data/x.json   (the spec)
+    ///   document URL       ->  /deep/data/x.json  (the bug)
+    ///   origin root        ->  /data/x.json       (a base "/" would hide this one)
+    fn setup_runtime_at_deep_url(html: &str) -> ObscuraJsRuntime {
+        let dom = parse_html(html);
+        let mut rt = ObscuraJsRuntime::new();
+        rt.set_dom(dom);
+        rt.set_url("http://example.com/deep/page");
+        rt.run_page_init();
+        rt
+    }
+
+    const BASE_HREF_PAGE: &str = r#"<html><head><base href="/app/"></head><body>
+            <a id="link" href="data/x.json"></a>
+            <form id="form" action="submit"></form>
+            <script id="script" src="chunk.js"></script>
+        </body></html>"#;
+
+    #[test]
+    fn base_href_governs_dom_url_reflection() {
+        let mut rt = setup_runtime_at_deep_url(BASE_HREF_PAGE);
+
+        // One evaluate, one assert: a bundle of assert_eq! aborts at the first failure and
+        // reports one broken path while hiding the others.
+        let seen = rt
+            .evaluate(
+                r#"return [
+                    document.baseURI,
+                    document.getElementById('link').href,
+                    document.getElementById('form').action,
+                    document.getElementById('script').src,
+                ]"#,
+            )
+            .unwrap();
+        assert_eq!(
+            seen.as_array().unwrap(),
+            &vec![
+                serde_json::json!("http://example.com/app/"),
+                serde_json::json!("http://example.com/app/data/x.json"),
+                serde_json::json!("http://example.com/app/submit"),
+                serde_json::json!("http://example.com/app/chunk.js"),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_relative_location_assignment_follows_the_base() {
+        // _resolveUrl serves location.href=, assign, replace and window.location=. Of the six
+        // call sites it has the largest external effect, so it gets its own test.
+        let mut rt = setup_runtime_at_deep_url(BASE_HREF_PAGE);
+        rt.evaluate("location.href = 'users/42'").unwrap();
+
+        let landed = rt.evaluate("location.href").unwrap();
+        assert_eq!(landed.as_str().unwrap(), "http://example.com/app/users/42");
+    }
+
+    #[test]
+    fn without_base_href_resolution_stays_on_the_document_url() {
+        let mut rt = setup_runtime_at_deep_url(
+            r#"<html><head></head><body>
+                <a id="link" href="data/x.json"></a>
+                <form id="form" action="submit"></form>
+                <script id="script" src="chunk.js"></script>
+            </body></html>"#,
+        );
+
+        // Every call site, not just the anchor: a site that resolves to the origin root instead
+        // of the document URL slips through on a page without a base only when nobody is looking.
+        let seen = rt
+            .evaluate(
+                r#"return [
+                    document.baseURI,
+                    document.getElementById('link').href,
+                    document.getElementById('form').action,
+                    document.getElementById('script').src,
+                ]"#,
+            )
+            .unwrap();
+        assert_eq!(
+            seen.as_array().unwrap(),
+            &vec![
+                serde_json::json!("http://example.com/deep/page"),
+                serde_json::json!("http://example.com/deep/data/x.json"),
+                serde_json::json!("http://example.com/deep/submit"),
+                serde_json::json!("http://example.com/deep/chunk.js"),
+            ]
+        );
+    }
+
+    #[test]
+    fn base_element_href_reflects_the_resolved_url() {
+        // Resolved against the fallback base URL, i.e. the document URL and not /app/.
+        let mut rt = setup_runtime_at_deep_url(BASE_HREF_PAGE);
+        let href = rt.evaluate("document.querySelector('base').href").unwrap();
+        assert_eq!(href.as_str().unwrap(), "http://example.com/app/");
+
+        let mut relative = setup_runtime_at_deep_url(
+            r#"<html><head><base href="assets/"></head><body></body></html>"#,
+        );
+        let href = relative
+            .evaluate("document.querySelector('base').href")
+            .unwrap();
+        assert_eq!(href.as_str().unwrap(), "http://example.com/deep/assets/");
+    }
+
+    #[test]
+    fn the_first_base_with_an_href_wins() {
+        // Tree order, and a <base> without href does not count.
+        let mut rt = setup_runtime_at_deep_url(
+            r#"<html><head><base><base href="/a/"><base href="/b/"></head><body>
+                <a id="link" href="x.json"></a>
+            </body></html>"#,
+        );
+        let link = rt
+            .evaluate("document.getElementById('link').href")
+            .unwrap();
+        assert_eq!(link.as_str().unwrap(), "http://example.com/a/x.json");
+    }
+
+    #[test]
+    fn an_empty_base_href_resolves_to_the_document_url() {
+        let mut rt = setup_runtime_at_deep_url(
+            r#"<html><head><base href=""></head><body>
+                <a id="link" href="x.json"></a>
+            </body></html>"#,
+        );
+        let link = rt
+            .evaluate("document.getElementById('link').href")
+            .unwrap();
+        assert_eq!(link.as_str().unwrap(), "http://example.com/deep/x.json");
+    }
+
+    #[test]
+    fn a_cross_origin_base_moves_the_target_but_not_the_page_origin() {
+        let mut rt = setup_runtime_at_deep_url(
+            r#"<html><head><base href="https://cdn.example.net/v2/"></head><body>
+                <a id="link" href="x.json"></a>
+            </body></html>"#,
+        );
+        let seen = rt
+            .evaluate("return [document.getElementById('link').href, location.origin]")
+            .unwrap();
+        assert_eq!(
+            seen.as_array().unwrap(),
+            &vec![
+                serde_json::json!("https://cdn.example.net/v2/x.json"),
+                serde_json::json!("http://example.com"),
+            ]
+        );
+    }
+
+    #[test]
+    fn base_href_rejects_a_data_url_base() {
+        // https://html.spec.whatwg.org/multipage/semantics.html#set-the-frozen-base-url
+        // Accepting it would make every later relative resolution fail instead of falling back.
+        let mut rt = setup_runtime_at_deep_url(
+            r#"<html><head><base href="data:text/html,x"></head><body>
+                <a id="link" href="data/x.json"></a>
+            </body></html>"#,
+        );
+
+        let base_uri = rt.evaluate("document.baseURI").unwrap();
+        assert_eq!(base_uri.as_str().unwrap(), "http://example.com/deep/page");
+
+        let link = rt
+            .evaluate("document.getElementById('link').href")
+            .unwrap();
+        assert_eq!(link.as_str().unwrap(), "http://example.com/deep/data/x.json");
+    }
+
+    #[test]
+    fn base_resolution_follows_the_url_set_by_push_state() {
+        // pushState changes the document URL, and without <base> that very URL is the base.
+        let mut rt = setup_runtime_at_deep_url(
+            r#"<html><head></head><body><a id="link" href="x.json"></a></body></html>"#,
+        );
+        rt.evaluate("history.pushState({}, '', '/other/route')").unwrap();
+
+        let link = rt
+            .evaluate("document.getElementById('link').href")
+            .unwrap();
+        assert_eq!(link.as_str().unwrap(), "http://example.com/other/x.json");
+    }
+
+    #[test]
+    fn a_relative_base_href_resolves_against_the_push_state_url() {
+        let mut rt = setup_runtime_at_deep_url(
+            r#"<html><head><base href="assets/"></head><body>
+                <a id="link" href="x.json"></a>
+            </body></html>"#,
+        );
+        rt.evaluate("history.pushState({}, '', '/other/route')").unwrap();
+
+        let link = rt
+            .evaluate("document.getElementById('link').href")
+            .unwrap();
+        assert_eq!(link.as_str().unwrap(), "http://example.com/other/assets/x.json");
+    }
+
+    /// Guards the cache in `document_base_url_memoized`. Without it, each of these reads walked
+    /// the tree and ran the selector engine, and `a.href` went from a field read to O(nodes).
+    /// The bound is deliberately loose: it should catch the regression, not watch the allocator.
+    #[test]
+    fn anchor_href_reads_do_not_scale_with_document_size() {
+        let mut body = String::from(r#"<html><head></head><body><a id="link" href="x.json"></a>"#);
+        for i in 0..4000 {
+            body.push_str(&format!("<div id=\"n{i}\"><span>text</span></div>"));
+        }
+        body.push_str("</body></html>");
+        let mut rt = setup_runtime_at_deep_url(&body);
+
+        let elapsed = rt
+            .evaluate(
+                r#"
+                const link = document.getElementById('link');
+                const started = Date.now();
+                for (let i = 0; i < 2000; i++) { link.href; }
+                return Date.now() - started;
+                "#,
+            )
+            .unwrap();
+        let ms = elapsed.as_f64().expect("elapsed ms");
+        assert!(
+            ms < 500.0,
+            "2000 a.href reads on a document with 12000 nodes took {ms} ms, the base query is not cached"
+        );
+    }
+
+    #[test]
+    fn the_base_memo_still_sees_a_base_element_added_later() {
+        let mut rt = setup_runtime_at_deep_url(
+            r#"<html><head></head><body><a id="link" href="x.json"></a></body></html>"#,
+        );
+        let before = rt
+            .evaluate("document.getElementById('link').href")
+            .unwrap();
+        assert_eq!(before.as_str().unwrap(), "http://example.com/deep/x.json");
+
+        rt.evaluate(
+            r#"
+            const base = document.createElement('base');
+            base.setAttribute('href', '/');
+            document.head.appendChild(base);
+            "#,
+        )
+        .unwrap();
+
+        let after = rt
+            .evaluate("document.getElementById('link').href")
+            .unwrap();
+        assert_eq!(after.as_str().unwrap(), "http://example.com/x.json");
+    }
+
+    #[test]
+    fn the_base_memo_notices_a_changed_href_attribute() {
+        let mut rt = setup_runtime_at_deep_url(BASE_HREF_PAGE);
+        let before = rt
+            .evaluate("document.getElementById('link').href")
+            .unwrap();
+        assert_eq!(before.as_str().unwrap(), "http://example.com/app/data/x.json");
+
+        rt.evaluate("document.querySelector('base').setAttribute('href', '/other/')")
+            .unwrap();
+
+        let after = rt
+            .evaluate("document.getElementById('link').href")
+            .unwrap();
+        assert_eq!(after.as_str().unwrap(), "http://example.com/other/data/x.json");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn base_href_governs_fetch_and_xhr_targets() {
+        let mut rt = setup_runtime_at_deep_url(BASE_HREF_PAGE);
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                const originalFetchOp = Deno.core.ops.op_fetch_url;
+                const seen = [];
+                try {
+                    Deno.core.ops.op_fetch_url = (url) => {
+                        seen.push(url);
+                        return JSON.stringify({ status: 200, headers: {}, body: "{}", url });
+                    };
+                    await fetch("data/x.json");
+                    const xhr = new XMLHttpRequest();
+                    xhr.open("GET", "data/y.json");
+                    xhr.send();
+                    await new Promise((r) => setTimeout(r, 0));
+                    return seen;
+                } finally {
+                    Deno.core.ops.op_fetch_url = originalFetchOp;
+                }
+            }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        let value = result.value.expect("captured URLs");
+        let seen = value.as_array().expect("captured URLs");
+        // The XHR entry cannot isolate its own layer: send() passes the already absolute URL on
+        // to fetch, so fetch takes over the resolution if it is removed from send, and the assert
+        // still holds. It pins the result, not the layer.
+        assert_eq!(seen.len(), 2, "one fetch, one XHR");
+        assert_eq!(seen[0].as_str().unwrap(), "http://example.com/app/data/x.json");
+        assert_eq!(seen[1].as_str().unwrap(), "http://example.com/app/data/y.json");
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn test_fetch_url_input_decodes_binary_body_base64() {
         let mut rt = setup_runtime("<html><body></body></html>");
@@ -14674,6 +15495,229 @@ mod tests {
             })
         );
     }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_preserves_binary_body_sources_at_the_op_boundary() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const originalFetchOp = Deno.core.ops.op_fetch_url;
+                    const calls = [];
+                    try {
+                        Deno.core.ops.op_fetch_url =
+                            (url, method, headers, body) => {
+                                calls.push({
+                                    path: new URL(url).pathname,
+                                    method,
+                                    headers: JSON.parse(headers),
+                                    isUint8Array: body instanceof Uint8Array,
+                                    bytes: Array.from(
+                                        body instanceof Uint8Array
+                                            ? body
+                                            : new TextEncoder().encode(body),
+                                    ),
+                                });
+                                return JSON.stringify({
+                                    status: 200,
+                                    headers: {},
+                                    body: "ok",
+                                    url,
+                                });
+                            };
+
+                        const sentinel = [0, 128, 255, 16];
+                        await fetch("/blob", {
+                            method: "POST",
+                            body: new Blob([new Uint8Array(sentinel)]),
+                        });
+
+                        const arrayBuffer = new Uint8Array(sentinel).buffer;
+                        await fetch("/array-buffer", { method: "POST", body: arrayBuffer });
+
+                        const backing = new Uint8Array([9, ...sentinel, 8]);
+                        await fetch("/typed-array-view", {
+                            method: "POST",
+                            body: backing.subarray(1, 5),
+                        });
+
+                        const request = new Request("/request", {
+                            method: "POST",
+                            headers: {
+                                authorization: "Bearer test-token",
+                                "x-request-source": "request",
+                            },
+                            body: new Uint8Array(sentinel),
+                        });
+                        await fetch(request);
+                        await fetch(request, {
+                            headers: { "x-init-override": "yes" },
+                        });
+
+                        await fetch(new Request("/request-params-object", {
+                            method: "POST",
+                            body: new URLSearchParams({ a: "b" }),
+                        }), { headers: {} });
+                        await fetch(new Request("/request-params-headers", {
+                            method: "POST",
+                            body: new URLSearchParams({ a: "b" }),
+                        }), { headers: new Headers() });
+
+                        return calls;
+                    } finally {
+                        Deno.core.ops.op_fetch_url = originalFetchOp;
+                    }
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!([
+                { "path": "/blob", "method": "POST", "headers": {}, "isUint8Array": true, "bytes": [0, 128, 255, 16] },
+                { "path": "/array-buffer", "method": "POST", "headers": {}, "isUint8Array": true, "bytes": [0, 128, 255, 16] },
+                { "path": "/typed-array-view", "method": "POST", "headers": {}, "isUint8Array": true, "bytes": [0, 128, 255, 16] },
+                { "path": "/request", "method": "POST", "headers": { "authorization": "Bearer test-token", "x-request-source": "request" }, "isUint8Array": true, "bytes": [0, 128, 255, 16] },
+                { "path": "/request", "method": "POST", "headers": { "x-init-override": "yes" }, "isUint8Array": true, "bytes": [0, 128, 255, 16] },
+                { "path": "/request-params-object", "method": "POST", "headers": {}, "isUint8Array": true, "bytes": [97, 61, 98] },
+                { "path": "/request-params-headers", "method": "POST", "headers": {}, "isUint8Array": true, "bytes": [97, 61, 98] },
+            ])
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn fetch_form_urlencoded_and_xhr_bodies_reach_the_op_as_bytes() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .call_function_on_for_cdp(
+                r#"async () => {
+                    const originalFetchOp = Deno.core.ops.op_fetch_url;
+                    const calls = [];
+                    const includesBytes = (bytes, needle) => {
+                        outer: for (let i = 0; i <= bytes.length - needle.length; i++) {
+                            for (let j = 0; j < needle.length; j++) {
+                                if (bytes[i + j] !== needle[j]) continue outer;
+                            }
+                            return true;
+                        }
+                        return false;
+                    };
+                    try {
+                        Deno.core.ops.op_fetch_url =
+                            (url, method, headers, body) => {
+                                const bytes = Array.from(
+                                    body instanceof Uint8Array
+                                        ? body
+                                        : new TextEncoder().encode(body),
+                                );
+                                calls.push({
+                                    path: new URL(url).pathname,
+                                    headers: JSON.parse(headers),
+                                    isUint8Array: body instanceof Uint8Array,
+                                    bytes,
+                                    hasRawSentinel: includesBytes(bytes, [0, 128, 255, 16]),
+                                });
+                                return JSON.stringify({
+                                    status: 200,
+                                    headers: {},
+                                    body: "ok",
+                                    url,
+                                });
+                            };
+
+                        const form = new FormData();
+                        form.append("note", "snow \u96ea");
+                        form.append(
+                            "upload",
+                            new File([new Uint8Array([0, 128, 255, 16])], "sentinel.bin", {
+                                type: "application/octet-stream",
+                            }),
+                        );
+                        await fetch("/form-data", { method: "POST", body: form });
+
+                        const params = new URLSearchParams();
+                        params.append("greeting", "\u96ea space&");
+                        await fetch("/url-search-params", { method: "POST", body: params });
+
+                        await new Promise((resolve, reject) => {
+                            const xhr = new XMLHttpRequest();
+                            xhr.open("POST", "/xhr-typed-array");
+                            xhr.onload = resolve;
+                            xhr.onerror = reject;
+                            const backing = new Uint8Array([9, 0, 128, 255, 16, 8]);
+                            xhr.send(backing.subarray(1, 5));
+                        });
+
+                        const formCall = calls.find(call => call.path === "/form-data");
+                        const paramsCall = calls.find(call => call.path === "/url-search-params");
+                        const xhrCall = calls.find(call => call.path === "/xhr-typed-array");
+                        return {
+                            formData: {
+                                isUint8Array: formCall.isUint8Array,
+                                contentType: Object.entries(formCall.headers)
+                                    .find(([name]) => name.toLowerCase() === "content-type")[1]
+                                    .startsWith("multipart/form-data; boundary=----WebKitFormBoundary"),
+                                hasText: includesBytes(
+                                    formCall.bytes,
+                                    Array.from(new TextEncoder().encode("snow \u96ea")),
+                                ),
+                                hasFilename: includesBytes(
+                                    formCall.bytes,
+                                    Array.from(new TextEncoder().encode('filename="sentinel.bin"')),
+                                ),
+                                hasRawSentinel: formCall.hasRawSentinel,
+                            },
+                            urlSearchParams: {
+                                isUint8Array: paramsCall.isUint8Array,
+                                contentType: Object.entries(paramsCall.headers)
+                                    .find(([name]) => name.toLowerCase() === "content-type")[1],
+                                bytes: paramsCall.bytes,
+                            },
+                            xhr: {
+                                isUint8Array: xhrCall.isUint8Array,
+                                bytes: xhrCall.bytes,
+                            },
+                        };
+                    } finally {
+                        Deno.core.ops.op_fetch_url = originalFetchOp;
+                    }
+                }"#,
+                None,
+                &[],
+                true,
+                true,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.value.unwrap(),
+            serde_json::json!({
+                "formData": {
+                    "isUint8Array": true,
+                    "contentType": true,
+                    "hasText": true,
+                    "hasFilename": true,
+                    "hasRawSentinel": true,
+                },
+                "urlSearchParams": {
+                    "isUint8Array": true,
+                    "contentType": "application/x-www-form-urlencoded;charset=UTF-8",
+                    "bytes": "greeting=%E9%9B%AA+space%26".as_bytes(),
+                },
+                "xhr": {
+                    "isUint8Array": true,
+                    "bytes": [0, 128, 255, 16],
+                },
+            })
+        );
+    }
+
     /// Serves a redirect chain across `connections` consecutive
     /// requests: `/hop/N` replies with 302 to `/hop/N-1`, `/hop/0` is the
     /// target. To a path the fixture cannot read it replies with 400
@@ -17154,4 +18198,54 @@ mod tests {
             .unwrap();
         assert_eq!(result, serde_json::json!("writer,one,two"));
     }
+
+    /// #699: an unhandled rejection from a failed dynamic import is page-local
+    /// noise in a browser. The bounded event loop must report it and keep
+    /// driving later tasks instead of dying on the error and starving every
+    /// pending timer.
+    #[tokio::test(flavor = "current_thread")]
+    async fn unhandled_rejection_does_not_starve_later_tasks() {
+        let mut rt = setup_runtime("<html><body></body></html>");
+        rt.evaluate(
+            "(function() { \
+                import('http://192.0.0.1/unreachable-module.js'); \
+                globalThis.__t = false; \
+                setTimeout(() => { globalThis.__t = true; }, 5); \
+                return 'ok'; \
+            })()",
+        )
+        .unwrap();
+        rt.run_event_loop_bounded(2_000)
+            .await
+            .expect("the pump must survive a page-local rejection");
+        assert_eq!(
+            rt.evaluate("globalThis.__t").unwrap(),
+            serde_json::json!(true),
+            "the pending timer must still fire after a page task error"
+        );
+    }
+
+    /// #734: ICU inherits the host OS locale when no default is set, so
+    /// Intl.resolvedOptions() contradicted navigator.language on any host
+    /// whose OS locale is not en-US. The pinned default must win.
+    #[test]
+    fn intl_locale_matches_navigator_language_regardless_of_host() {
+        // nextest runs each test in its own process, so setting the process
+        // locale here cannot race another test's V8 init.
+        std::env::set_var("LC_ALL", "de-DE");
+        std::env::set_var("LANG", "de-DE");
+        let mut rt = setup_runtime("<html><body></body></html>");
+        let result = rt
+            .evaluate(
+                "Intl.DateTimeFormat().resolvedOptions().locale + '|' + navigator.language",
+            )
+            .unwrap();
+        assert_eq!(
+            result,
+            serde_json::json!("en-US|en-US"),
+            "Intl must not leak the host OS locale while navigator.language says en-US"
+        );
+    }
 }
+
+

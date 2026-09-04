@@ -80,18 +80,25 @@ pub async fn handle(
             // silently — the next Target.attachToTarget will set things up.
             match ctx.get_session_page(session_id) {
                 Some(page) => {
+                    let origin = page.url_string();
+                    let page_id = page.id.clone();
+                    let frame_id = page.frame_id.clone();
+                    if let Some(session_id) = session_id {
+                        ctx.runtime_enabled_sessions.insert(session_id.clone());
+                    }
+                    ctx.refresh_runtime_event_collection(&page_id);
                     let event = crate::types::CdpEvent {
                         method: "Runtime.executionContextCreated".to_string(),
                         params: json!({
                             "context": {
                                 "id": 1,
-                                "origin": page.url_string(),
+                                "origin": origin,
                                 "name": "",
-                                "uniqueId": format!("ctx-{}", page.id),
+                                "uniqueId": format!("ctx-{}", page_id),
                                 "auxData": {
                                     "isDefault": true,
                                     "type": "default",
-                                    "frameId": page.frame_id,
+                                    "frameId": frame_id,
                                 }
                             }
                         }),
@@ -101,6 +108,16 @@ pub async fn handle(
                 }
                 None => {
                     // No session attached yet — that's fine. Just ack.
+                }
+            }
+            Ok(json!({}))
+        }
+        "disable" => {
+            if let Some(session_id) = session_id {
+                let page_id = ctx.sessions.get(session_id).cloned();
+                ctx.runtime_enabled_sessions.remove(session_id);
+                if let Some(page_id) = page_id {
+                    ctx.refresh_runtime_event_collection(&page_id);
                 }
             }
             Ok(json!({}))
@@ -245,10 +262,15 @@ pub async fn handle(
                 let page = ctx
                     .get_session_page_mut(session_id)
                     .ok_or("No page")?;
-                let escaped_oid = oid.replace('\\', "\\\\").replace('\'', "\\'");
+                // The child ids minted below are `<parent>::<key>` and the key
+                // is a property name off a page object, so the page decides
+                // what ends up inside this literal. A JSON literal covers the
+                // C0 controls a manual quote/backslash pair leaves alone; see
+                // `util::object_id_literal`.
+                let oid_literal = crate::util::object_id_literal(oid);
                 let code = format!(
                     "(function() {{\
-                        var obj = globalThis.__obscura_objects['{oid}'];\
+                        var obj = globalThis.__obscura_objects[{oid}];\
                         if (!obj || typeof obj !== 'object') return [];\
                         var keys = Object.keys(obj);\
                         return keys.map(function(k) {{\
@@ -257,7 +279,7 @@ pub async fn handle(
                             var item = {{ name: k, type: t }};\
                             if (v === null) {{ item.value = null; return item; }}\
                             if (t !== 'object' && t !== 'function') {{ item.value = v; return item; }}\
-                            var childOid = '{oid}::' + k;\
+                            var childOid = {oid} + '::' + k;\
                             globalThis.__obscura_objects[childOid] = v;\
                             item.childOid = childOid;\
                             if (typeof v.nodeType === 'number') {{\
@@ -275,7 +297,7 @@ pub async fn handle(
                             return item;\
                         }});\
                     }})()",
-                    oid = escaped_oid,
+                    oid = oid_literal,
                 );
                 let result = page.evaluate(&code);
                 if let serde_json::Value::Array(props) = result {
